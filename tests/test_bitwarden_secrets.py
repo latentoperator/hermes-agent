@@ -476,6 +476,86 @@ def test_apply_override_existing(monkeypatch, tmp_path):
     assert os.environ["OPENAI_API_KEY"] == "fresh"
 
 
+def test_apply_alias_maps_bsm_key_to_runtime_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([
+        {"key": "DANTE_TELEGRAM_BOT_TOKEN", "value": "dante-token"},
+    ])
+    monkeypatch.setattr(
+        bw.subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    monkeypatch.setattr(bw, "find_bws", lambda **kw: fake_binary)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True,
+        project_id="p",
+        aliases={"DANTE_TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN"},
+        auto_install=False,
+    )
+
+    assert result.ok
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "dante-token"
+    assert "TELEGRAM_BOT_TOKEN" in result.applied
+    assert "DANTE_TELEGRAM_BOT_TOKEN" not in os.environ
+
+
+def test_apply_include_keys_skips_unlisted_bsm_secrets(monkeypatch, tmp_path):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([
+        {"key": "DANTE_TELEGRAM_BOT_TOKEN", "value": "dante-token"},
+        {"key": "WREN_TELEGRAM_BOT_TOKEN", "value": "wren-token"},
+    ])
+    monkeypatch.setattr(
+        bw.subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    monkeypatch.setattr(bw, "find_bws", lambda **kw: fake_binary)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True,
+        project_id="p",
+        aliases={"DANTE_TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN"},
+        include_keys=["DANTE_TELEGRAM_BOT_TOKEN"],
+        auto_install=False,
+    )
+
+    assert result.ok
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "dante-token"
+    assert "WREN_TELEGRAM_BOT_TOKEN" not in os.environ
+
+
+def test_apply_alias_respects_existing_target_when_not_overriding(monkeypatch, tmp_path):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "existing-token")
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([
+        {"key": "DANTE_TELEGRAM_BOT_TOKEN", "value": "dante-token"},
+    ])
+    monkeypatch.setattr(
+        bw.subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    monkeypatch.setattr(bw, "find_bws", lambda **kw: fake_binary)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True,
+        project_id="p",
+        aliases={"DANTE_TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN"},
+        override_existing=False,
+        auto_install=False,
+    )
+
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "existing-token"
+    assert "TELEGRAM_BOT_TOKEN" in result.skipped
+
+
 def test_apply_never_overrides_bootstrap_token(monkeypatch, tmp_path):
     """Even with override_existing=True, the access-token var is preserved."""
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.original")
@@ -545,6 +625,11 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
         "    cache_ttl_seconds: 0\n"
         "    override_existing: false\n"
         "    auto_install: false\n"
+        "    aliases:\n"
+        "      DANTE_TELEGRAM_BOT_TOKEN: TELEGRAM_BOT_TOKEN\n"
+        "    include_keys:\n"
+        "      - DANTE_TELEGRAM_BOT_TOKEN\n"
+        "      - MY_BSM_KEY\n"
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
@@ -555,6 +640,9 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
         called["n"] += 1
         assert kwargs["enabled"] is True
         assert kwargs["project_id"] == "proj-1"
+        assert kwargs["override_existing"] is False
+        assert kwargs["aliases"] == {"DANTE_TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN"}
+        assert kwargs["include_keys"] == ["DANTE_TELEGRAM_BOT_TOKEN", "MY_BSM_KEY"]
         os.environ["MY_BSM_KEY"] = "from-bsm"
         return bw.FetchResult(
             secrets={"MY_BSM_KEY": "from-bsm"},

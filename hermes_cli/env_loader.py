@@ -292,6 +292,8 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         auto_install=bool(bw_cfg.get("auto_install", True)),
         server_url=str(bw_cfg.get("server_url", "") or "").strip(),
         home_path=home_path,
+        aliases=_normalize_aliases(bw_cfg.get("aliases")),
+        include_keys=_normalize_string_list(bw_cfg.get("include_keys")),
     )
 
     if result.applied:
@@ -321,6 +323,24 @@ def _apply_external_secret_sources(home_path: Path) -> None:
             f"  Bitwarden Secrets Manager: {warn}",
             file=sys.stderr,
         )
+
+
+def _normalize_aliases(raw: object) -> dict[str, str]:
+    """Return valid string-to-string BSM alias mappings from config."""
+    if not isinstance(raw, dict):
+        return {}
+    aliases: dict[str, str] = {}
+    for source, target in raw.items():
+        if isinstance(source, str) and isinstance(target, str):
+            aliases[source] = target
+    return aliases
+
+
+def _normalize_string_list(raw: object) -> list[str]:
+    """Return a string list from config, ignoring invalid entries."""
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, str)]
 
 
 def _load_secrets_config(home_path: Path) -> dict:

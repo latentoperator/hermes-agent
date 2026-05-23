@@ -116,6 +116,14 @@ class TestResolveCommand:
         assert topic.name == "topic"
         assert "topic" in GATEWAY_KNOWN_COMMANDS
 
+    def test_fleet_is_gateway_command(self):
+        fleet = resolve_command("fleet")
+        assert fleet is not None
+        assert fleet.name == "fleet"
+        assert fleet.gateway_only is True
+        assert "reset-session" in SUBCOMMANDS["/fleet"]
+        assert "fleet" in GATEWAY_KNOWN_COMMANDS
+
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
         assert resolve_command("/bg").name == "background"
