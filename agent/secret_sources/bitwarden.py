@@ -598,6 +598,8 @@ def apply_bitwarden_secrets(
     auto_install: bool = True,
     server_url: str = "",
     home_path: Optional[Path] = None,
+    aliases: Optional[Dict[str, str]] = None,
+    include_keys: Optional[List[str]] = None,
 ) -> FetchResult:
     """Pull secrets from BSM and set them on ``os.environ``.
 
@@ -656,19 +658,30 @@ def apply_bitwarden_secrets(
 
     result.secrets = secrets
     result.warnings.extend(warnings)
+    include_set = set(include_keys or [])
 
     for key, value in secrets.items():
-        if key == access_token_env:
+        if include_set and key not in include_set:
+            result.skipped.append(key)
+            continue
+        target_key = (aliases or {}).get(key, key)
+        if not _is_valid_env_name(target_key):
+            result.warnings.append(
+                f"Skipping alias target {target_key!r} for {key!r}: "
+                "not a valid env-var name"
+            )
+            continue
+        if target_key == access_token_env:
             # Don't let BSM clobber the very token we used to fetch
             # itself — that would be a footgun if someone stored the
             # token as a BSM secret too.
-            result.skipped.append(key)
+            result.skipped.append(target_key)
             continue
-        if not override_existing and os.environ.get(key):
-            result.skipped.append(key)
+        if not override_existing and os.environ.get(target_key):
+            result.skipped.append(target_key)
             continue
-        os.environ[key] = value
-        result.applied.append(key)
+        os.environ[target_key] = value
+        result.applied.append(target_key)
 
     return result
 

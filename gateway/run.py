@@ -6702,6 +6702,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name == "fleet":
+                return await self._handle_fleet_command(event)
+
             # /stop must hard-kill the session when an agent is running.
             # A soft interrupt (agent.interrupt()) doesn't help when the agent
             # is truly hung — the executor thread is blocked and never checks
@@ -7161,7 +7164,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
-        
+
+        if canonical == "fleet":
+            return await self._handle_fleet_command(event)
+
         if canonical == "stop":
             return await self._handle_stop_command(event)
         
