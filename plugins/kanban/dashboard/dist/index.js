@@ -261,6 +261,11 @@
     };
   }
 
+  function assigneeLabel(name) {
+    if (!name) return "";
+    return name === "default" ? "Hermes" : name;
+  }
+
   // -------------------------------------------------------------------------
   // Minimal safe markdown renderer.
   //
@@ -1045,6 +1050,7 @@
           onOpen: setSelectedTaskId,
           onCreate: createTask,
           allTasks: boardData.columns.reduce(function (acc, c) { return acc.concat(c.tasks); }, []),
+          assignees: (boardData && boardData.assignees) || [],
         }),
         selectedTaskId ? h(TaskDrawer, {
           taskId: selectedTaskId,
@@ -1389,7 +1395,7 @@
             },
               h("option", { value: "" }, "(unassigned)"),
               (assignees || []).map(function (a) {
-                return h("option", { key: a, value: a }, a);
+                return h("option", { key: a, value: a }, assigneeLabel(a));
               }),
             ),
           )
@@ -1620,7 +1626,7 @@
 
     const profileOptions = profiles.map(function (p) {
       const tag = p.is_default ? " (default)" : "";
-      return h(SelectOption, { key: p.name, value: p.name }, p.name + tag);
+      return h(SelectOption, { key: p.name, value: p.name }, assigneeLabel(p.name) + tag);
     });
 
     return h(Card, { className: "p-3" },
@@ -2002,7 +2008,7 @@
         }, selectChangeHandler(props.setAssigneeFilter)),
           h(SelectOption, { value: "" }, tx(t, "allProfiles", "All profiles")),
           assignees.map(function (a) {
-            return h(SelectOption, { key: a, value: a }, a);
+            return h(SelectOption, { key: a, value: a }, assigneeLabel(a));
           }),
         ),
       ),
@@ -2132,7 +2138,7 @@
           h(SelectOption, { value: "" }, "— reassign —"),
           h(SelectOption, { value: "__none__" }, "(unassign)"),
           props.assignees.map(function (a) {
-            return h(SelectOption, { key: a, value: a }, a);
+            return h(SelectOption, { key: a, value: a }, assigneeLabel(a));
           }),
         ),
         h(Button, {
@@ -2257,6 +2263,7 @@
           onOpen: props.onOpen,
           onCreate: props.onCreate,
           allTasks: props.allTasks,
+          assignees: props.assignees,
         });
       }),
       h(TrashDropZone, {
@@ -2365,6 +2372,7 @@
       showCreate ? h(InlineCreate, {
         columnName: props.column.name,
         allTasks: props.allTasks,
+        assignees: props.assignees,
         onSubmit: function (body) {
           props.onCreate(body).then(function () { setShowCreate(false); });
         },
@@ -2680,21 +2688,20 @@
         rows: 2,
       }),
       h("div", { className: "flex gap-2" },
-        h(Input, {
+        h(Select, Object.assign({
           value: assignee,
-          onChange: function (e) { setAssignee(e.target.value); },
-          placeholder: props.columnName === "triage"
-            ? tx(t, "specifier", "specifier")
-            : tx(t, "assigneePlaceholder", "assignee"),
           className: "h-7 text-xs flex-1",
           title: props.columnName === "triage"
-            ? "Hermes profile that will spec this task (default: the dispatcher's configured specifier). Leave blank to let the dispatcher pick."
+            ? "Hermes profile that will spec this task (default: Hermes). Leave blank to let the dispatcher pick."
             : "Hermes profile to assign. Leave blank and the dispatcher will pick from available profiles when the task is Ready.",
-          style: { textTransform: "none" },
-          autoCapitalize: "none",
-          autoCorrect: "off",
-          spellCheck: false,
-        }),
+        }, selectChangeHandler(setAssignee)),
+          h(SelectOption, { value: "" }, props.columnName === "triage"
+            ? tx(t, "specifier", "specifier")
+            : tx(t, "assigneePlaceholder", "assignee")),
+          (props.assignees || []).map(function (a) {
+            return h(SelectOption, { key: a, value: a }, assigneeLabel(a));
+          }),
+        ),
         h(Input, {
           type: "number",
           value: priority,

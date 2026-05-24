@@ -69,6 +69,35 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
+def test_kanban_notifier_sends_started_ping_on_spawned_event(tmp_path, monkeypatch):
+    """Subscribed tasks notify the operator when a worker actually spawns."""
+    db_path = tmp_path / "started-ping.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="started ping", assignee="wren")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        claimed = kb.claim_task(conn, tid, claimer="test-lock", ttl_seconds=300)
+        assert claimed is not None
+        kb._set_worker_pid(conn, tid, 4242)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert "started" in text.lower()
+    assert "@wren" in text
+    assert tid in text
+    assert "started ping" in text
+
+
 def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):
     db_path = tmp_path / "shared-kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
