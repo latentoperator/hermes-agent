@@ -193,16 +193,36 @@ def apply_wal_with_fallback(
         return "wal"
     except sqlite3.OperationalError as exc:
         msg = str(exc).lower()
+
+        # If the database is already in WAL mode, a concurrent connection can
+        # still fail the idempotent-looking ``PRAGMA journal_mode=WAL`` while
+        # it tries to negotiate the mode. Treat that as success instead of
+        # attempting to flip the live DB back to DELETE, which needs an
+        # exclusive lock and can fail repeatedly in gateway dispatcher/notifier
+        # races.
+        try:
+            current = conn.execute("PRAGMA journal_mode").fetchone()
+            if current and str(current[0]).lower() == "wal":
+                return "wal"
+        except sqlite3.OperationalError:
+            pass
+
         if not any(marker in msg for marker in _WAL_INCOMPAT_MARKERS):
             # Unrelated OperationalError — don't silently swallow.
             raise
-        # Don't downgrade if another process already set WAL on disk.
-        existing = _on_disk_journal_mode(conn)
-        if existing == "wal":
-            raise
+
         _log_wal_fallback_once(db_label, exc)
-        conn.execute("PRAGMA journal_mode=DELETE")
-        return "delete"
+        try:
+            conn.execute("PRAGMA journal_mode=DELETE")
+            return "delete"
+        except sqlite3.OperationalError:
+            # Same race, second chance: if another connection left the DB in
+            # WAL mode, the connection is usable and should not take down
+            # gateway-side Kanban polling.
+            current = conn.execute("PRAGMA journal_mode").fetchone()
+            if current and str(current[0]).lower() == "wal":
+                return "wal"
+            raise
 
 
 def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
