@@ -25,8 +25,8 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return the module."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -38,7 +38,12 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    return _load_plugin_module().router
 
 
 @pytest.fixture
@@ -75,13 +80,76 @@ def test_board_empty(client):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
-    assert data["assignees"] == []
+    assert data["assignees"] == ["default"]
     assert data["latest_event_id"] == 0
 
 
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
+
+
+def test_board_assignees_include_profiles_on_disk(client, kanban_home):
+    """The dashboard create form needs a picker with installed profiles, not just used assignees."""
+    profiles = kanban_home / "profiles"
+    (profiles / "dante").mkdir(parents=True)
+    (profiles / "dante" / "config.yaml").write_text("model:\n  default: test\n")
+    (profiles / "wren").mkdir(parents=True)
+    (profiles / "wren" / "config.yaml").write_text("model:\n  default: test\n")
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+
+    assert "dante" in data["assignees"]
+    assert "wren" in data["assignees"]
+
+
+def test_board_assignees_honor_hidden_profiles(client, kanban_home):
+    profiles = kanban_home / "profiles"
+    for name in ("dante", "triss", "syren"):
+        (profiles / name).mkdir(parents=True)
+        (profiles / name / "config.yaml").write_text("model:\n  default: test\n")
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  hidden_assignees:\n    - triss\n    - syren\n"
+    )
+
+    data = client.get("/api/plugins/kanban/board").json()
+
+    assert "dante" in data["assignees"]
+    assert "triss" not in data["assignees"]
+    assert "syren" not in data["assignees"]
+
+
+def test_dashboard_create_auto_subscribes_home_channels(kanban_home, monkeypatch):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(
+        mod,
+        "_configured_home_channels",
+        lambda: [
+            {
+                "platform": "telegram",
+                "chat_id": "7593705216",
+                "thread_id": "",
+                "name": "Home",
+            }
+        ],
+    )
+    monkeypatch.setattr(mod, "_active_profile_name", lambda: "default")
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/kanban")
+    local_client = TestClient(app)
+
+    r = local_client.post("/api/plugins/kanban/tasks", json={"title": "from dashboard"})
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+
+    with kb.connect() as conn:
+        subs = kb.list_notify_subs(conn, task_id)
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "7593705216"
+    assert subs[0]["notifier_profile"] == "default"
 
 
 def test_create_task_appears_on_board(client):
