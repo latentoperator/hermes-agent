@@ -5981,6 +5981,26 @@ class GatewayRunner:
                     except Exception:
                         pass
 
+        def _coerce_board_exclusion_list(value) -> set[str]:
+            if isinstance(value, str):
+                try:
+                    parsed = json.loads(value)
+                except Exception:
+                    parsed = None
+                if isinstance(parsed, list):
+                    value = parsed
+                else:
+                    value = [s.strip() for s in value.split(",") if s.strip()]
+            return {
+                str(slug).strip()
+                for slug in (value or [])
+                if str(slug).strip()
+            }
+
+        dispatch_excluded_boards = _coerce_board_exclusion_list(
+            kanban_cfg.get("dispatch_excluded_boards", [])
+        )
+
         def _tick_once() -> "list[tuple[str, Optional[object]]]":
             """Run one dispatch_once per board. Returns (slug, result) pairs.
 
@@ -5995,6 +6015,12 @@ class GatewayRunner:
             out: list[tuple[str, "Optional[object]"]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if slug in dispatch_excluded_boards:
+                    logger.debug(
+                        "kanban dispatcher: skipping excluded board %s",
+                        slug,
+                    )
+                    continue
                 out.append((slug, _tick_once_for_board(slug)))
             return out
 
@@ -6016,6 +6042,8 @@ class GatewayRunner:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if slug in dispatch_excluded_boards:
+                    continue
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
@@ -6040,6 +6068,9 @@ class GatewayRunner:
         # of triage tasks doesn't burst-spend the aux LLM in one tick;
         # remainder defers to subsequent ticks.
         auto_decompose_enabled = bool(kanban_cfg.get("auto_decompose", True))
+        excluded_auto_decompose_boards = dispatch_excluded_boards | _coerce_board_exclusion_list(
+            kanban_cfg.get("auto_decompose_excluded_boards", [])
+        )
         try:
             auto_decompose_per_tick = int(
                 kanban_cfg.get("auto_decompose_per_tick", 3) or 3
@@ -6069,6 +6100,12 @@ class GatewayRunner:
             successes = 0
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                if slug in excluded_auto_decompose_boards:
+                    logger.debug(
+                        "kanban auto-decompose: skipping excluded board %s",
+                        slug,
+                    )
+                    continue
                 if attempted >= auto_decompose_per_tick:
                     break
                 # Pin this board for the duration of the call — same

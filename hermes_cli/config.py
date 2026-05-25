@@ -1990,6 +1990,14 @@ DEFAULT_CONFIG = {
         # decomposition is manual via `hermes kanban decompose <id>` or
         # the dashboard's Decompose button.
         "auto_decompose": True,
+        # Board slugs that should never be auto-decomposed by the embedded
+        # gateway dispatcher. Useful for portfolio/control boards where
+        # triage means "human intake/status" rather than executable work.
+        "auto_decompose_excluded_boards": [],
+        # Board slugs that the embedded gateway dispatcher should ignore
+        # entirely. Useful for read-only/portfolio boards that must never
+        # spawn workers even if a card is accidentally assigned/ready.
+        "dispatch_excluded_boards": [],
         # Max triage tasks to decompose per dispatcher tick. Prevents a
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
