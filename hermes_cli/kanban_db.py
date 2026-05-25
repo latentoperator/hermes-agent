@@ -1419,8 +1419,9 @@ def connect(
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
-    time but keeps the code robust if the DB file is ever re-created.
+    WAL mode and other DB-level PRAGMAs are applied during process-local
+    initialization for a path; per-connection setup is intentionally limited
+    to cheap connection-local PRAGMAs.
 
     The first connection to a given path auto-runs :func:`init_db` so
     fresh installs and test harnesses that construct `connect()`
@@ -1453,18 +1454,28 @@ def connect(
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
+                needs_init = resolved not in _INITIALIZED_PATHS
                 # WAL activation can take an exclusive lock while SQLite creates the
                 # sidecar files for a fresh database. Keep it in the same process-local
                 # critical section as schema initialization so concurrent gateway
                 # startup threads do not race before _INITIALIZED_PATHS is populated.
-                # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-                # falls back to DELETE with one WARNING so kanban stays usable there.
-                # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-                # FULL (was NORMAL): fsync before each checkpoint to narrow the
-                # crash window that can leave a b-tree page header torn.
-                conn.execute("PRAGMA synchronous=FULL")
+                #
+                # Do NOT re-run journal_mode/synchronous negotiation on every
+                # short-lived dispatcher/notifier connection. In production,
+                # concurrent Kanban workers can make otherwise idempotent PRAGMAs
+                # raise repeated sqlite3.OperationalError("disk I/O error") inside
+                # the gateway, leaving triage cards stuck even though the DB itself
+                # is healthy. Once this process has initialized the DB path,
+                # subsequent connects only need per-connection pragmas below.
+                if needs_init:
+                    # WAL doesn't work on network filesystems (NFS/SMB/FUSE).
+                    # Shared helper falls back to DELETE with one WARNING so kanban
+                    # stays usable there. See hermes_state._WAL_INCOMPAT_MARKERS.
+                    from hermes_state import apply_wal_with_fallback
+                    apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                    # FULL (was NORMAL): fsync before each checkpoint to narrow the
+                    # crash window that can leave a b-tree page header torn.
+                    conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
                 # Zero freed pages so a later torn write cannot expose stale
@@ -1473,7 +1484,6 @@ def connect(
                 # Surface corrupt cells as read errors instead of silent
                 # wrong-data returns.
                 conn.execute("PRAGMA cell_size_check=ON")
-                needs_init = resolved not in _INITIALIZED_PATHS
                 if needs_init:
                     # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
                     # migrations. Cached so subsequent connect() calls in the same

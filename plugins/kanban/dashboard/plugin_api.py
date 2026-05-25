@@ -151,6 +151,10 @@ BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
 
+# The Hopewell command board is a portfolio/control surface, not an execution
+# queue. Keep it visually compact so high-level project cards are readable.
+COMMAND_BOARD_COLUMNS: list[str] = ["triage", "ready", "blocked", "done"]
+
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -449,7 +453,8 @@ def get_board(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
         ).fetchone()["m"]
 
-        columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
+        board_columns = COMMAND_BOARD_COLUMNS if board == "hopewell-command" else BOARD_COLUMNS
+        columns: dict[str, list[dict]] = {c: [] for c in board_columns}
         if include_archived:
             columns["archived"] = []
 
@@ -475,7 +480,8 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
+            fallback_column = "todo" if "todo" in columns else board_columns[0]
+            col = t.status if t.status in columns else fallback_column
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
