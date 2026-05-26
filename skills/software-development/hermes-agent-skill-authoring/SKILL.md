@@ -1,6 +1,6 @@
 ---
 name: hermes-agent-skill-authoring
-description: "Author in-repo SKILL.md: frontmatter, validator, structure."
+description: "Use when authoring in-repo Hermes SKILL.md files with valid frontmatter and peer-matched structure."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -54,6 +54,28 @@ metadata:
 ```
 
 `version` / `author` / `license` / `metadata` are NOT enforced by the validator, but every peer has them — omit and your skill sticks out.
+
+## Concise Frontmatter Standard
+
+Frontmatter is the routing and discovery surface, not the procedure. Keep it compact enough that skill pickers, search indexes, and agent prompts can scan it without carrying body-level instructions.
+
+- `description` should be one routing sentence: when to load the skill and the outcome it supports.
+- Aim for 80–140 characters for normal descriptions; treat 150+ as review-worthy and 200+ as likely body leakage unless the extra words materially improve routing.
+- Put operational detail, safety policy, examples, tool lists, and implementation internals in body sections or `references/` files, not in the description.
+- `tags` should be 3–6 durable discovery categories. Avoid synonym piles, one-off project labels, and implementation details.
+- `related_skills` should name real procedural dependencies or common handoffs, not general browsing recommendations.
+
+Good description shape:
+
+```yaml
+description: Use when reviewing pull requests for security, correctness, and maintainability.
+```
+
+Bad description shape:
+
+```yaml
+description: Use when reviewing PRs; first run gh pr diff, then inspect auth, SQL, secrets, tests, comments, CI status, and decide whether to approve, request changes, or create follow-up tasks.
+```
 
 ## Size Limits
 
