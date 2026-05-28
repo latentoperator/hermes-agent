@@ -3956,7 +3956,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._restart_requested
             else "Your current task will be interrupted."
         )
-        msg = f"⚠️ Gateway {action} — {hint}"
+        msg = f"Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
