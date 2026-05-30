@@ -1659,15 +1659,16 @@ def test_home_subscribe_creates_notify_sub_row(client, with_home_channels):
     """POST .../home-subscribe/telegram writes a kanban_notify_subs row
     keyed to the telegram home's (chat_id, thread_id)."""
     from hermes_cli import kanban_db as kb
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
 
-    r = client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
+    r = client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
     assert r.status_code == 200
     assert r.json()["ok"] is True
 
     conn = kb.connect()
     try:
-        subs = kb.list_notify_subs(conn, t["id"])
+        subs = kb.list_notify_subs(conn, task_id)
     finally:
         conn.close()
     assert len(subs) == 1
@@ -1680,10 +1681,12 @@ def test_home_subscribe_creates_notify_sub_row(client, with_home_channels):
 def test_home_subscribe_flips_subscribed_flag_in_subsequent_get(client, with_home_channels):
     """After subscribe, the GET endpoint reports subscribed=true for that
     platform and false for the others."""
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
+    client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
 
-    r = client.get(f"/api/plugins/kanban/home-channels?task_id={t['id']}")
+    r = client.get(f"/api/plugins/kanban/home-channels?task_id={task_id}")
     flags = {h["platform"]: h["subscribed"] for h in r.json()["home_channels"]}
     assert flags == {"telegram": True, "discord": False}
 
@@ -1691,13 +1694,14 @@ def test_home_subscribe_flips_subscribed_flag_in_subsequent_get(client, with_hom
 def test_home_subscribe_is_idempotent(client, with_home_channels):
     """Re-subscribing keeps a single row at the DB layer."""
     from hermes_cli import kanban_db as kb
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
-    client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
-    client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
+    client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+    client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+    client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
     conn = kb.connect()
     try:
-        assert len(kb.list_notify_subs(conn, t["id"])) == 1
+        assert len(kb.list_notify_subs(conn, task_id)) == 1
     finally:
         conn.close()
 
@@ -1705,13 +1709,14 @@ def test_home_subscribe_is_idempotent(client, with_home_channels):
 def test_home_subscribe_backfills_owner_on_legacy_row(client, with_home_channels):
     """Re-subscribing should backfill notifier ownership on ownerless rows."""
     from hermes_cli import kanban_db as kb
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
 
     conn = kb.connect()
     try:
         kb.add_notify_sub(
             conn,
-            task_id=t["id"],
+            task_id=task_id,
             platform="telegram",
             chat_id="1234567",
             thread_id="42",
@@ -1719,12 +1724,12 @@ def test_home_subscribe_backfills_owner_on_legacy_row(client, with_home_channels
     finally:
         conn.close()
 
-    r = client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
+    r = client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
     assert r.status_code == 200
 
     conn = kb.connect()
     try:
-        subs = kb.list_notify_subs(conn, t["id"])
+        subs = kb.list_notify_subs(conn, task_id)
     finally:
         conn.close()
 
@@ -1748,14 +1753,15 @@ def test_home_subscribe_unknown_task_returns_404(client, with_home_channels):
 def test_home_unsubscribe_removes_notify_sub_row(client, with_home_channels):
     """DELETE .../home-subscribe/telegram removes the matching row."""
     from hermes_cli import kanban_db as kb
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
-    client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
-    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/telegram")
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
+    client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+    r = client.delete(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
     assert r.status_code == 200
 
     conn = kb.connect()
     try:
-        assert kb.list_notify_subs(conn, t["id"]) == []
+        assert kb.list_notify_subs(conn, task_id) == []
     finally:
         conn.close()
 
