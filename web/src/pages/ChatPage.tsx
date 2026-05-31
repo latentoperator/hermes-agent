@@ -24,7 +24,7 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
-import { HERMES_BASE_PATH, buildWsAuthParam } from "@/lib/api";
+import { HERMES_BASE_PATH, buildWsAuthParam, type ProfileInfo } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Copy, PanelRight, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -42,6 +42,7 @@ function buildWsUrl(
   authParam: [string, string],
   resume: string | null,
   channel: string,
+  profile: string | null,
 ): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   // ``authParam`` is ``["token", <session>]`` in loopback mode and
@@ -49,6 +50,7 @@ function buildWsUrl(
   // ``_ws_auth_ok`` picks whichever shape matches the current gate state.
   const qs = new URLSearchParams({ [authParam[0]]: authParam[1], channel });
   if (resume) qs.set("resume", resume);
+  if (profile) qs.set("profile", profile);
   return `${proto}//${window.location.host}${HERMES_BASE_PATH}/api/pty?${qs.toString()}`;
 }
 
@@ -169,11 +171,59 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // The dashboard keeps ChatPage mounted persistently so the PTY survives tab
   // switches. That is great for ordinary /chat navigation, but it means query
   // param changes do NOT remount the component. Resume-in-chat from the
-  // Sessions page relies on `/chat?resume=<id>` changing at runtime, so we must
-  // treat the current resume target as part of the PTY identity and rebuild the
-  // terminal session when it changes.
+  // Sessions page relies on `/chat?resume=<id>` changing at runtime, and the
+  // profile selector similarly needs a new PTY child when it changes.
   const resumeParam = searchParams.get("resume");
-  const channel = useMemo(() => generateChannelId(), [resumeParam]);
+  const selectedProfile = searchParams.get("profile");
+  const channelKey = `${resumeParam ?? ""}:${selectedProfile ?? ""}`;
+  const channel = useMemo(() => {
+    // Tie the sidebar/event channel to the terminal-session identity.  When
+    // profile/resume changes, the old ChatSidebar unmounts, closing /api/ws;
+    // the backend then tears down that sidecar session and its slash worker.
+    void channelKey;
+    return generateChannelId();
+  }, [channelKey]);
+  const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
+  const [profilesError, setProfilesError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    api
+      .getProfiles()
+      .then((res) => {
+        if (cancelled) return;
+        setProfiles(res.profiles);
+        setProfilesError(null);
+      })
+      .catch((err: Error) => {
+        if (cancelled) return;
+        setProfilesError(err.message);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onProfileChange = useCallback(
+    (value: string) => {
+      const next = new URLSearchParams(searchParams);
+      if (value) {
+        next.set("profile", value);
+      } else {
+        next.delete("profile");
+      }
+      // A resume id belongs to one profile's session DB.  Switching profiles
+      // while carrying it forward would invite a confusing "missing session"
+      // boot, so start a clean TUI for the new profile.
+      next.delete("resume");
+      setSearchParams(next, { replace: true });
+      setBanner(null);
+      setMobilePanelOpenRaw(false);
+    },
+    [searchParams, setSearchParams],
+  );
 
   useEffect(() => {
     if (!resumeParam) return;
@@ -571,26 +621,28 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // ``return cleanup`` stays at the top level; handlers + disposables
     // are hoisted to ``let`` bindings the cleanup closes over.
     let unmounting = false;
+    let ws: WebSocket | null = null;
     let onDataDisposable: { dispose(): void } | null = null;
     let onResizeDisposable: { dispose(): void } | null = null;
     void (async () => {
       const authParam = await buildWsAuthParam();
       if (unmounting) return;
-      const url = buildWsUrl(authParam, resumeParam, channel);
-      const ws = new WebSocket(url);
-      ws.binaryType = "arraybuffer";
-      wsRef.current = ws;
+      const url = buildWsUrl(authParam, resumeParam, channel, selectedProfile);
+      const socket = new WebSocket(url);
+      ws = socket;
+      socket.binaryType = "arraybuffer";
+      wsRef.current = socket;
 
-    ws.onopen = () => {
+    socket.onopen = () => {
       setBanner(null);
       // Send the initial RESIZE immediately so Ink has *a* size to lay
       // out against on its first paint.  The double-rAF block above will
       // follow up with the authoritative measurement — at worst Ink
       // reflows once after the PTY boots, which is imperceptible.
-      ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+      socket.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
     };
 
-    ws.onmessage = (ev) => {
+    socket.onmessage = (ev) => {
       if (typeof ev.data === "string") {
         term.write(ev.data);
       } else {
@@ -598,7 +650,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
     };
 
-    ws.onclose = (ev) => {
+    socket.onclose = (ev) => {
       wsRef.current = null;
       if (unmounting) {
         return;
@@ -635,18 +687,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
       const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
       onDataDisposable = term.onData((data) => {
-        if (ws.readyState !== WebSocket.OPEN) return;
+        if (socket.readyState !== WebSocket.OPEN) return;
 
         if (SGR_MOUSE_RE.test(data)) {
           return;
         }
 
-        ws.send(data);
+        socket.send(data);
       });
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(`\x1b[RESIZE:${cols};${rows}]`);
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(`\x1b[RESIZE:${cols};${rows}]`);
         }
       });
     })();
@@ -668,13 +720,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (hostSyncRaf) cancelAnimationFrame(hostSyncRaf);
       if (settleRaf1) cancelAnimationFrame(settleRaf1);
       if (settleRaf2) cancelAnimationFrame(settleRaf2);
-      // Phase 5.3: ``ws`` is local to the IIFE that opens it (the gated-mode
-      // ticket fetch makes the open async). The cleanup runs at the outer
-      // effect's top level so it can't reach into that scope — close via
-      // the ref instead. ``?.`` covers the race where unmount fires before
-      // the ticket fetch resolves and ``wsRef.current`` was never assigned.
-      wsRef.current?.close();
-      wsRef.current = null;
+      // Phase 5.3: ``ws`` is opened asynchronously after the gated-mode
+      // ticket fetch. Keep both the effect-local handle and the ref in sync:
+      // the local handle guarantees profile/resume changes close the exact
+      // socket this effect created, while the ref covers imperative callers.
+      ws?.close();
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -683,7 +736,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         copyResetRef.current = null;
       }
     };
-  }, [channel, resumeParam]);
+  }, [channel, resumeParam, selectedProfile]);
 
   // When the user returns to the chat tab (isActive: false → true), the
   // terminal host just transitioned from display:none to display:flex.
@@ -820,7 +873,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "border-t border-current/10",
             )}
           >
-            <ChatSidebar channel={channel} />
+            <ChatSidebar key={channel} channel={channel} />
           </div>
         </div>
       </>,
@@ -831,6 +884,36 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     <div className="flex min-h-0 flex-1 flex-col gap-2">
       <PluginSlot name="chat:top" />
       {mobileModelToolsPortal}
+
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-current/10 bg-midground/5 px-3 py-2 text-xs tracking-wide text-text-secondary">
+        <label className="flex min-w-0 items-center gap-2">
+          <span className="text-display text-text-tertiary">profile</span>
+          <select
+            value={selectedProfile ?? ""}
+            onChange={(ev) => onProfileChange(ev.target.value)}
+            disabled={profiles.length === 0}
+            title="Start a fresh embedded Chat session in the selected Hermes profile"
+            className="rounded border border-current/20 bg-background-base px-2 py-1 text-midground outline-none hover:border-current/40 disabled:opacity-50"
+          >
+            <option value="">dashboard default</option>
+            {profiles.map((profile) => (
+              <option key={profile.name} value={profile.name}>
+                {profile.name}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        <span className="min-w-0 text-right text-[11px] text-text-tertiary">
+          Switching profiles starts a fresh terminal session.
+        </span>
+      </div>
+
+      {profilesError && (
+        <div className="border border-warning/50 bg-warning/10 text-warning px-3 py-2 text-xs tracking-wide">
+          Profile list unavailable: {profilesError}
+        </div>
+      )}
 
       {banner && (
         <div className="border border-warning/50 bg-warning/10 text-warning px-3 py-2 text-xs tracking-wide">
@@ -888,7 +971,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-80"
           >
             <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSidebar channel={channel} />
+              <ChatSidebar key={channel} channel={channel} />
             </div>
           </div>
         )}

@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from tui_gateway import server
 
@@ -131,8 +131,19 @@ def _ws_peer_label(ws: Any) -> str:
     return f"{host}:{port}" if port is not None else host
 
 
-async def handle_ws(ws: Any) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
+async def handle_ws(
+    ws: Any,
+    *,
+    close_sessions_on_disconnect: bool = False,
+    transport_factory: Callable[[Any, asyncio.AbstractEventLoop], Any] = WSTransport,
+) -> None:
+    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
+
+    When used as the dashboard Chat sidebar sidecar, this handler runs inside
+    the long-lived dashboard server process. Sessions created by that WS need
+    explicit cleanup on disconnect; there is no process exit to trigger the
+    stdio gateway's atexit cleanup path.
+    """
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
     messages = 0
@@ -146,7 +157,11 @@ async def handle_ws(ws: Any) -> None:
         disconnect_reason = "connected"
         _log.info("ws accepted peer=%s", peer)
 
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        loop = asyncio.get_running_loop()
+        if transport_factory is WSTransport:
+            transport = WSTransport(ws, loop, peer=peer)
+        else:
+            transport = transport_factory(ws, loop)
 
         ready_ok = await transport.write_async(
             {
@@ -259,12 +274,34 @@ async def handle_ws(ws: Any) -> None:
         if transport is not None:
             transport.close()
 
-            # Detach the transport from any sessions it owned so later emits
-            # fall back to stdio instead of crashing into a closed socket.
-            for _, sess in list(server._sessions.items()):
+            # Detach or close sessions owned by this socket. Stdio TUI embeds
+            # run in their own process, so process shutdown handles session
+            # cleanup. Dashboard sidecar WebSockets run in the long-lived
+            # dashboard server; if the browser disconnects, close their
+            # sessions now so slash_worker children do not linger.
+            for sid, sess in list(server._sessions.items()):
                 if sess.get("transport") is transport:
-                    sess["transport"] = server._stdio_transport
-                    detached_sessions += 1
+                    if close_sessions_on_disconnect:
+                        server._sessions.pop(sid, None)
+                        try:
+                            server._finalize_session(sess, end_reason="ws_disconnect")
+                        except Exception:
+                            pass
+                        try:
+                            worker = sess.get("slash_worker")
+                            if worker:
+                                worker.close()
+                        except Exception:
+                            pass
+                        try:
+                            agent = sess.get("agent")
+                            if agent and hasattr(agent, "close"):
+                                agent.close()
+                        except Exception:
+                            pass
+                    else:
+                        sess["transport"] = server._stdio_transport
+                        detached_sessions += 1
         try:
             await ws.close()
         except Exception as exc:

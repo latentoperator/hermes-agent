@@ -7097,6 +7097,19 @@ def _ws_host_origin_is_allowed(ws: "WebSocket") -> bool:
     if not parsed.netloc:
         return False
 
+    # Loopback dashboards are commonly published through a trusted reverse
+    # proxy (Cloudflared/Tailscale/etc.) that preserves the browser Origin
+    # while rewriting Host to loopback.  Keep the default same-bound-host
+    # guard, but allow operators to name explicit public dashboard origins.
+    allowed_origins = {
+        item.strip().rstrip("/")
+        for item in os.environ.get("HERMES_DASHBOARD_ALLOWED_ORIGINS", "").split(",")
+        if item.strip()
+    }
+    origin_value = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    if origin_value in allowed_origins:
+        return True
+
     return _is_accepted_host(parsed.netloc, bound_host)
 
 
@@ -7188,6 +7201,7 @@ def _ws_auth_ok(ws: "WebSocket") -> bool:
 def _resolve_chat_argv(
     resume: Optional[str] = None,
     sidecar_url: Optional[str] = None,
+    profile: Optional[str] = None,
 ) -> tuple[list[str], Optional[str], Optional[dict]]:
     """Resolve the argv + cwd + env for the chat PTY.
 
@@ -7207,8 +7221,18 @@ def _resolve_chat_argv(
     `sidecar_url` (when set) is forwarded as ``HERMES_TUI_SIDECAR_URL`` so
     the spawned ``tui_gateway.entry`` can mirror dispatcher emits to the
     dashboard's ``/api/pub`` endpoint (see :func:`pub_ws`).
+
+    `profile` selects the HERMES_HOME inherited by the TUI child.  The
+    dashboard server itself stays in its own profile; only the spawned chat
+    process is scoped to the requested profile.
     """
     from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
+    from hermes_cli.profiles import (
+        get_profile_dir,
+        normalize_profile_name,
+        profile_exists,
+        validate_profile_name,
+    )
 
     argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
     env = os.environ.copy()
@@ -7221,6 +7245,20 @@ def _resolve_chat_argv(
     # the dashboard PTY path.
     env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
     env.setdefault("HERMES_TUI_INLINE", "1")
+
+    if profile:
+        try:
+            selected_profile = normalize_profile_name(profile)
+            validate_profile_name(selected_profile)
+        except ValueError as exc:
+            raise PtyUnavailableError(str(exc)) from exc
+
+        if not profile_exists(selected_profile):
+            raise PtyUnavailableError(f"Profile '{selected_profile}' does not exist")
+
+        profile_home = get_profile_dir(selected_profile)
+        env["HERMES_HOME"] = str(profile_home)
+        env["HERMES_PROFILE"] = selected_profile
 
     if resume:
         latest_resume, _latest_path = _session_latest_descendant(resume)
@@ -7359,11 +7397,16 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # --- spawn PTY ------------------------------------------------------
     resume = ws.query_params.get("resume") or None
+    profile = ws.query_params.get("profile") or None
     channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
 
     try:
-        argv, cwd, env = _resolve_chat_argv(resume=resume, sidecar_url=sidecar_url)
+        argv, cwd, env = _resolve_chat_argv(
+            resume=resume,
+            sidecar_url=sidecar_url,
+            profile=profile,
+        )
     except SystemExit as exc:
         # _make_tui_argv calls sys.exit(1) when node/npm is missing.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
@@ -7463,7 +7506,7 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    await handle_ws(ws, close_sessions_on_disconnect=True)
 
 
 # ---------------------------------------------------------------------------
