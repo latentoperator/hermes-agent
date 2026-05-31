@@ -232,6 +232,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     if _profile_home:
         sanitized["HOME"] = _profile_home
 
+    _inject_hermes_bin_path(sanitized)
+
     return sanitized
 
 
@@ -299,6 +301,36 @@ _SANE_PATH = (
 )
 
 
+def _prepend_path_entry(env: dict, directory: str | os.PathLike | None) -> None:
+    """Prepend an existing directory to ``env['PATH']`` if not present."""
+    if not directory:
+        return
+    directory_str = os.fspath(directory)
+    if not os.path.isdir(directory_str):
+        return
+    existing_path = env.get("PATH", "")
+    parts = [part for part in existing_path.split(os.pathsep) if part]
+    if directory_str not in parts:
+        env["PATH"] = os.pathsep.join([directory_str, *parts]) if parts else directory_str
+
+
+def _inject_hermes_bin_path(env: dict) -> None:
+    """Make Hermes-managed host binaries available in tool subprocesses.
+
+    Profile subprocesses may intentionally remap HOME to
+    ``$HERMES_HOME/home`` for isolation.  That is good for tools like git/ssh,
+    but it means ``$HOME/.hermes/bin`` no longer points at the shared Hermes
+    bin directory where helpers such as ``bws`` are installed.  Resolve the
+    root Hermes directory explicitly and put its ``bin`` on PATH.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        _prepend_path_entry(env, get_default_hermes_root() / "bin")
+    except Exception:
+        pass
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
@@ -325,6 +357,8 @@ def _make_run_env(env: dict) -> dict:
     # prepends its MSYS2 /usr/bin equivalent via the shell-init files.
     if not _IS_WINDOWS and "/usr/bin" not in existing_path.split(":"):
         run_env["PATH"] = f"{existing_path}:{_SANE_PATH}" if existing_path else _SANE_PATH
+
+    _inject_hermes_bin_path(run_env)
 
     _inject_context_hermes_home(run_env)
 
