@@ -9869,6 +9869,15 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
+    allowed_origins = {
+        item.strip().rstrip("/")
+        for item in os.environ.get("HERMES_DASHBOARD_ALLOWED_ORIGINS", "").split(",")
+        if item.strip()
+    }
+    origin_value = f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+    if origin_value in allowed_origins:
+        return None
+
     if not _is_accepted_host(parsed.netloc, bound_host):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
@@ -10036,7 +10045,6 @@ def _resolve_chat_argv(
     so a profile-scoped chat must spawn its own gateway subprocess.
     """
     from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
-
     profile_dir: Optional[Path] = None
     requested = (profile or "").strip()
     if requested and requested.lower() != "current":
@@ -10352,7 +10360,7 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    await handle_ws(ws, close_sessions_on_disconnect=True)
 
 
 # ---------------------------------------------------------------------------

@@ -175,9 +175,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // The dashboard keeps ChatPage mounted persistently so the PTY survives tab
   // switches. That is great for ordinary /chat navigation, but it means query
   // param changes do NOT remount the component. Resume-in-chat from the
-  // Sessions page relies on `/chat?resume=<id>` changing at runtime, so we must
-  // treat the current resume target as part of the PTY identity and rebuild the
-  // terminal session when it changes.
+  // Sessions page relies on `/chat?resume=<id>` changing at runtime, and the
+  // profile selector similarly needs a new PTY child when it changes.
   const resumeParam = searchParams.get("resume");
   // Profile-scoped chat: spawn the PTY under the globally selected
   // management profile. Changing it remounts the terminal (key below /
@@ -581,26 +580,28 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // ``return cleanup`` stays at the top level; handlers + disposables
     // are hoisted to ``let`` bindings the cleanup closes over.
     let unmounting = false;
+    let ws: WebSocket | null = null;
     let onDataDisposable: { dispose(): void } | null = null;
     let onResizeDisposable: { dispose(): void } | null = null;
     void (async () => {
       const authParam = await buildWsAuthParam();
       if (unmounting) return;
       const url = buildWsUrl(authParam, resumeParam, channel, scopedProfile);
-      const ws = new WebSocket(url);
-      ws.binaryType = "arraybuffer";
-      wsRef.current = ws;
+      const socket = new WebSocket(url);
+      ws = socket;
+      socket.binaryType = "arraybuffer";
+      wsRef.current = socket;
 
-    ws.onopen = () => {
+    socket.onopen = () => {
       setBanner(null);
       // Send the initial RESIZE immediately so Ink has *a* size to lay
       // out against on its first paint.  The double-rAF block above will
       // follow up with the authoritative measurement — at worst Ink
       // reflows once after the PTY boots, which is imperceptible.
-      ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+      socket.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
     };
 
-    ws.onmessage = (ev) => {
+    socket.onmessage = (ev) => {
       if (typeof ev.data === "string") {
         term.write(ev.data);
       } else {
@@ -608,7 +609,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
     };
 
-    ws.onclose = (ev) => {
+    socket.onclose = (ev) => {
       wsRef.current = null;
       if (unmounting) {
         return;
@@ -676,18 +677,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
       const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
       onDataDisposable = term.onData((data) => {
-        if (ws.readyState !== WebSocket.OPEN) return;
+        if (socket.readyState !== WebSocket.OPEN) return;
 
         if (SGR_MOUSE_RE.test(data)) {
           return;
         }
 
-        ws.send(data);
+        socket.send(data);
       });
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(`\x1b[RESIZE:${cols};${rows}]`);
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(`\x1b[RESIZE:${cols};${rows}]`);
         }
       });
     })();
@@ -709,13 +710,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (hostSyncRaf) cancelAnimationFrame(hostSyncRaf);
       if (settleRaf1) cancelAnimationFrame(settleRaf1);
       if (settleRaf2) cancelAnimationFrame(settleRaf2);
-      // Phase 5.3: ``ws`` is local to the IIFE that opens it (the gated-mode
-      // ticket fetch makes the open async). The cleanup runs at the outer
-      // effect's top level so it can't reach into that scope — close via
-      // the ref instead. ``?.`` covers the race where unmount fires before
-      // the ticket fetch resolves and ``wsRef.current`` was never assigned.
-      wsRef.current?.close();
-      wsRef.current = null;
+      // Phase 5.3: ``ws`` is opened asynchronously after the gated-mode
+      // ticket fetch. Keep both the effect-local handle and the ref in sync:
+      // the local handle guarantees profile/resume changes close the exact
+      // socket this effect created, while the ref covers imperative callers.
+      ws?.close();
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -724,6 +726,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         copyResetRef.current = null;
       }
     };
+  }, [channel, resumeParam, scopedProfile]);
   }, [channel, resumeParam, scopedProfile]);
 
   // When the user returns to the chat tab (isActive: false → true), the
@@ -861,7 +864,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               "border-t border-current/10",
             )}
           >
-            <ChatSidebar channel={channel} />
+            <ChatSidebar key={channel} channel={channel} />
           </div>
         </div>
       </>,
@@ -929,7 +932,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             className="flex min-h-0 shrink-0 flex-col overflow-hidden lg:h-full lg:w-80"
           >
             <div className="min-h-0 flex-1 overflow-hidden">
-              <ChatSidebar channel={channel} />
+              <ChatSidebar key={channel} channel={channel} />
             </div>
           </div>
         )}

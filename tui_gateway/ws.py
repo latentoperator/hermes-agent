@@ -27,7 +27,7 @@ import asyncio
 import json
 import logging
 import socket
-from typing import Any
+from typing import Any, Callable
 
 from tui_gateway import server
 
@@ -156,8 +156,18 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(ws: Any) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
+async def handle_ws(
+    ws: Any,
+    *,
+    close_sessions_on_disconnect: bool = False,
+    transport_factory: Callable[[Any, asyncio.AbstractEventLoop], Any] = WSTransport,
+) -> None:
+    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
+
+    Dashboard sidecar WebSockets run inside the long-lived dashboard server
+    process. When requested, sessions owned by this socket are explicitly
+    closed on disconnect through the unified server teardown path.
+    """
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
     messages = 0
@@ -174,7 +184,11 @@ async def handle_ws(ws: Any) -> None:
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
+        loop = asyncio.get_running_loop()
+        if transport_factory is WSTransport:
+            transport = WSTransport(ws, loop, peer=peer)
+        else:
+            transport = transport_factory(ws, loop)
 
         ready_ok = await transport.write_async(
             {
@@ -287,6 +301,11 @@ async def handle_ws(ws: Any) -> None:
         detached_sessions = 0
         if transport is not None:
             transport.close()
+            if close_sessions_on_disconnect:
+                with server._sessions_lock:
+                    for sess in server._sessions.values():
+                        if sess.get("transport") is transport:
+                            sess["close_on_disconnect"] = True
 
             # Reap sessions this transport owned (close_on_disconnect sidecar
             # sessions) or detach the rest to the drop sentinel so later emits
