@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import platform
+import random
 import shutil
 import stat
 import subprocess
@@ -66,6 +67,8 @@ _BWS_CHECKSUM_NAME = f"bws-sha256-checksums-{_BWS_VERSION}.txt"
 # How long to wait for bws subprocesses and HTTP downloads, in seconds.
 _BWS_DOWNLOAD_TIMEOUT = 60
 _BWS_RUN_TIMEOUT = 30
+_BWS_RATE_LIMIT_MAX_ATTEMPTS = 5
+_BWS_RATE_LIMIT_BASE_DELAY = 1.0
 
 # In-process cache so repeated load_hermes_dotenv() calls (CLI startup,
 # gateway hot-reload, test suites) don't re-fetch from BSM.
@@ -519,29 +522,36 @@ def _run_bws_list(
     if server_url:
         env["BWS_SERVER_URL"] = server_url
 
-    try:
-        proc = subprocess.run(  # noqa: S603 — bws path is trusted
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=_BWS_RUN_TIMEOUT,
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets"
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError(f"failed to invoke bws: {exc}") from exc
+    last_error = ""
+    for attempt in range(1, _BWS_RATE_LIMIT_MAX_ATTEMPTS + 1):
+        try:
+            proc = subprocess.run(  # noqa: S603 — bws path is trusted
+                cmd,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=_BWS_RUN_TIMEOUT,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"failed to invoke bws: {exc}") from exc
 
-    if proc.returncode != 0:
-        # bws writes auth/network errors to stderr in plain English.
-        # Strip ANSI just in case and surface the first 200 chars.
+        if proc.returncode == 0:
+            break
+
+        # bws writes auth/network/rate-limit errors to stderr in plain English.
+        # Strip ANSI just in case and surface a concise message if retries fail.
         err = (proc.stderr or proc.stdout or "").strip().replace("\x1b", "")
-        raise RuntimeError(
-            f"bws exited {proc.returncode}: {err[:200]}"
-        )
+        last_error = err[:200]
+        if not _is_bws_rate_limited(err) or attempt >= _BWS_RATE_LIMIT_MAX_ATTEMPTS:
+            raise RuntimeError(f"bws exited {proc.returncode}: {last_error}")
+        time.sleep(_bws_rate_limit_delay(attempt, err))
+    else:  # pragma: no cover - loop exits by break or raise
+        raise RuntimeError(f"bws exited non-zero: {last_error}")
 
     raw = proc.stdout.strip()
     if not raw:
@@ -573,6 +583,28 @@ def _run_bws_list(
             continue
         secrets[key] = value
     return secrets, warnings
+
+
+def _is_bws_rate_limited(message: str) -> bool:
+    lowered = message.lower()
+    return "429" in lowered or "too many requests" in lowered or "slow down" in lowered
+
+
+def _bws_rate_limit_delay(attempt: int, message: str) -> float:
+    """Return a small backoff for BWS 429s during parallel fleet starts."""
+    retry_after = _BWS_RATE_LIMIT_BASE_DELAY
+    marker = "try again in "
+    lowered = message.lower()
+    if marker in lowered:
+        tail = lowered.split(marker, 1)[1]
+        token = tail.split()[0].rstrip("s.,")
+        try:
+            retry_after = max(retry_after, float(token))
+        except ValueError:
+            pass
+    exponential = _BWS_RATE_LIMIT_BASE_DELAY * (2 ** (attempt - 1))
+    jitter = random.uniform(0.0, 0.75)
+    return min(max(retry_after, exponential) + jitter, 8.0)
 
 
 def _is_valid_env_name(name: str) -> bool:

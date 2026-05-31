@@ -488,6 +488,39 @@ def test_fetch_cache_disabled(monkeypatch, tmp_path):
     assert call_count["n"] == 2
 
 
+def test_fetch_retries_bws_rate_limit(monkeypatch, tmp_path):
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "K", "value": "v"}])
+    calls = {"n": 0}
+
+    def fake_run(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr='Error: [429 Too Many Requests] {"message":"Slow down! Too many requests. Try again in 1s."}',
+            )
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    sleeps = []
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    monkeypatch.setattr(bw.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(bw.random, "uniform", lambda a, b: 0.0)
+
+    secrets, warnings = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        use_cache=False,
+    )
+    assert secrets == {"K": "v"}
+    assert warnings == []
+    assert calls["n"] == 2
+    assert sleeps == [1.0]
+
+
 # ---------------------------------------------------------------------------
 # apply_bitwarden_secrets — the public entry point used by env_loader
 # ---------------------------------------------------------------------------

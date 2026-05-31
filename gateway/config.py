@@ -1565,12 +1565,17 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         )
 
     # SMS (Twilio)
+    # Only auto-enable SMS when the gateway has the complete send configuration.
+    # Some environments hydrate broad Twilio credentials for other tools; a bare
+    # Account SID/Auth Token should not make every gateway attempt SMS startup.
     twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
-    if twilio_sid:
+    twilio_auth = os.getenv("TWILIO_AUTH_TOKEN")
+    twilio_phone = os.getenv("TWILIO_PHONE_NUMBER")
+    if twilio_sid and twilio_auth and twilio_phone:
         if Platform.SMS not in config.platforms:
             config.platforms[Platform.SMS] = PlatformConfig()
         config.platforms[Platform.SMS].enabled = True
-        config.platforms[Platform.SMS].api_key = os.getenv("TWILIO_AUTH_TOKEN", "")
+        config.platforms[Platform.SMS].api_key = twilio_auth
     sms_home = os.getenv("SMS_HOME_CHANNEL")
     if sms_home and Platform.SMS in config.platforms:
         config.platforms[Platform.SMS].home_channel = HomeChannel(

@@ -233,6 +233,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     if _profile_home:
         sanitized["HOME"] = _profile_home
 
+    _inject_hermes_bin_path(sanitized)
+
     return sanitized
 
 
@@ -366,6 +368,32 @@ def _path_env_key(run_env: dict) -> str | None:
     return None
 
 
+def _prepend_path_entry(env: dict, directory: str | os.PathLike | None) -> None:
+    """Prepend an existing directory to PATH if not already present."""
+    if not directory:
+        return
+    directory_str = os.fspath(directory)
+    if not os.path.isdir(directory_str):
+        return
+    path_key = _path_env_key(env)
+    if path_key is None:
+        return
+    existing_path = env.get(path_key, "")
+    parts = [part for part in existing_path.split(os.pathsep) if part]
+    if directory_str not in parts:
+        env[path_key] = os.pathsep.join([directory_str, *parts]) if parts else directory_str
+
+
+def _inject_hermes_bin_path(env: dict) -> None:
+    """Make Hermes-managed host binaries available in tool subprocesses."""
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        _prepend_path_entry(env, get_default_hermes_root() / "bin")
+    except Exception:
+        pass
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
@@ -384,6 +412,8 @@ def _make_run_env(env: dict) -> dict:
     path_key = _path_env_key(run_env)
     if path_key is not None:
         run_env[path_key] = _append_missing_sane_path_entries(run_env.get(path_key, ""))
+
+    _inject_hermes_bin_path(run_env)
 
     _inject_context_hermes_home(run_env)
 
