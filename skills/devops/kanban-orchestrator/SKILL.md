@@ -3,6 +3,7 @@ name: kanban-orchestrator
 description: Plan and route multi-card Kanban work without executing child tasks directly.
 version: 3.0.0
 platforms: [linux, macos, windows]
+environments: [kanban]
 metadata:
   hermes:
     tags: [kanban, multi-agent, orchestration, routing]

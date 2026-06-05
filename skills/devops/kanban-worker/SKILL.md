@@ -3,6 +3,7 @@ name: kanban-worker
 description: Pitfalls, examples, and handoff patterns for Hermes Kanban workers.
 version: 2.0.0
 platforms: [linux, macos, windows]
+environments: [kanban]
 metadata:
   hermes:
     tags: [kanban, multi-agent, collaboration, workflow, pitfalls]

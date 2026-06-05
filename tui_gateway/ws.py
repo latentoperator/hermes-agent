@@ -100,7 +100,10 @@ class WSTransport:
             return not self._closed
         except Exception as exc:
             self._closed = True
-            _log.warning("ws write failed peer=%s error=%s", self._peer, exc)
+            _log.warning(
+                "ws write failed peer=%s error_type=%s error=%s",
+                self._peer, type(exc).__name__, exc,
+            )
             return False
 
     async def write_async(self, obj: dict) -> bool:
@@ -115,7 +118,10 @@ class WSTransport:
             await self._ws.send_text(line)
         except Exception as exc:
             self._closed = True
-            _log.warning("ws send failed peer=%s error=%s", self._peer, exc)
+            _log.warning(
+                "ws send failed peer=%s error_type=%s error=%s",
+                self._peer, type(exc).__name__, exc,
+            )
 
     def close(self) -> None:
         self._closed = True
@@ -271,14 +277,17 @@ async def handle_ws(
                 break
     finally:
         detached_sessions = 0
+        reaped_scheduled = 0
         if transport is not None:
             transport.close()
 
             # Detach or close sessions owned by this socket. Stdio TUI embeds
             # run in their own process, so process shutdown handles session
             # cleanup. Dashboard sidecar WebSockets run in the long-lived
-            # dashboard server; if the browser disconnects, close their
-            # sessions now so slash_worker children do not linger.
+            # dashboard server; callers that own those sessions can request
+            # immediate cleanup. Otherwise, detach to stdio and let upstream's
+            # grace-delayed orphan reaper handle stale dashboard sessions while
+            # still allowing a quick reconnect/session.resume to rebind.
             for sid, sess in list(server._sessions.items()):
                 if sess.get("transport") is transport:
                     if close_sessions_on_disconnect:
@@ -302,6 +311,15 @@ async def handle_ws(
                     else:
                         sess["transport"] = server._stdio_transport
                         detached_sessions += 1
+                        try:
+                            server._schedule_ws_orphan_reap(sid)
+                            reaped_scheduled += 1
+                        except Exception:
+                            _log.exception(
+                                "ws orphan-reap schedule failed peer=%s sid=%s",
+                                peer,
+                                sid,
+                            )
         try:
             await ws.close()
         except Exception as exc:
