@@ -28,6 +28,7 @@ const { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } = requ
 const { runBootstrap } = require('./bootstrap-runner.cjs')
 const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const { probeGatewayWebSocket } = require('./gateway-ws-probe.cjs')
+const { serializeJsonBody, setJsonRequestHeaders } = require('./oauth-net-request.cjs')
 const {
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -407,8 +408,13 @@ function previewFileMetadata(filePath, mimeType) {
 }
 
 app.setName(APP_NAME)
+// Seed the native About panel with the live Hermes version. This is refreshed
+// on every open via the explicit "About" menu handler (refreshAboutPanel), so
+// an in-place `hermes update` mid-session is reflected without an app restart;
+// the seed here just covers the first open and any non-menu invocation path.
 app.setAboutPanelOptions({
   applicationName: APP_NAME,
+  applicationVersion: resolveHermesVersion(),
   copyright: 'Copyright © 2026 Nous Research'
 })
 
@@ -1313,6 +1319,31 @@ function resolveUpdaterBinary() {
   return fileExists(candidate) ? candidate : null
 }
 
+function repairMacUpdaterHelper(updater) {
+  if (!IS_MAC || !updater) return
+
+  try {
+    execFileSync('/usr/bin/xattr', ['-cr', updater], { stdio: 'ignore' })
+  } catch (err) {
+    rememberLog(`[updates] macOS updater helper quarantine repair skipped: ${err.message}`)
+  }
+
+  try {
+    execFileSync('/usr/bin/codesign', ['--verify', updater], { stdio: 'ignore' })
+    return
+  } catch {
+    // Unsigned or invalid helper. Apply a local ad-hoc signature so Gatekeeper
+    // does not block the staged updater before it can run.
+  }
+
+  try {
+    execFileSync('/usr/bin/codesign', ['--force', '--sign', '-', updater], { stdio: 'ignore' })
+    rememberLog('[updates] repaired macOS updater helper signature')
+  } catch (err) {
+    rememberLog(`[updates] macOS updater helper signature repair skipped: ${err.message}`)
+  }
+}
+
 // Path to the venv shim whose lock decides whether `hermes update` can write
 // fresh entry points. On Windows this is the file the running backend
 // `hermes.exe` holds open; on POSIX it's never mandatory-locked.
@@ -1473,6 +1504,7 @@ async function applyUpdates(opts = {}) {
     }
 
     emitUpdateProgress({ stage: 'restart', message: 'Handing off to the Hermes updater…', percent: 100 })
+    repairMacUpdaterHelper(updater)
 
     const updateRoot = resolveUpdateRoot()
     const { branch: configuredBranch } = readDesktopUpdateConfig()
@@ -2954,7 +2986,7 @@ function buildApplicationMenu() {
     template.push({
       label: APP_NAME,
       submenu: [
-        { role: 'about', label: `About ${APP_NAME}` },
+        { label: `About ${APP_NAME}`, click: () => showAboutPanelFresh() },
         checkForUpdatesItem,
         { type: 'separator' },
         { role: 'services' },
@@ -3467,7 +3499,7 @@ function fetchJsonViaOauthSession(url, options = {}) {
       reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
       return
     }
-    const body = options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body))
+    const body = serializeJsonBody(options.body)
     const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
     const request = electronNet.request({
@@ -3477,8 +3509,7 @@ function fetchJsonViaOauthSession(url, options = {}) {
       useSessionCookies: true,
       redirect: 'follow'
     })
-    request.setHeader('Content-Type', 'application/json')
-    if (body) request.setHeader('Content-Length', String(body.length))
+    setJsonRequestHeaders(request)
 
     let timedOut = false
     const timer = setTimeout(() => {
@@ -3907,6 +3938,44 @@ async function resolveRemoteBackend(profile) {
   const authMode = normAuthMode(config.remote?.authMode)
   const token = authMode === 'oauth' ? null : decryptDesktopSecret(config.remote?.token)
   return buildRemoteConnection(config.remote?.url, authMode, token, 'settings')
+}
+
+// A remote profile's sessions live on its remote host's state.db, not on a local
+// file the primary can open — so reads for it must route to the remote backend,
+// not the local-disk fast path. These three helpers drive that (see
+// interceptSessionReadForRemote).
+function profileHasRemoteOverride(profile) {
+  return Boolean(profileRemoteOverride(readDesktopConnectionConfig(), profile))
+}
+
+function configuredRemoteProfileNames() {
+  const config = readDesktopConnectionConfig()
+  return Object.keys(config.profiles || {}).filter(name => profileRemoteOverride(config, name))
+}
+
+// True when the app is in app-global remote mode (Settings → "All profiles" →
+// Remote, or the env override): a SINGLE remote backend serves every profile via
+// ?profile=. Distinct from per-profile overrides — here there's one host for all.
+function globalRemoteActive() {
+  if (process.env.HERMES_DESKTOP_REMOTE_URL) {
+    return true
+  }
+  return readDesktopConnectionConfig().mode === 'remote'
+}
+
+// GET a profile's resolved backend (remote pool or local primary), parsed JSON.
+async function fetchJsonForProfile(profile, path) {
+  return requestJsonForProfile(profile, path, 'GET')
+}
+
+// Issue an arbitrary method against a profile's resolved backend, parsed JSON.
+async function requestJsonForProfile(profile, path, method, body) {
+  const conn = await ensureBackend(profile)
+  const url = `${conn.baseUrl}${path}`
+  const opts = { method, body, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
+  return conn.authMode === 'oauth'
+    ? fetchJsonViaOauthSession(url, opts)
+    : fetchJson(url, conn.token, opts)
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -4698,7 +4767,145 @@ ipcMain.handle('hermes:requestMicrophoneAccess', async () => {
   return systemPreferences.askForMediaAccess('microphone')
 })
 
+// Re-route remote-profile session requests to the owning remote backend. Returns
+// `undefined` when not interceptable (caller takes the normal local path), else
+// the response. Reads tag the profile as ?profile=<name>; mutations carry it in
+// request.profile. Either way, a remote profile's session lives only on its
+// remote host, so the request must go there (where it serves its own state.db).
+//   GET    /api/profiles/sessions        → splice each remote profile's rows in
+//   GET    /api/sessions/{id}[/messages] → read from remote
+//   DELETE /api/sessions/{id}            → delete on remote
+//   PATCH  /api/sessions/{id}            → rename/archive on remote
+async function interceptSessionRequestForRemote(request) {
+  if (typeof request?.path !== 'string') {
+    return undefined
+  }
+  const method = (request.method || 'GET').toUpperCase()
+
+  let parsed
+  try {
+    parsed = new URL(request.path, 'http://x')
+  } catch {
+    return undefined
+  }
+  const { pathname, searchParams } = parsed
+
+  if (method === 'GET' && pathname === '/api/profiles/sessions') {
+    const remoteProfiles = configuredRemoteProfileNames()
+    if (remoteProfiles.length === 0) {
+      return undefined // no remote profiles → local fast path
+    }
+    const requested = (searchParams.get('profile') || 'all').trim() || 'all'
+    if (requested !== 'all') {
+      return profileHasRemoteOverride(requested) ? remoteSessionList(requested, searchParams) : undefined
+    }
+    return mergeRemoteProfileSessions(searchParams, remoteProfiles)
+  }
+
+  // Per-session read/mutation. Owner is in ?profile= (reads) or request.profile
+  // (mutations). Two remote shapes:
+  //  - per-profile override: route to that profile's own remote, sans profile
+  //    param (it serves its own state.db natively).
+  //  - global remote mode: ONE backend serves every profile via ?profile=, so
+  //    route there and KEEP the profile param so it opens the right state.db.
+  if (/^\/api\/sessions\/[^/]+(\/messages)?$/.test(pathname)) {
+    const profile = (searchParams.get('profile') || request.profile || '').trim()
+    if (!profile) {
+      return undefined
+    }
+    if (profileHasRemoteOverride(profile)) {
+      if (method === 'GET') {
+        return fetchJsonForProfile(profile, pathname)
+      }
+      const body = request.body && typeof request.body === 'object' ? { ...request.body } : request.body
+      if (body) delete body.profile
+      return requestJsonForProfile(profile, pathname, method, body)
+    }
+    if (globalRemoteActive()) {
+      // Single global backend: keep ?profile= so it opens the right state.db.
+      const sep = pathname.includes('?') ? '&' : '?'
+      const path = `${pathname}${sep}profile=${encodeURIComponent(profile)}`
+      if (method === 'GET') {
+        return fetchJsonForProfile(null, path)
+      }
+      const body = request.body && typeof request.body === 'object' ? { ...request.body, profile } : { profile }
+      return requestJsonForProfile(null, path, method, body)
+    }
+    return undefined
+  }
+
+  return undefined
+}
+
+const rowsOf = data => (Array.isArray(data?.sessions) ? data.sessions : [])
+
+// A remote profile's session list, read from its remote host and tagged with the
+// desktop-facing profile name (the remote's /api/sessions doesn't know it).
+async function remoteSessionList(profile, searchParams) {
+  const qs = new URLSearchParams(searchParams)
+  qs.delete('profile') // remote serves its own db; no cross-profile read there
+  const data = await fetchJsonForProfile(profile, `/api/sessions?${qs}`)
+  for (const s of rowsOf(data)) {
+    s.profile = profile
+    s.is_default_profile = false
+  }
+  return { ...data, sessions: rowsOf(data) }
+}
+
+// Unified list: primary's local aggregate, with each remote profile's stale local
+// rows/totals swapped for the remote's real ones, re-sorted by recency and
+// re-windowed to the requested page. A dead remote contributes nothing rather
+// than breaking the sidebar.
+async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
+  const limit = Math.max(1, Number(searchParams.get('limit')) || 20)
+  const offset = Math.max(0, Number(searchParams.get('offset')) || 0)
+  const order = searchParams.get('order') === 'created' ? 'started_at' : 'last_active'
+
+  const primary = await ensureBackend(null)
+  const base = await fetchJson(`${primary.baseUrl}/api/profiles/sessions?${searchParams}`, primary.token, {
+    method: 'GET',
+    timeoutMs: DEFAULT_FETCH_TIMEOUT_MS
+  }).catch(() => ({ sessions: [], total: 0, profile_totals: {} }))
+
+  // Over-fetch each remote from offset 0 (limit+offset rows) so the merged window
+  // is correct for this page — mirrors the primary's per-profile over-fetch.
+  const remoteParams = new URLSearchParams(searchParams)
+  remoteParams.set('limit', String(limit + offset))
+  remoteParams.set('offset', '0')
+
+  const remoteSet = new Set(remoteProfiles)
+  const merged = rowsOf(base).filter(s => !remoteSet.has(s?.profile))
+  const profileTotals = { ...(base.profile_totals || {}) }
+  let total = (Number(base.total) || 0) - remoteProfiles.reduce((n, p) => n + (profileTotals[p] || 0), 0)
+
+  // Swap each remote profile's stale local rows/total for the remote's real ones.
+  await Promise.all(remoteProfiles.map(async name => {
+    const list = await remoteSessionList(name, remoteParams).catch(() => null)
+    if (!list) {
+      delete profileTotals[name] // dead remote → drop its stale local total too
+      return
+    }
+    const rows = rowsOf(list)
+    merged.push(...rows)
+    profileTotals[name] = Number(list.total) || rows.length
+    total += profileTotals[name]
+  }))
+
+  const recency = s => s?.[order] ?? s?.started_at ?? 0
+  merged.sort((a, b) => recency(b) - recency(a))
+  return { ...base, sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
+}
+
 ipcMain.handle('hermes:api', async (_event, request) => {
+  // Remote-profile session requests would otherwise hit the local primary off
+  // each profile's on-disk state.db — fine for local profiles, but a remote
+  // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
+  // no-op) the moment they run there. Route reads + mutations to the remote.
+  const rerouted = await interceptSessionRequestForRemote(request)
+  if (rerouted !== undefined) {
+    return rerouted
+  }
+
   const connection = await ensureBackend(request?.profile)
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
   const url = `${connection.baseUrl}${request.path}`
@@ -5169,6 +5376,19 @@ function resolveHermesVersion() {
     // Fall through to the Electron app version below.
   }
   return app.getVersion()
+}
+
+// Re-resolve the live Hermes version and push it into the native About panel
+// just before showing it, so an in-place `hermes update` is reflected without
+// an app restart. macOS only — `showAboutPanel()` is a no-op elsewhere, and the
+// other platforms don't use this menu item.
+function showAboutPanelFresh() {
+  app.setAboutPanelOptions({
+    applicationName: APP_NAME,
+    applicationVersion: resolveHermesVersion(),
+    copyright: 'Copyright © 2026 Nous Research'
+  })
+  app.showAboutPanel()
 }
 
 ipcMain.handle('hermes:version', async () => ({
