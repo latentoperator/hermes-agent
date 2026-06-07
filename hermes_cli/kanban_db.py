@@ -103,6 +103,16 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
+# Hopewell's dev review gate is intentionally Kanban-owned, not Git-hook-owned:
+# cards created for persistent work under this root get a dependent review card.
+# Env/config can override every field so this stays operationally recoverable.
+DEFAULT_REVIEW_GATE_ROOTS = ("/home/hopewell/hopewell-dev",)
+DEFAULT_REVIEW_GATE_ASSIGNEE = "wren"
+DEFAULT_REVIEW_GATE_MODEL = "anthropic/claude-opus-4.8"
+DEFAULT_REVIEW_GATE_FALLBACK_MODEL = "google/gemini-3-pro-preview"
+DEFAULT_REVIEW_GATE_SKILLS = ("github-code-review",)
+REVIEW_GATE_CREATED_BY = "hopewell-dev-review-gate"
+
 # A running task's claim is valid for 15 minutes by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
 # call ``heartbeat_claim(task_id)`` periodically. In practice most kanban
@@ -2059,6 +2069,128 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _review_gate_config() -> dict[str, Any]:
+    """Return Hopewell dev review-gate settings from config/env."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        gate = kanban_cfg.get("review_gate", {}) if isinstance(kanban_cfg, dict) else {}
+        if not isinstance(gate, dict):
+            gate = {}
+    except Exception:
+        gate = {}
+
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+    enabled = _env_bool(
+        "HERMES_KANBAN_REVIEW_GATE_ENABLED",
+        bool(gate.get("enabled", True)),
+    )
+
+    raw_roots = os.environ.get("HERMES_KANBAN_REVIEW_GATE_ROOTS")
+    if raw_roots is not None:
+        roots = [p.strip() for p in raw_roots.split(os.pathsep) if p.strip()]
+    else:
+        configured_roots = gate.get("roots")
+        if isinstance(configured_roots, (list, tuple)):
+            roots = [str(p).strip() for p in configured_roots if str(p).strip()]
+        else:
+            roots = list(DEFAULT_REVIEW_GATE_ROOTS)
+
+    raw_skills = os.environ.get("HERMES_KANBAN_REVIEW_GATE_SKILLS")
+    if raw_skills is not None:
+        skills = [s.strip() for s in raw_skills.split(",") if s.strip()]
+    else:
+        configured_skills = gate.get("skills")
+        if isinstance(configured_skills, (list, tuple)):
+            skills = [str(s).strip() for s in configured_skills if str(s).strip()]
+        else:
+            skills = list(DEFAULT_REVIEW_GATE_SKILLS)
+
+    return {
+        "enabled": enabled,
+        "roots": roots,
+        "assignee": os.environ.get(
+            "HERMES_KANBAN_REVIEW_GATE_ASSIGNEE",
+            str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
+        ).strip() or DEFAULT_REVIEW_GATE_ASSIGNEE,
+        "model": os.environ.get(
+            "HERMES_KANBAN_REVIEW_GATE_MODEL",
+            str(gate.get("model") or DEFAULT_REVIEW_GATE_MODEL),
+        ).strip() or DEFAULT_REVIEW_GATE_MODEL,
+        "fallback_model": os.environ.get(
+            "HERMES_KANBAN_REVIEW_GATE_FALLBACK_MODEL",
+            str(gate.get("fallback_model") or DEFAULT_REVIEW_GATE_FALLBACK_MODEL),
+        ).strip() or DEFAULT_REVIEW_GATE_FALLBACK_MODEL,
+        "skills": skills or list(DEFAULT_REVIEW_GATE_SKILLS),
+        "max_runtime_seconds": gate.get("max_runtime_seconds", 30 * 60),
+    }
+
+
+def _path_is_under(path: str | Path, root: str | Path) -> bool:
+    try:
+        Path(path).expanduser().resolve(strict=False).relative_to(
+            Path(root).expanduser().resolve(strict=False)
+        )
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _should_create_review_gate(
+    *,
+    title: str,
+    created_by: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    skills: Optional[list[str]],
+    model_override: Optional[str],
+    triage: bool,
+) -> tuple[bool, dict[str, Any]]:
+    gate = _review_gate_config()
+    if not gate.get("enabled"):
+        return False, gate
+    if not workspace_path or workspace_kind not in {"dir", "worktree"}:
+        return False, gate
+    if created_by == REVIEW_GATE_CREATED_BY:
+        return False, gate
+    if triage:
+        return False, gate
+    lower_title = (title or "").strip().lower()
+    if lower_title.startswith(("review:", "code review:", "review ")):
+        return False, gate
+    skill_names = {str(s).strip() for s in (skills or []) if str(s).strip()}
+    if skill_names.intersection(set(gate.get("skills") or DEFAULT_REVIEW_GATE_SKILLS)):
+        return False, gate
+    if model_override and str(model_override).strip() == gate.get("model"):
+        return False, gate
+    if not any(_path_is_under(workspace_path, root) for root in gate.get("roots", [])):
+        return False, gate
+    return True, gate
+
+
+def _review_gate_body(parent_id: str, parent_title: str, fallback_model: str) -> str:
+    return (
+        "Run the Hopewell dev code-review gate for the parent implementation card.\n\n"
+        f"Parent task: {parent_id}\n"
+        f"Parent title: {parent_title.strip()}\n\n"
+        "Scope: inspect the implementation handoff, changed diff, test output, and "
+        "obvious operational risks for work under /home/hopewell/hopewell-dev. "
+        "Use the github-code-review skill. Produce a concise PASS / WARN / BLOCK "
+        "result and write durable review artifacts under .code-reviews/feedback/ "
+        "when there are findings worth preserving. Do not perform broad unrelated "
+        "refactors.\n\n"
+        f"If the Opus/Nous review run fails due to model/provider/runtime failure, "
+        f"retry the same review with Gemini via model {fallback_model}."
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2076,12 +2208,14 @@ def create_task(
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
+    model_override: Optional[str] = None,
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
+    auto_review_gate: bool = True,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2106,6 +2240,10 @@ def create_task(
     ``kanban-worker``. Use this to pin a task to a specialist skill
     (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``model_override`` optionally pins the dispatched worker invocation
+    to a specific model. The dispatcher passes it as ``-m <model>``;
+    ``None`` means use the assignee profile's default model.
     """
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -2123,6 +2261,8 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if model_override is not None:
+        model_override = str(model_override).strip() or None
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -2246,8 +2386,8 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, model_override, max_retries, goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2265,6 +2405,7 @@ def create_task(
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
+                        model_override,
                         int(max_retries) if max_retries is not None else None,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
@@ -2287,9 +2428,45 @@ def create_task(
                         "tenant": tenant,
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
+                        "model_override": model_override,
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+            if auto_review_gate:
+                should_review, gate = _should_create_review_gate(
+                    title=title,
+                    created_by=created_by,
+                    workspace_kind=workspace_kind,
+                    workspace_path=workspace_path,
+                    skills=skills_list,
+                    model_override=model_override,
+                    triage=triage,
+                )
+                if should_review:
+                    create_task(
+                        conn,
+                        title=f"review: {title.strip()}",
+                        body=_review_gate_body(
+                            task_id,
+                            title,
+                            str(gate.get("fallback_model") or DEFAULT_REVIEW_GATE_FALLBACK_MODEL),
+                        ),
+                        assignee=str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
+                        created_by=REVIEW_GATE_CREATED_BY,
+                        workspace_kind=workspace_kind,
+                        workspace_path=workspace_path,
+                        branch_name=branch_name,
+                        tenant=tenant,
+                        priority=priority,
+                        parents=[task_id],
+                        idempotency_key=f"{REVIEW_GATE_CREATED_BY}:{task_id}",
+                        max_runtime_seconds=int(gate.get("max_runtime_seconds") or 30 * 60),
+                        skills=gate.get("skills") or list(DEFAULT_REVIEW_GATE_SKILLS),
+                        model_override=str(gate.get("model") or DEFAULT_REVIEW_GATE_MODEL),
+                        max_retries=1,
+                        board=board,
+                        auto_review_gate=False,
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
