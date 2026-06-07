@@ -2058,6 +2058,19 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Visible code-review gate. When enabled, tasks created with a persistent
+        # workspace under any configured root automatically get a dependent review
+        # card. The default Hopewell path keeps review owned by Kanban workflow
+        # state rather than hidden git hooks.
+        "review_gate": {
+            "enabled": True,
+            "roots": ["/home/hopewell/hopewell-dev"],
+            "assignee": "wren",
+            "skills": ["github-code-review"],
+            "model": "anthropic/claude-opus-4.8",
+            "fallback_model": "google/gemini-3-pro-preview",
+            "max_runtime_seconds": 1800,
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
