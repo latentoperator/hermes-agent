@@ -5777,6 +5777,75 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+def _is_opus_review_gate_card(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True if *task_id* is an Opus review-gate card that would qualify
+    for an automatic Gemini fallback on circuit-breaker trip.
+
+    Lightweight read-only check — no mutation.
+    """
+    row = conn.execute(
+        "SELECT created_by, model_override, title FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return False
+    if row["created_by"] != REVIEW_GATE_CREATED_BY:
+        return False
+    if (row["model_override"] or "").strip() != DEFAULT_REVIEW_GATE_MODEL:
+        return False
+    return (row["title"] or "").strip().lower().startswith("review:")
+
+
+def _create_gemini_fallback(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Create a Gemini fallback review card for *task_id* — an Opus
+    review-gate card that just hit the circuit breaker.
+
+    Must be called OUTSIDE any existing write transaction — it opens its
+    own ``write_txn``.
+    """
+    row = conn.execute(
+        "SELECT title, assignee, workspace_kind, workspace_path, "
+        "branch_name, tenant FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return False
+
+    title = row["title"] or ""
+    parent_ids = [
+        p["parent_id"]
+        for p in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)
+        )
+    ]
+
+    gb = _review_gate_body(
+        parent_ids[0] if parent_ids else task_id,
+        title,
+        str(DEFAULT_REVIEW_GATE_FALLBACK_MODEL),
+    )
+
+    create_task(
+        conn,
+        title=f"{title.strip()} (Gemini retry)",
+        body=gb,
+        assignee=(row["assignee"] or DEFAULT_REVIEW_GATE_ASSIGNEE),
+        created_by=REVIEW_GATE_CREATED_BY,
+        workspace_kind=row["workspace_kind"] or "scratch",
+        workspace_path=row["workspace_path"],
+        branch_name=row["branch_name"],
+        tenant=row["tenant"],
+        parents=parent_ids,
+        idempotency_key=f"{REVIEW_GATE_CREATED_BY}:gemini:{task_id}",
+        max_runtime_seconds=30 * 60,
+        skills=list(DEFAULT_REVIEW_GATE_SKILLS),
+        model_override=DEFAULT_REVIEW_GATE_FALLBACK_MODEL,
+        max_retries=1,
+        auto_review_gate=False,
+    )
+    return True
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5825,6 +5894,7 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    _should_gemini_fallback = False
     with write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries "
@@ -5848,6 +5918,10 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if failures >= effective_limit:
+            # Before tripping the breaker, record whether this is an
+            # Opus review-gate card (the fallback is created AFTER this
+            # transaction commits, avoiding nested-write-txn deadlock).
+            _should_gemini_fallback = _is_opus_review_gate_card(conn, task_id)
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
@@ -5928,6 +6002,20 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+    # After the failure transaction commits, create a Gemini fallback
+    # review card if this was an Opus review-gate card that just hit
+    # the circuit breaker.  Runs in its own write_txn to avoid nested-
+    # transaction deadlock.
+    if blocked and _should_gemini_fallback:
+        try:
+            _create_gemini_fallback(conn, task_id)
+        except Exception:
+            # Fallback creation is best-effort — do not let a Gemini
+            # card-creation failure shadow the real task failure.
+            _log.warning(
+                "review-gate: Gemini fallback failed for task %s", task_id,
+                exc_info=True,
+            )
     return blocked
 
 
