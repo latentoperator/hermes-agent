@@ -1145,6 +1145,53 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Dispatch-group tracking for agent-to-agent feedback.
+-- When an agent profile creates Kanban tasks (via kanban_create tool),
+-- those tasks are enrolled in a dispatch group keyed by (profile, session).
+-- The dispatcher / notifier watches group state and emits drain notices
+-- when no tracked tasks remain active (all done/archived/blocked).
+CREATE TABLE IF NOT EXISTS dispatch_groups (
+    id              TEXT PRIMARY KEY,
+    origin_profile  TEXT NOT NULL,
+    origin_session  TEXT,
+    board           TEXT,
+    created_at      INTEGER NOT NULL,
+    -- Cached computed state: 'active' | 'drained'.
+    -- Recomputed on status transitions of tracked tasks.
+    state           TEXT NOT NULL DEFAULT 'active',
+    state_at        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS dispatch_group_tasks (
+    group_id  TEXT NOT NULL,
+    task_id   TEXT NOT NULL,
+    PRIMARY KEY (group_id, task_id)
+);
+
+-- Durable notices for agent next-turn awareness.  A notice is created
+-- when a tracked task becomes blocked, or when the whole dispatch
+-- group reaches zero active tasks (drained).  The originating agent
+-- polls or is injected with pending (acked=0) notices at session start.
+CREATE TABLE IF NOT EXISTS dispatch_notices (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile      TEXT NOT NULL,
+    session_id   TEXT,
+    group_id     TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    -- 'blocked' — a single tracked task transitioned to blocked
+    -- 'drained' — the group has zero active tasks remaining
+    payload      TEXT,
+    created_at   INTEGER NOT NULL,
+    acked        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_dispatch_notices_pending
+    ON dispatch_notices(profile, session_id, acked);
+CREATE INDEX IF NOT EXISTS idx_dispatch_group_tasks_group
+    ON dispatch_group_tasks(group_id);
+CREATE INDEX IF NOT EXISTS idx_dispatch_group_tasks_task
+    ON dispatch_group_tasks(task_id);
 """
 
 
@@ -4348,7 +4395,16 @@ def block_task(
                 summary=reason,
             )
         _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
-        return True
+
+    # Dispatch-group tracking: after a successful block, emit blocked
+    # notices for every dispatch group this task belongs to, and
+    # recompute group drain state.  Best-effort — never fail a block
+    # for a dispatch-group error.
+    try:
+        check_task_dispatch_blocked(conn, task_id)
+    except Exception:
+        pass
+    return True
 
 
 
@@ -8008,3 +8064,402 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Dispatch groups — agent-to-agent feedback loop
+# ---------------------------------------------------------------------------
+
+# Active statuses for dispatch group drain computation.
+# Tasks in these statuses are still "in flight" and keep the group active.
+_DISPATCH_ACTIVE_STATUSES = frozenset({"triage", "todo", "ready", "running", "scheduled", "review"})
+# Drained/inactive statuses.  Blocked is drained but reversible.
+_DISPATCH_DRAINED_STATUSES = frozenset({"done", "archived", "blocked"})
+
+
+def _dispatch_group_id(profile: str, session_id: str, board: str) -> str:
+    """Derive a stable dispatch-group id from origin identity.
+
+    Session-scoped so every ``kanban_create`` call in the same agent
+    conversation feeds into the same group.
+    """
+    raw = f"{profile}:{session_id or ''}:{board or 'default'}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def get_or_create_dispatch_group(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    session_id: Optional[str] = None,
+    board: Optional[str] = None,
+) -> str:
+    """Return the group id for this (profile, session_id) pair, creating it if needed."""
+    gid = _dispatch_group_id(profile, session_id or "", board or "")
+    row = conn.execute(
+        "SELECT id FROM dispatch_groups WHERE id = ?", (gid,)
+    ).fetchone()
+    if row:
+        return gid
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO dispatch_groups (id, origin_profile, origin_session, board, created_at, state) "
+        "VALUES (?, ?, ?, ?, ?, 'active')",
+        (gid, profile, session_id, board, now),
+    )
+    return gid
+
+
+def add_task_to_dispatch_group(
+    conn: sqlite3.Connection, group_id: str, task_id: str
+) -> None:
+    """Enroll a task in a dispatch group."""
+    conn.execute(
+        "INSERT OR IGNORE INTO dispatch_group_tasks (group_id, task_id) VALUES (?, ?)",
+        (group_id, task_id),
+    )
+
+
+def _task_is_active(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Check whether a single task is still in an active status."""
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    return row["status"] in _DISPATCH_ACTIVE_STATUSES
+
+
+def recompute_dispatch_group_state(
+    conn: sqlite3.Connection, group_id: str
+) -> str:
+    """Recompute group state from tracked tasks and update the cached column.
+
+    Returns 'active' or 'drained'.
+    """
+    group_row = conn.execute(
+        "SELECT id, origin_profile, origin_session, state FROM dispatch_groups WHERE id = ?",
+        (group_id,),
+    ).fetchone()
+    if group_row is None:
+        return "drained"  # vanished group; nothing to track
+
+    # Count active tasks in the group.
+    active = conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+          FROM dispatch_group_tasks dgt
+          JOIN tasks t ON t.id = dgt.task_id
+         WHERE dgt.group_id = ?
+           AND t.status IN ({})
+        """.format(",".join("?" * len(_DISPATCH_ACTIVE_STATUSES))),
+        (group_id, *sorted(_DISPATCH_ACTIVE_STATUSES)),
+    ).fetchone()["cnt"]
+
+    new_state = "active" if active > 0 else "drained"
+    now = int(time.time())
+    conn.execute(
+        "UPDATE dispatch_groups SET state = ?, state_at = ? WHERE id = ?",
+        (new_state, now, group_id),
+    )
+    return new_state
+
+
+def _dispatch_notice_exists(
+    conn: sqlite3.Connection, group_id: str, kind: str,
+    *,
+    task_id: Optional[str] = None,
+) -> bool:
+    """Check if an identical unacked notice already exists (dedup).
+
+    For blocked notices, dedupe by (group_id, kind, task_id) so each
+    blocked card gets its own notice.  For drained notices, dedupe by
+    (group_id, kind) since there should not be two separate drain events
+    without an intervening active state.
+    """
+    if kind == "blocked" and task_id:
+        row = conn.execute(
+            "SELECT 1 FROM dispatch_notices "
+            "WHERE group_id = ? AND kind = ? AND acked = 0 "
+            "AND json_extract(payload, '$.task_id') = ? LIMIT 1",
+            (group_id, kind, task_id),
+        ).fetchone()
+        return row is not None
+    row = conn.execute(
+        "SELECT 1 FROM dispatch_notices "
+        "WHERE group_id = ? AND kind = ? AND acked = 0 LIMIT 1",
+        (group_id, kind),
+    ).fetchone()
+    return row is not None
+
+
+def emit_dispatch_notice(
+    conn: sqlite3.Connection,
+    *,
+    group_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+) -> Optional[int]:
+    """Emit a dispatch notice if one doesn't already exist for this group+kind.
+
+    Returns the new notice id, or None if deduped.
+    """
+    group_row = conn.execute(
+        "SELECT origin_profile, origin_session FROM dispatch_groups WHERE id = ?",
+        (group_id,),
+    ).fetchone()
+    if group_row is None:
+        return None
+
+    # Dedup: for blocked notices, dedupe by task_id so each blocked card
+    # gets its own notice.  For drained notices, dedupe by group+kind only.
+    task_id_for_dedup = (
+        payload.get("task_id") if (kind == "blocked" and payload) else None
+    )
+    if _dispatch_notice_exists(conn, group_id, kind, task_id=task_id_for_dedup):
+        return None
+
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO dispatch_notices (profile, session_id, group_id, kind, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            group_row["origin_profile"],
+            group_row["origin_session"],
+            group_id,
+            kind,
+            json.dumps(payload) if payload else None,
+            now,
+        ),
+    )
+    return cur.lastrowid
+
+
+def get_pending_dispatch_notices(
+    conn: sqlite3.Connection,
+    profile: str,
+    session_id: Optional[str] = None,
+    *,
+    limit: int = 5,
+) -> list[dict]:
+    """Return unacked notices for a profile, newest first.
+
+    Session_id can be None to match notices with no session id (legacy),
+    or a string to match a specific session.
+    """
+    if session_id:
+        rows = conn.execute(
+            "SELECT id, kind, group_id, payload, created_at "
+            "FROM dispatch_notices "
+            "WHERE profile = ? AND session_id = ? AND acked = 0 "
+            "ORDER BY created_at DESC LIMIT ?",
+            (profile, session_id, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, kind, group_id, payload, created_at "
+            "FROM dispatch_notices "
+            "WHERE profile = ? AND session_id IS NULL AND acked = 0 "
+            "ORDER BY created_at DESC LIMIT ?",
+            (profile, limit),
+        ).fetchall()
+    results: list[dict] = []
+    for r in rows:
+        payload = None
+        if r["payload"]:
+            try:
+                payload = json.loads(r["payload"])
+            except Exception:
+                payload = {"raw": r["payload"]}
+        results.append({
+            "notice_id": r["id"],
+            "kind": r["kind"],
+            "group_id": r["group_id"],
+            "payload": payload,
+            "created_at": r["created_at"],
+        })
+    return results
+
+
+def ack_dispatch_notice(
+    conn: sqlite3.Connection, notice_id: int
+) -> bool:
+    """Mark a dispatch notice as acked so it won't be re-delivered."""
+    cur = conn.execute(
+        "UPDATE dispatch_notices SET acked = 1 WHERE id = ? AND acked = 0",
+        (notice_id,),
+    )
+    return cur.rowcount > 0
+
+
+def ack_all_dispatch_notices(
+    conn: sqlite3.Connection,
+    profile: str,
+    session_id: Optional[str] = None,
+) -> int:
+    """Ack all pending notices for a profile+session.  Returns count acked."""
+    if session_id:
+        cur = conn.execute(
+            "UPDATE dispatch_notices SET acked = 1 "
+            "WHERE profile = ? AND session_id = ? AND acked = 0",
+            (profile, session_id),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE dispatch_notices SET acked = 1 "
+            "WHERE profile = ? AND session_id IS NULL AND acked = 0",
+            (profile,),
+        )
+    return cur.rowcount
+
+
+def recompute_all_dispatch_groups(
+    conn: sqlite3.Connection,
+) -> list[dict]:
+    """Walk every dispatch group, recompute state, and emit notices.
+
+    Called periodically by the dispatch-group watcher.  Returns a list
+    of ``{group_id, kind, notice_id}`` for newly-emitted notices.
+    """
+    groups = conn.execute(
+        "SELECT id, state FROM dispatch_groups"
+    ).fetchall()
+    emitted: list[dict] = []
+    for g in groups:
+        old_state = g["state"]
+        new_state = recompute_dispatch_group_state(conn, g["id"])
+        if new_state == "drained" and old_state == "active":
+            # Gather summary: how many done, blocked, etc.
+            summary = _build_drain_summary(conn, g["id"])
+            nid = emit_dispatch_notice(
+                conn, group_id=g["id"], kind="drained", payload=summary,
+            )
+            if nid is not None:
+                emitted.append({"group_id": g["id"], "kind": "drained", "notice_id": nid})
+    return emitted
+
+
+def check_task_dispatch_blocked(
+    conn: sqlite3.Connection, task_id: str
+) -> list[dict]:
+    """Called when a task is blocked.  Emits blocked notices for every
+    dispatch group this task belongs to, then recomputes group state.
+
+    Returns list of newly-emitted notices.
+    """
+    group_rows = conn.execute(
+        "SELECT group_id FROM dispatch_group_tasks WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    emitted: list[dict] = []
+    for gr in group_rows:
+        gid = gr["group_id"]
+        group_row = conn.execute(
+            "SELECT state FROM dispatch_groups WHERE id = ?", (gid,)
+        ).fetchone()
+        if group_row is None:
+            continue
+        # Emit blocked notice for this task
+        task_row = conn.execute(
+            "SELECT title FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        payload = {
+            "task_id": task_id,
+            "title": task_row["title"] if task_row else task_id,
+        }
+        nid = emit_dispatch_notice(
+            conn, group_id=gid, kind="blocked", payload=payload,
+        )
+        if nid is not None:
+            emitted.append({"group_id": gid, "kind": "blocked", "notice_id": nid, "task_id": task_id})
+        # Also recompute group state — if this was the last active task, it drains.
+        old_state = group_row["state"]
+        new_state = recompute_dispatch_group_state(conn, gid)
+        if new_state == "drained" and old_state == "active":
+            summary = _build_drain_summary(conn, gid)
+            nid2 = emit_dispatch_notice(
+                conn, group_id=gid, kind="drained", payload=summary,
+            )
+            if nid2 is not None:
+                emitted.append({"group_id": gid, "kind": "drained", "notice_id": nid2})
+    return emitted
+
+
+def _build_drain_summary(
+    conn: sqlite3.Connection, group_id: str
+) -> dict:
+    """Build a compact summary of a drained dispatch group."""
+    rows = conn.execute(
+        """
+        SELECT t.id, t.title, t.status, t.assignee
+          FROM dispatch_group_tasks dgt
+          JOIN tasks t ON t.id = dgt.task_id
+         WHERE dgt.group_id = ?
+        """,
+        (group_id,),
+    ).fetchall()
+    by_status: dict[str, list[dict]] = {}
+    for r in rows:
+        by_status.setdefault(r["status"], []).append({
+            "task_id": r["id"],
+            "title": r["title"],
+            "assignee": r["assignee"],
+        })
+    return {
+        "group_id": group_id,
+        "total": len(rows),
+        "by_status": {s: len(tasks) for s, tasks in by_status.items()},
+        "tasks": by_status,
+    }
+
+
+def format_dispatch_notice_for_prompt(notice: dict) -> str:
+    """Format a single dispatch notice as compact text for agent context injection.
+
+    Returns a string suitable for inclusion in the agent's system prompt
+    or prefill context.
+    """
+    kind = notice["kind"]
+    payload = notice.get("payload") or {}
+
+    if kind == "blocked":
+        task_id = payload.get("task_id", "?")
+        title = payload.get("title", task_id)
+        return f"[Kanban] Task {task_id} (\"{title}\") is blocked — may need review."
+
+    if kind == "drained":
+        total = payload.get("total", 0)
+        by_status = payload.get("by_status", {})
+        done = by_status.get("done", 0)
+        blocked = by_status.get("blocked", 0)
+        archived = by_status.get("archived", 0)
+        parts = []
+        if done:
+            parts.append(f"{done} completed")
+        if blocked:
+            parts.append(f"{blocked} blocked")
+        if archived:
+            parts.append(f"{archived} archived")
+        status_str = ", ".join(parts) if parts else "all resolved"
+        return (
+            f"[Kanban] Your dispatched work has drained: "
+            f"{total} tasks dispatched, {status_str}."
+        )
+
+    return f"[Kanban] Notice: {kind}"
+
+
+def build_dispatch_notices_context(
+    notices: list[dict],
+) -> str:
+    """Build a compact context block from pending dispatch notices.
+
+    Used to inject into the agent's next-turn context.  Returns ''
+    when there are no notices.
+    """
+    if not notices:
+        return ""
+    lines = ["[Dispatch notices — pending Kanban updates]"]
+    for n in notices:
+        lines.append(format_dispatch_notice_for_prompt(n))
+    return "\n".join(lines)
