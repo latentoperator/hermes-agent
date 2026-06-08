@@ -4264,7 +4264,7 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-    return finalize_turn(
+    result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -4280,6 +4280,25 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
     )
 
+    # ── Deferred dispatch-notice ack ──
+    # Notices were fetched and injected into the user message before the
+    # model turn started, but the ack is deferred until here so that an
+    # API failure mid-turn doesn't lose notices forever.  Only ack when
+    # the turn actually completed (model response delivered); a failed or
+    # interrupted turn leaves notices unacked so they re-inject next time.
+    if _dispatch_notice_ids and result.get("completed"):
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            _conn = _kb.connect()
+            try:
+                _kb.ack_dispatch_notices(_conn, _dispatch_notice_ids)
+            finally:
+                _conn.close()
+        except Exception:
+            pass
+
+    return result
 
 
 __all__ = ["run_conversation"]

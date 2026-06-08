@@ -3970,6 +3970,15 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    # ── Dispatch-group drain recomputation ──
+    # When a tracked task completes, recompute its dispatch groups'
+    # active/drained state so drain notices fire promptly regardless
+    # of whether completion came through the tool wrapper, CLI,
+    # dashboard, or API.
+    try:
+        recompute_dispatch_groups_for_task(conn, task_id)
+    except Exception:
+        pass
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     return True
@@ -4893,6 +4902,15 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
+    # ── Dispatch-group drain recomputation ──
+    # When a tracked task is archived, recompute its dispatch groups'
+    # active/drained state so drain notices fire promptly regardless
+    # of whether archiving came through the tool wrapper, CLI,
+    # dashboard, or API.
+    try:
+        recompute_dispatch_groups_for_task(conn, task_id)
+    except Exception:
+        pass
     return True
 
 
@@ -8228,29 +8246,30 @@ def get_pending_dispatch_notices(
     profile: str,
     session_id: Optional[str] = None,
     *,
-    limit: int = 5,
+    limit: Optional[int] = None,
 ) -> list[dict]:
     """Return unacked notices for a profile, newest first.
 
     Session_id can be None to match notices with no session id (legacy),
-    or a string to match a specific session.
+    or a string to match a specific session.  ``limit`` defaults to None
+    (all notices returned); set to an integer to cap results.
     """
+    params: list = [profile]
+    sql = (
+        "SELECT id, kind, group_id, payload, created_at "
+        "FROM dispatch_notices "
+        "WHERE profile = ? "
+    )
     if session_id:
-        rows = conn.execute(
-            "SELECT id, kind, group_id, payload, created_at "
-            "FROM dispatch_notices "
-            "WHERE profile = ? AND session_id = ? AND acked = 0 "
-            "ORDER BY created_at DESC LIMIT ?",
-            (profile, session_id, limit),
-        ).fetchall()
+        sql += "AND session_id = ? "
+        params.append(session_id)
     else:
-        rows = conn.execute(
-            "SELECT id, kind, group_id, payload, created_at "
-            "FROM dispatch_notices "
-            "WHERE profile = ? AND session_id IS NULL AND acked = 0 "
-            "ORDER BY created_at DESC LIMIT ?",
-            (profile, limit),
-        ).fetchall()
+        sql += "AND session_id IS NULL "
+    sql += "AND acked = 0 ORDER BY created_at DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
     results: list[dict] = []
     for r in rows:
         payload = None
@@ -8298,6 +8317,29 @@ def ack_all_dispatch_notices(
             "WHERE profile = ? AND session_id IS NULL AND acked = 0",
             (profile,),
         )
+    return cur.rowcount
+
+
+def ack_dispatch_notices(
+    conn: sqlite3.Connection, notice_ids: list[int],
+) -> int:
+    """Ack specific dispatch notices by id.  Returns count acked.
+
+    Unlike ``ack_all_dispatch_notices`` which acks by profile+session,
+    this acks only the exact notice rows requested.  Safe to call with
+    an empty list (no-op).
+
+    Used by the conversation loop's deferred-ack path: collect notice
+    ids before the model turn, ack them only after the turn succeeds.
+    """
+    if not notice_ids:
+        return 0
+    placeholders = ",".join("?" * len(notice_ids))
+    cur = conn.execute(
+        f"UPDATE dispatch_notices SET acked = 1 "
+        f"WHERE id IN ({placeholders}) AND acked = 0",
+        notice_ids,
+    )
     return cur.rowcount
 
 
