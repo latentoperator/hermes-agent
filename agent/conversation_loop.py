@@ -383,8 +383,7 @@ def run_conversation(
             When None (default), API calls use the standard non-streaming path.
         persist_user_message: Optional clean user message to store in
             transcripts/history when user_message contains API-only
-            synthetic prefixes.
-                or queuing follow-up prefetch work.
+            synthetic prefixes (e.g. dispatch notices, voice prefix).
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -407,6 +406,7 @@ def run_conversation(
     # until the next matching profile+session turn acks them.  Harmless, but
     # worth knowing when interpreting stale notice counts.
     _dispatch_prefix = ""
+    _dispatch_notice_ids: list[int] = []
     origin_profile = os.environ.get("HERMES_PROFILE")
     if origin_profile:
         try:
@@ -418,15 +418,19 @@ def run_conversation(
                 )
                 if _notices:
                     _dispatch_prefix = _kb.build_dispatch_notices_context(_notices)
-                    _kb.ack_all_dispatch_notices(
-                        _conn, origin_profile, agent.session_id,
-                    )
+                    _dispatch_notice_ids = [
+                        n["notice_id"] for n in _notices
+                    ]
             finally:
                 _conn.close()
         except Exception:
             pass
 
     if _dispatch_prefix:
+        # Capture clean user message before injection so transcripts
+        # and memory don't get polluted with dispatch notice text.
+        if persist_user_message is None:
+            persist_user_message = user_message
         user_message = _dispatch_prefix + "\n\n" + user_message
 
     # Tell auxiliary_client what the live main provider/model are for
