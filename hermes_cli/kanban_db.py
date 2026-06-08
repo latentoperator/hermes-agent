@@ -8008,8 +8008,6 @@ def latest_summaries(
 # Active statuses for dispatch group drain computation.
 # Tasks in these statuses are still "in flight" and keep the group active.
 _DISPATCH_ACTIVE_STATUSES = frozenset({"triage", "todo", "ready", "running", "scheduled", "review"})
-# Drained/inactive statuses.  Blocked is drained but reversible.
-_DISPATCH_DRAINED_STATUSES = frozenset({"done", "archived", "blocked"})
 
 
 def _dispatch_group_id(profile: str, session_id: str, board: str) -> str:
@@ -8053,16 +8051,6 @@ def add_task_to_dispatch_group(
         "INSERT OR IGNORE INTO dispatch_group_tasks (group_id, task_id) VALUES (?, ?)",
         (group_id, task_id),
     )
-
-
-def _task_is_active(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Check whether a single task is still in an active status."""
-    row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if row is None:
-        return False
-    return row["status"] in _DISPATCH_ACTIVE_STATUSES
 
 
 def recompute_dispatch_group_state(

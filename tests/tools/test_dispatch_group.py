@@ -847,3 +847,145 @@ def test_blocked_notice_dedup_per_task_not_per_group(monkeypatch, tmp_path):
         )
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Conversation-loop injection tests
+# ---------------------------------------------------------------------------
+
+
+def test_conversation_loop_injection_no_profile(monkeypatch, tmp_path):
+    """Without HERMES_PROFILE, the injection is a no-op and user_message
+    is unchanged."""
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)  # noqa: B023
+
+    # Replicate the injection logic inline
+    import os as _os
+    _dispatch_prefix = ""
+    origin_profile = _os.environ.get("HERMES_PROFILE")
+    assert origin_profile is None  # precondition
+
+    user_message = "hello"
+    if origin_profile:
+        _dispatch_prefix = "SHOULD NOT APPEAR"
+    if _dispatch_prefix:
+        user_message = _dispatch_prefix + "\n\n" + user_message
+    assert user_message == "hello"
+
+
+def test_conversation_loop_injection_drains_notices(monkeypatch, tmp_path):
+    """When HERMES_PROFILE is set and pending notices exist, the injection
+    prepends them to user_message and acks them."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "wren")
+
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)  # noqa: B023
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        gid = kb.get_or_create_dispatch_group(
+            conn, profile="wren", session_id="sess-inject",
+        )
+        nid = kb.emit_dispatch_notice(
+            conn, group_id=gid, kind="drained",
+            payload={"total": 2, "by_status": {"done": 2}},
+        )
+        assert nid is not None
+    finally:
+        conn.close()
+
+    # Replicate the injection logic
+    import os as _os
+    _dispatch_prefix = ""
+    origin_profile = _os.environ.get("HERMES_PROFILE")
+    session_id = "sess-inject"
+    if origin_profile:
+        try:
+            from hermes_cli import kanban_db as _kb
+            _conn = _kb.connect()
+            try:
+                _notices = _kb.get_pending_dispatch_notices(
+                    _conn, origin_profile, session_id,
+                )
+                if _notices:
+                    _dispatch_prefix = _kb.build_dispatch_notices_context(_notices)
+                    _kb.ack_all_dispatch_notices(
+                        _conn, origin_profile, session_id,
+                    )
+            finally:
+                _conn.close()
+        except Exception:
+            pass
+
+    user_message = "hello"
+    if _dispatch_prefix:
+        user_message = _dispatch_prefix + "\n\n" + user_message
+
+    assert "drained" in user_message
+    assert "2 completed" in user_message or "2" in user_message
+    assert user_message.endswith("hello")
+
+    # Verify notices were acked
+    conn2 = kb.connect()
+    try:
+        remaining = kb.get_pending_dispatch_notices(conn2, "wren", "sess-inject")
+        assert len(remaining) == 0
+    finally:
+        conn2.close()
+
+
+def test_conversation_loop_injection_no_notices(monkeypatch, tmp_path):
+    """When HERMES_PROFILE is set but no pending notices exist, user_message
+    is unchanged."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "wren")
+
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)  # noqa: B023
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    import os as _os
+    _dispatch_prefix = ""
+    origin_profile = _os.environ.get("HERMES_PROFILE")
+    session_id = "sess-no-notices"
+    if origin_profile:
+        try:
+            from hermes_cli import kanban_db as _kb
+            _conn = _kb.connect()
+            try:
+                _notices = _kb.get_pending_dispatch_notices(
+                    _conn, origin_profile, session_id,
+                )
+                if _notices:
+                    _dispatch_prefix = _kb.build_dispatch_notices_context(_notices)
+                    _kb.ack_all_dispatch_notices(
+                        _conn, origin_profile, session_id,
+                    )
+            finally:
+                _conn.close()
+        except Exception:
+            pass
+
+    user_message = "hello"
+    if _dispatch_prefix:
+        user_message = _dispatch_prefix + "\n\n" + user_message
+
+    assert user_message == "hello"

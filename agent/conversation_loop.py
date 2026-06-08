@@ -399,7 +399,13 @@ def run_conversation(
     # When an agent profile dispatches work to Kanban (via kanban_create)
     # and that dispatched work drains — all tracked tasks done, archived,
     # or blocked — the notifier writes a durable notice.  Inject it into
-    # the next turn so the agent is aware without Chris polling the board.
+    # the next turn so the agent is aware without manual polling.
+    #
+    # NOTE: Cron jobs also have HERMES_PROFILE set, so kanban_create calls
+    # inside cron sessions will enroll tasks in dispatch groups.  Since cron
+    # sessions never return for follow-up turns, those notices accumulate
+    # until the next matching profile+session turn acks them.  Harmless, but
+    # worth knowing when interpreting stale notice counts.
     _dispatch_prefix = ""
     origin_profile = os.environ.get("HERMES_PROFILE")
     if origin_profile:
