@@ -584,6 +584,13 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
+            # ── Dispatch-group drain recomputation ──
+            # When a tracked task completes, recompute its dispatch groups'
+            # active/drained state so drain notices fire promptly.
+            try:
+                kb.recompute_all_dispatch_groups(conn)
+            except Exception:
+                pass
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
@@ -622,6 +629,13 @@ def _handle_block(args: dict, **kw) -> str:
                     f"could not block {tid} (unknown id or not in "
                     f"running/ready)"
                 )
+            # ── Dispatch-group blocked notice ──
+            # If the blocked task belongs to any dispatch groups, emit
+            # blocked notices and recompute group drain state.
+            try:
+                kb.check_task_dispatch_blocked(conn, tid)
+            except Exception:
+                pass
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
@@ -820,6 +834,24 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            # ── Dispatch-group tracking ──
+            # When an agent session creates Kanban tasks, auto-enroll them
+            # in a dispatch group so the origin profile gets notified when
+            # the dispatched work drains.
+            origin_profile = os.environ.get("HERMES_PROFILE")
+            if origin_profile:
+                try:
+                    dg_id = kb.get_or_create_dispatch_group(
+                        conn,
+                        profile=origin_profile,
+                        session_id=session_id,
+                        board=board,
+                    )
+                    kb.add_task_to_dispatch_group(conn, dg_id, new_tid)
+                except Exception:
+                    # Dispatch-group tracking is best-effort; never fail a
+                    # task creation for a group enrollment error.
+                    pass
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
@@ -851,6 +883,15 @@ def _handle_unblock(args: dict, **kw) -> str:
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
+            # ── Dispatch-group reactivation ──
+            # After unblocking, recompute dispatch group state so the
+            # group transitions back to 'active'.  This ensures a
+            # subsequent complete-triggered recompute sees active→drained
+            # and emits a second drain notice.
+            try:
+                kb.recompute_all_dispatch_groups(conn)
+            except Exception:
+                pass
             return _ok(task_id=str(tid), status="ready")
         finally:
             conn.close()
