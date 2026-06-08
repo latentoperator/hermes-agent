@@ -372,20 +372,46 @@ def test_check_task_dispatch_blocked_drains_when_last_active(monkeypatch, tmp_pa
 # ---------------------------------------------------------------------------
 
 def test_recompute_all_dispatch_groups_emits_drain(monkeypatch, tmp_path):
-    """When all tasks in all groups are done, recompute emits drain notices."""
+    """recompute_all_dispatch_groups emits drain for groups not yet drained.
+
+    complete_task now calls recompute_dispatch_groups_for_task internally,
+    so the drain notice is emitted during completion.  recompute_all_dispatch_groups
+    must NOT double-emit when called after — idempotency matters.
+    """
     kb, conn = _fresh_kanban_db(monkeypatch, tmp_path)
     try:
         gid = kb.get_or_create_dispatch_group(
             conn, profile="wren", session_id="sess-1",
         )
+        # Verify drain notice was emitted by complete_task's internal recompute.
         t1 = kb.create_task(conn, title="task-a", assignee="peer")
         kb.add_task_to_dispatch_group(conn, gid, t1)
         kb.claim_task(conn, t1)
         kb.complete_task(conn, t1)
+
+        notices = kb.get_pending_dispatch_notices(conn, "wren", "sess-1", limit=100)
+        drain_notices = [n for n in notices if n["kind"] == "drained"]
+        assert len(drain_notices) >= 1, (
+            "complete_task should emit drain notice via internal recompute"
+        )
+
+        # recompute_all_dispatch_groups must be idempotent — no double drain.
         emitted = kb.recompute_all_dispatch_groups(conn)
-        assert len(emitted) >= 1
-        drain = [e for e in emitted if e["kind"] == "drained"]
-        assert len(drain) >= 1
+        assert emitted == [], (
+            "recompute_all_dispatch_groups must not re-emit already-drained notices"
+        )
+
+        # Ack the first drain notice, then directly set task back to ready
+        # so recompute_all_dispatch_groups sees active→drained on its own.
+        for n in drain_notices:
+            kb.ack_dispatch_notice(conn, n["notice_id"])
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (t1,))
+        conn.execute("UPDATE dispatch_groups SET state = 'active' WHERE id = ?", (gid,))
+        kb.complete_task(conn, t1)
+
+        # complete_task already drained again — confirm recompute_all idempotent.
+        emitted2 = kb.recompute_all_dispatch_groups(conn)
+        assert emitted2 == [], "idempotent after second complete"
     finally:
         conn.close()
 
@@ -882,7 +908,8 @@ def test_conversation_loop_injection_no_profile(monkeypatch, tmp_path):
 
 def test_conversation_loop_injection_drains_notices(monkeypatch, tmp_path):
     """When HERMES_PROFILE is set and pending notices exist, the injection
-    prepends them to user_message and acks them."""
+    prepends them to user_message and defers the ack (notices remain
+    unacked until the deferred-ack path runs after a completed turn)."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -907,9 +934,10 @@ def test_conversation_loop_injection_drains_notices(monkeypatch, tmp_path):
     finally:
         conn.close()
 
-    # Replicate the injection logic
+    # Replicate the injection logic (fetch only — no immediate ack)
     import os as _os
     _dispatch_prefix = ""
+    _dispatch_notice_ids = []
     origin_profile = _os.environ.get("HERMES_PROFILE")
     session_id = "sess-inject"
     if origin_profile:
@@ -922,9 +950,9 @@ def test_conversation_loop_injection_drains_notices(monkeypatch, tmp_path):
                 )
                 if _notices:
                     _dispatch_prefix = _kb.build_dispatch_notices_context(_notices)
-                    _kb.ack_all_dispatch_notices(
-                        _conn, origin_profile, session_id,
-                    )
+                    _dispatch_notice_ids = [
+                        n["notice_id"] for n in _notices
+                    ]
             finally:
                 _conn.close()
         except Exception:
@@ -938,13 +966,30 @@ def test_conversation_loop_injection_drains_notices(monkeypatch, tmp_path):
     assert "2 completed" in user_message or "2" in user_message
     assert user_message.endswith("hello")
 
-    # Verify notices were acked
+    # Notices should still be unacked (deferred ack hasn't run yet)
     conn2 = kb.connect()
     try:
         remaining = kb.get_pending_dispatch_notices(conn2, "wren", "sess-inject")
-        assert len(remaining) == 0
+        assert len(remaining) == 1, "notices should still be unacked before deferred ack"
     finally:
         conn2.close()
+
+    # Simulate the deferred ack (as run after a completed turn)
+    if _dispatch_notice_ids:
+        conn3 = kb.connect()
+        try:
+            acked = kb.ack_dispatch_notices(conn3, _dispatch_notice_ids)
+            assert acked == 1
+        finally:
+            conn3.close()
+
+    # Now notices should be gone
+    conn4 = kb.connect()
+    try:
+        remaining2 = kb.get_pending_dispatch_notices(conn4, "wren", "sess-inject")
+        assert len(remaining2) == 0, "notices should be acked after deferred ack"
+    finally:
+        conn4.close()
 
 
 def test_conversation_loop_injection_no_notices(monkeypatch, tmp_path):
@@ -989,3 +1034,69 @@ def test_conversation_loop_injection_no_notices(monkeypatch, tmp_path):
         user_message = _dispatch_prefix + "\n\n" + user_message
 
     assert user_message == "hello"
+
+
+# ---------------------------------------------------------------------------
+# Regression: >5 notices silently dropped (default limit was 5)
+# ---------------------------------------------------------------------------
+
+def test_get_pending_notices_default_limit_bumped(monkeypatch, tmp_path):
+    """Default limit (None = unlimited) returns all notices; explicit limit caps results.
+
+    Regression test for the bug where conversation_loop called
+    get_pending_dispatch_notices without a limit, got at most 5 notices,
+    then ack_all_dispatch_notices acked everything — notices 6+ were
+    silently lost.  The fix removes the implicit limit and adds targeted-ack.
+    """
+    kb, conn = _fresh_kanban_db(monkeypatch, tmp_path)
+    try:
+        # Emit 7 distinct blocked notices (unique task_ids beat dedup).
+        g = kb.get_or_create_dispatch_group(
+            conn, profile="wren", session_id="sess-flood",
+        )
+        notice_ids = []
+        for i in range(7):
+            nid = kb.emit_dispatch_notice(
+                conn, group_id=g, kind="blocked",
+                payload={"idx": i, "task_id": f"t_{i:03d}"},
+            )
+            assert nid is not None, f"notice {i} should be emitted"
+            notice_ids.append(nid)
+
+        # New default (None = unlimited) returns all 7 — the old default
+        # silently drop 2.
+        notices_all = kb.get_pending_dispatch_notices(
+            conn, "wren", "sess-flood",
+        )
+        assert len(notices_all) == 7, (
+            f"default limit should return all 7, got {len(notices_all)}"
+        )
+
+        # Explicit small limit still caps correctly.
+        notices_3 = kb.get_pending_dispatch_notices(
+            conn, "wren", "sess-flood", limit=3,
+        )
+        assert len(notices_3) == 3, (
+            f"limit=3 should return 3, got {len(notices_3)}"
+        )
+
+        # Verify targeted ack (new function) only removes specified notices.
+        acked = kb.ack_dispatch_notices(conn, notice_ids[:3])
+        assert acked == 3
+        remaining = kb.get_pending_dispatch_notices(
+            conn, "wren", "sess-flood",
+        )
+        assert len(remaining) == 4, (
+            f"4 should remain after targeted ack of 3, got {len(remaining)}"
+        )
+
+        # Verify ack_all removes everything.
+        acked_all = kb.ack_all_dispatch_notices(conn, "wren", "sess-flood")
+        assert acked_all == 4
+        after = kb.get_pending_dispatch_notices(
+            conn, "wren", "sess-flood",
+        )
+        assert len(after) == 0
+
+    finally:
+        conn.close()
