@@ -395,6 +395,34 @@ def run_conversation(
 
     agent._ensure_db_session()
 
+    # ── Dispatch-group notice injection ──
+    # When an agent profile dispatches work to Kanban (via kanban_create)
+    # and that dispatched work drains — all tracked tasks done, archived,
+    # or blocked — the notifier writes a durable notice.  Inject it into
+    # the next turn so the agent is aware without Chris polling the board.
+    _dispatch_prefix = ""
+    origin_profile = os.environ.get("HERMES_PROFILE")
+    if origin_profile:
+        try:
+            from hermes_cli import kanban_db as _kb
+            _conn = _kb.connect()
+            try:
+                _notices = _kb.get_pending_dispatch_notices(
+                    _conn, origin_profile, agent.session_id,
+                )
+                if _notices:
+                    _dispatch_prefix = _kb.build_dispatch_notices_context(_notices)
+                    _kb.ack_all_dispatch_notices(
+                        _conn, origin_profile, agent.session_id,
+                    )
+            finally:
+                _conn.close()
+        except Exception:
+            pass
+
+    if _dispatch_prefix:
+        user_message = _dispatch_prefix + "\n\n" + user_message
+
     # Tell auxiliary_client what the live main provider/model are for
     # this turn. Used by tools whose behaviour depends on the active
     # main model (e.g. vision_analyze's native fast path) so they see
