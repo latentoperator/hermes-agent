@@ -396,6 +396,35 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # ── Dispatch-group notice injection ──
+    # When this profile dispatches Kanban work and that work drains, the
+    # notifier writes a durable notice. Inject it into the next turn so the
+    # agent is aware without the user polling the board. Defensive: notice
+    # lookup must never block a conversation turn.
+    _dispatch_prefix = ""
+    origin_profile = os.environ.get("HERMES_PROFILE")
+    if origin_profile:
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            _conn = _kb.connect()
+            try:
+                _notices = _kb.get_pending_dispatch_notices(
+                    _conn, origin_profile, agent.session_id,
+                )
+                if _notices:
+                    _dispatch_prefix = _kb.build_dispatch_notices_context(_notices)
+                    _kb.ack_all_dispatch_notices(
+                        _conn, origin_profile, agent.session_id,
+                    )
+            finally:
+                _conn.close()
+        except Exception:
+            pass
+
+    if _dispatch_prefix:
+        user_message = _dispatch_prefix + "\n\n" + user_message
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
