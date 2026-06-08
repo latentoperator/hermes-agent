@@ -8027,17 +8027,17 @@ def get_or_create_dispatch_group(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
 ) -> str:
-    """Return the group id for this (profile, session_id) pair, creating it if needed."""
+    """Return the group id for this (profile, session_id) pair, creating it if needed.
+
+    Uses INSERT OR IGNORE so concurrent callers racing on the same
+    (profile, session_id, board) tuple don't hit a unique-key violation.
+    """
     gid = _dispatch_group_id(profile, session_id or "", board or "")
-    row = conn.execute(
-        "SELECT id FROM dispatch_groups WHERE id = ?", (gid,)
-    ).fetchone()
-    if row:
-        return gid
     now = int(time.time())
     conn.execute(
-        "INSERT INTO dispatch_groups (id, origin_profile, origin_session, board, created_at, state) "
-        "VALUES (?, ?, ?, ?, ?, 'active')",
+        "INSERT OR IGNORE INTO dispatch_groups"
+        " (id, origin_profile, origin_session, board, created_at, state)"
+        " VALUES (?, ?, ?, ?, ?, 'active')",
         (gid, profile, session_id, board, now),
     )
     return gid
@@ -8259,6 +8259,42 @@ def recompute_all_dispatch_groups(
             )
             if nid is not None:
                 emitted.append({"group_id": g["id"], "kind": "drained", "notice_id": nid})
+    return emitted
+
+
+def recompute_dispatch_groups_for_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[dict]:
+    """Recompute dispatch-group state for only the groups a task belongs to.
+
+    Called after a task transition (complete / unblock) so drain notices
+    fire promptly without walking every group on the board.
+
+    Returns a list of ``{group_id, kind, notice_id}`` for newly-emitted
+    notices.
+    """
+    group_rows = conn.execute(
+        "SELECT DISTINCT group_id FROM dispatch_group_tasks WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    emitted: list[dict] = []
+    for gr in group_rows:
+        gid = gr["group_id"]
+        group_row = conn.execute(
+            "SELECT state FROM dispatch_groups WHERE id = ?", (gid,)
+        ).fetchone()
+        if group_row is None:
+            continue
+        old_state = group_row["state"]
+        new_state = recompute_dispatch_group_state(conn, gid)
+        if new_state == "drained" and old_state == "active":
+            summary = _build_drain_summary(conn, gid)
+            nid = emit_dispatch_notice(
+                conn, group_id=gid, kind="drained", payload=summary,
+            )
+            if nid is not None:
+                emitted.append({"group_id": gid, "kind": "drained", "notice_id": nid})
     return emitted
 
 
