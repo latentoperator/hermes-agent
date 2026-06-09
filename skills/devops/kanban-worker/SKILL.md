@@ -22,7 +22,9 @@ Your workspace kind determines how you should behave inside `$HERMES_KANBAN_WORK
 |---|---|---|
 | `scratch` | Fresh tmp dir, yours alone | Read/write freely; it gets GC'd when the task is archived. |
 | `dir:<path>` | Shared persistent directory | Other runs will read what you write. Treat it like long-lived state. Path is guaranteed absolute (the kernel rejects relative paths). |
-| `worktree` | Git worktree at the resolved path | If `.git` doesn't exist, run `git worktree add <path> ${HERMES_KANBAN_BRANCH:-wt/$HERMES_KANBAN_TASK}` from the main repo first, then cd and work normally. Commit work here. |
+| `worktree` | Git worktree at the resolved path | If `.git` doesn't exist, run `git worktree add <path> ${HERMES_KANBAN_BRANCH:-wt/$HERMES_KANBAN_TASK}` from the main repo first, then `git push -u origin <branch>` so the branch is visible remotely before work starts. Commit as soon as meaningful work exists, push right after, and keep fixes on the same branch. |
+
+For code-changing work, the pushed branch is the durable artifact and the worktree is disposable. A card is not ready for `done` until the working tree is clean, `HEAD` is ahead of the captured base SHA, the branch has been pushed, freshly fetched/remote `origin/<branch>` equals local `HEAD`, and tests/verifications were run against that exact HEAD in a recorded representative environment. Most code-changing tasks should still block as `review-required` with that evidence rather than self-certifying completion.
 
 ## Tenant isolation
 

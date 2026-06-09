@@ -1249,7 +1249,9 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Workspace flavor: 'scratch' (fresh tmp dir, "
                     "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
+                    "absolute workspace_path), 'worktree' (git worktree; "
+                    "with a board default_workdir and no explicit path, "
+                    "Hermes resolves to <repo>/.worktrees/<task_id>)."
                 ),
             },
             "workspace_path": {
