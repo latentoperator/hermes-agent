@@ -74,7 +74,9 @@ function generateChannelId(): string {
 // theme, because the TUI's skin engine already paints the content; the
 // terminal chrome just needs to sit quietly inside the dashboard.
 // `background` is omitted here — it's supplied dynamically from the active
-// theme's `terminalBackground` field so users can control it via YAML themes.
+// theme. Themes may pin `terminalBackground`; otherwise the embedded TUI
+// inherits the dashboard canvas color so the terminal pane doesn't read as a
+// separate black box inside blue/teal skins.
 const TERMINAL_THEME_STATIC = {
   foreground: "#f0e6d2",
   cursor: "#f0e6d2",
@@ -166,7 +168,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   );
 
   const { theme } = useTheme();
-  const terminalBg = theme.terminalBackground ?? "#000000";
+  const terminalBg = theme.terminalBackground ?? theme.palette.background.hex;
   const terminalTheme = useMemo(
     () => ({ ...TERMINAL_THEME_STATIC, background: terminalBg }),
     [terminalBg],
