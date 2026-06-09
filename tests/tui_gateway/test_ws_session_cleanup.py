@@ -64,12 +64,13 @@ async def test_ws_disconnect_can_close_owned_sessions(monkeypatch):
     monkeypatch.setattr("tui_gateway.ws._WebSocketDisconnect", _FakeDisconnect)
     monkeypatch.setattr(server, "resolve_skin", lambda: {"name": "test"})
     monkeypatch.setattr(server, "_stdio_transport", object())
-    finalized: list[tuple[dict, str]] = []
-    monkeypatch.setattr(
-        server,
-        "_finalize_session",
-        lambda session, end_reason="tui_close": finalized.append((session, end_reason)),
-    )
+    torn_down: list[tuple[dict, str]] = []
+
+    def fake_teardown(session, *, end_reason="tui_close"):
+        torn_down.append((session, end_reason))
+        session["slash_worker"].close()
+
+    monkeypatch.setattr(server, "_teardown_session", fake_teardown)
 
     ws = _FakeWebSocket()
     worker = _FakeWorker()
@@ -87,6 +88,6 @@ async def test_ws_disconnect_can_close_owned_sessions(monkeypatch):
     assert ws.accepted is True
     assert ws.closed is True
     assert worker.closed is True
-    assert finalized == [(owned_session, "ws_disconnect")]
+    assert torn_down == [(owned_session, "ws_disconnect")]
     assert "owned" not in server._sessions
     assert "other" in server._sessions

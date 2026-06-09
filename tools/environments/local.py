@@ -233,7 +233,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     if _profile_home:
         sanitized["HOME"] = _profile_home
 
-    _inject_hermes_bin_path(sanitized)
+    _inject_hermes_bin_path(sanitized, profile_home_enabled=bool(_profile_home))
 
     return sanitized
 
@@ -384,8 +384,10 @@ def _prepend_path_entry(env: dict, directory: str | os.PathLike | None) -> None:
         env[path_key] = os.pathsep.join([directory_str, *parts]) if parts else directory_str
 
 
-def _inject_hermes_bin_path(env: dict) -> None:
+def _inject_hermes_bin_path(env: dict, *, profile_home_enabled: bool = False) -> None:
     """Make Hermes-managed host binaries available in tool subprocesses."""
+    if _IS_WINDOWS or not profile_home_enabled:
+        return
     try:
         from hermes_constants import get_default_hermes_root
 
@@ -413,8 +415,6 @@ def _make_run_env(env: dict) -> dict:
     if path_key is not None:
         run_env[path_key] = _append_missing_sane_path_entries(run_env.get(path_key, ""))
 
-    _inject_hermes_bin_path(run_env)
-
     _inject_context_hermes_home(run_env)
 
     # Per-profile HOME isolation: redirect system tool configs (git, ssh, gh,
@@ -424,6 +424,8 @@ def _make_run_env(env: dict) -> dict:
     _profile_home = get_subprocess_home()
     if _profile_home:
         run_env["HOME"] = _profile_home
+
+    _inject_hermes_bin_path(run_env, profile_home_enabled=bool(_profile_home))
 
     # Inject ContextVar-based session vars into subprocess env.
     # ContextVars don't propagate to child processes, so we bridge them here.
