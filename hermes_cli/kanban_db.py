@@ -2383,16 +2383,29 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
+    #
+    # For worktree tasks, the board default is the *project repo*, not the
+    # worktree path itself. Put the per-card checkout under
+    # ``<repo>/.worktrees/<task_id>/`` so it stays project-local and
+    # discoverable without turning the main checkout into the task
+    # workspace. This preserves the one-card/one-worktree model and avoids
+    # the old profile-scratch/default-CWD ambiguity.
+    board_default: Optional[str] = None
     if workspace_path is None and workspace_kind in {"dir", "worktree"}:
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
-        board_default = board_meta.get("default_workdir")
-        if board_default:
-            workspace_path = str(board_default)
+        _raw_board_default = board_meta.get("default_workdir")
+        if _raw_board_default:
+            board_default = str(_raw_board_default)
+            if workspace_kind == "dir":
+                workspace_path = board_default
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        effective_workspace_path = workspace_path
+        if effective_workspace_path is None and workspace_kind == "worktree" and board_default:
+            effective_workspace_path = str(Path(board_default).expanduser() / ".worktrees" / task_id)
         try:
             with write_txn(conn):
                 # Determine task status from parent status, unless the caller
@@ -2446,7 +2459,7 @@ def create_task(
                         created_by,
                         now,
                         workspace_kind,
-                        workspace_path,
+                        effective_workspace_path,
                         branch_name,
                         tenant,
                         idempotency_key,
@@ -2474,6 +2487,7 @@ def create_task(
                         "parents": list(parents),
                         "tenant": tenant,
                         "branch_name": branch_name,
+                        "workspace_path": effective_workspace_path,
                         "skills": list(skills_list) if skills_list else None,
                         "model_override": model_override,
                         "goal_mode": bool(goal_mode) or None,
@@ -2484,7 +2498,7 @@ def create_task(
                     title=title,
                     created_by=created_by,
                     workspace_kind=workspace_kind,
-                    workspace_path=workspace_path,
+                    workspace_path=effective_workspace_path,
                     skills=skills_list,
                     model_override=model_override,
                     triage=triage,
@@ -2501,7 +2515,7 @@ def create_task(
                         assignee=str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
                         created_by=REVIEW_GATE_CREATED_BY,
                         workspace_kind=workspace_kind,
-                        workspace_path=workspace_path,
+                        workspace_path=effective_workspace_path,
                         branch_name=branch_name,
                         tenant=tenant,
                         priority=priority,

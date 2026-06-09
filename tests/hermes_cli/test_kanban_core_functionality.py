@@ -2586,6 +2586,43 @@ def test_resolve_workspace_rejects_relative_worktree_path(kanban_home):
         conn.close()
 
 
+def test_worktree_inherits_board_default_as_project_local_task_dir(kanban_home, tmp_path):
+    """A board default_workdir names the repo; worktree tasks get repo/.worktrees/<task>."""
+    repo = tmp_path / "project"
+    repo.mkdir()
+    kb.write_board_metadata(None, default_workdir=str(repo))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="wt", assignee="worker", workspace_kind="worktree"
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        expected = repo / ".worktrees" / tid
+        assert task.workspace_path == str(expected)
+        assert kb.resolve_workspace(task) == expected
+    finally:
+        conn.close()
+
+
+def test_dir_still_inherits_board_default_directly(kanban_home, tmp_path):
+    """dir tasks keep the prior default_workdir semantics."""
+    repo = tmp_path / "project"
+    repo.mkdir()
+    kb.write_board_metadata(None, default_workdir=str(repo))
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="dir", assignee="worker", workspace_kind="dir"
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.workspace_path == str(repo)
+        assert kb.resolve_workspace(task) == repo
+    finally:
+        conn.close()
+
+
 def test_build_worker_context_caps_prior_attempts(kanban_home):
     """When a task has more than _CTX_MAX_PRIOR_ATTEMPTS runs, only
     the most recent N are shown in full; earlier attempts are summarised
