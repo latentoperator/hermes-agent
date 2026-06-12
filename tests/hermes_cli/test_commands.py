@@ -386,7 +386,11 @@ class TestSlackNativeSlashes:
         slack_norm = {_norm(n) for n in slack_names}
         tg_norm = {_norm(n) for n in tg_names}
         reserved_norm = {_norm(n) for n in _SLACK_RESERVED_COMMANDS}
-        missing = (tg_norm - slack_norm) - reserved_norm
+        # Slack has a hard 50-command cap.  We reserve slots for /hermes and
+        # the long-standing /btw and /bg aliases, so one low-frequency
+        # canonical command currently degrades to `/hermes debug`.
+        curated_omissions = {"debug"}
+        missing = (tg_norm - slack_norm) - reserved_norm - curated_omissions
         assert not missing, (
             f"commands on Telegram but missing from Slack native slashes: {sorted(missing)}"
         )

@@ -10048,7 +10048,10 @@ def _resolve_chat_argv(
     profile_dir: Optional[Path] = None
     requested = (profile or "").strip()
     if requested and requested.lower() != "current":
-        profile_dir = _resolve_profile_dir(requested)
+        try:
+            profile_dir = _resolve_profile_dir(requested)
+        except HTTPException as exc:
+            raise PtyUnavailableError(str(exc.detail)) from exc
 
     argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
     env = os.environ.copy()
@@ -10069,6 +10072,7 @@ def _resolve_chat_argv(
 
     if profile_dir is not None:
         env["HERMES_HOME"] = str(profile_dir)
+        env["HERMES_PROFILE"] = requested
 
     if resume:
         latest_resume, _latest_path = _session_latest_descendant(resume)
