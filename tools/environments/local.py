@@ -230,7 +230,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(sanitized)
 
-    _inject_hermes_bin_path(sanitized, profile_home_enabled=bool(_profile_home))
+    _inject_hermes_bin_path(sanitized, profile_home_enabled=_uses_profile_home(sanitized))
 
     return sanitized
 
@@ -393,6 +393,20 @@ def _inject_hermes_bin_path(env: dict, *, profile_home_enabled: bool = False) ->
         pass
 
 
+def _uses_profile_home(env: dict) -> bool:
+    """Return True when subprocess HOME is the active profile's home dir."""
+    hermes_home = str(env.get("HERMES_HOME") or "").strip()
+    home = str(env.get("HOME") or "").strip()
+    if not hermes_home or not home:
+        return False
+    try:
+        expected = os.path.normcase(os.path.abspath(os.path.join(hermes_home, "home")))
+        actual = os.path.normcase(os.path.abspath(os.path.expanduser(home)))
+        return actual == expected
+    except Exception:
+        return False
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
@@ -417,7 +431,7 @@ def _make_run_env(env: dict) -> dict:
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(run_env)
 
-    _inject_hermes_bin_path(run_env, profile_home_enabled=bool(_profile_home))
+    _inject_hermes_bin_path(run_env, profile_home_enabled=_uses_profile_home(run_env))
 
     # Inject ContextVar-based session vars into subprocess env.
     # ContextVars don't propagate to child processes, so we bridge them here.

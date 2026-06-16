@@ -488,6 +488,7 @@ class TestHermesBinPathInjection:
             "HOME": str(tmp_path),
             "HERMES_HOME": str(profile),
             "PATH": "/usr/bin:/bin",
+            "TERMINAL_HOME_MODE": "profile",
         }
         with patch.dict(os.environ, env, clear=True):
             result = _make_run_env({})
@@ -507,6 +508,7 @@ class TestHermesBinPathInjection:
             "HOME": str(tmp_path),
             "HERMES_HOME": str(profile),
             "PATH": "/usr/bin:/bin",
+            "TERMINAL_HOME_MODE": "profile",
         }
         with patch.dict(os.environ, base_env, clear=True):
             result = _sanitize_subprocess_env(base_env)
