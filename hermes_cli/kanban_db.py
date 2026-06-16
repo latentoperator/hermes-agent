@@ -106,10 +106,12 @@ _IS_WINDOWS = sys.platform == "win32"
 # Hopewell's dev review gate is intentionally Kanban-owned, not Git-hook-owned:
 # cards created for persistent work under this root get a dependent review card.
 # Env/config can override every field so this stays operationally recoverable.
+# Review gates normally use the assignee profile's default model; set a non-empty
+# review_gate.model only when an operator explicitly wants a per-card model pin.
 DEFAULT_REVIEW_GATE_ROOTS = ("/home/hopewell/hopewell-dev",)
 DEFAULT_REVIEW_GATE_ASSIGNEE = "wren"
-DEFAULT_REVIEW_GATE_MODEL = "anthropic/claude-opus-4.8"
-DEFAULT_REVIEW_GATE_FALLBACK_MODEL = "google/gemini-3-pro-preview"
+DEFAULT_REVIEW_GATE_MODEL: Optional[str] = None
+DEFAULT_REVIEW_GATE_FALLBACK_MODEL: Optional[str] = None
 DEFAULT_REVIEW_GATE_SKILLS = ("github-code-review",)
 REVIEW_GATE_CREATED_BY = "hopewell-dev-review-gate"
 
@@ -784,6 +786,10 @@ class Task:
     # list = explicitly no extra skills.
     skills: Optional[list] = None
     model_override: Optional[str] = None
+    # Per-task reasoning effort override. When set, the dispatcher passes
+    # ``--reasoning <level>`` to the worker CLI, overriding the profile's
+    # configured ``agent.reasoning_effort`` for this run.
+    reasoning_override: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -874,6 +880,11 @@ class Task:
             ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            reasoning_override=(
+                row["reasoning_override"]
+                if "reasoning_override" in keys and row["reasoning_override"]
+                else None
+            ),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -1026,6 +1037,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
     model_override       TEXT,
+    -- Per-task reasoning effort override. When set, the dispatcher passes
+    -- --reasoning <level> to the worker, overriding agent.reasoning_effort
+    -- for this task only. NULL = use the profile default.
+    reasoning_override   TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -1735,7 +1750,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
 
     if "model_override" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
+        _add_column_if_missing(conn, "tasks", "model_override", "model_override TEXT")
+
+    if "reasoning_override" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "reasoning_override", "reasoning_override TEXT"
+        )
 
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
@@ -2135,6 +2155,12 @@ def _review_gate_config() -> dict[str, Any]:
             return default
         return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
+    def _optional_model(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        model = str(value).strip()
+        return model or None
+
     enabled = _env_bool(
         "HERMES_KANBAN_REVIEW_GATE_ENABLED",
         bool(gate.get("enabled", True)),
@@ -2160,6 +2186,20 @@ def _review_gate_config() -> dict[str, Any]:
         else:
             skills = list(DEFAULT_REVIEW_GATE_SKILLS)
 
+    raw_model = os.environ.get("HERMES_KANBAN_REVIEW_GATE_MODEL")
+    if raw_model is None:
+        model = _optional_model(gate.get("model", DEFAULT_REVIEW_GATE_MODEL))
+    else:
+        model = _optional_model(raw_model)
+
+    raw_fallback_model = os.environ.get("HERMES_KANBAN_REVIEW_GATE_FALLBACK_MODEL")
+    if raw_fallback_model is None:
+        fallback_model = _optional_model(
+            gate.get("fallback_model", DEFAULT_REVIEW_GATE_FALLBACK_MODEL)
+        )
+    else:
+        fallback_model = _optional_model(raw_fallback_model)
+
     return {
         "enabled": enabled,
         "roots": roots,
@@ -2167,14 +2207,8 @@ def _review_gate_config() -> dict[str, Any]:
             "HERMES_KANBAN_REVIEW_GATE_ASSIGNEE",
             str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
         ).strip() or DEFAULT_REVIEW_GATE_ASSIGNEE,
-        "model": os.environ.get(
-            "HERMES_KANBAN_REVIEW_GATE_MODEL",
-            str(gate.get("model") or DEFAULT_REVIEW_GATE_MODEL),
-        ).strip() or DEFAULT_REVIEW_GATE_MODEL,
-        "fallback_model": os.environ.get(
-            "HERMES_KANBAN_REVIEW_GATE_FALLBACK_MODEL",
-            str(gate.get("fallback_model") or DEFAULT_REVIEW_GATE_FALLBACK_MODEL),
-        ).strip() or DEFAULT_REVIEW_GATE_FALLBACK_MODEL,
+        "model": model,
+        "fallback_model": fallback_model,
         "skills": skills or list(DEFAULT_REVIEW_GATE_SKILLS),
         "max_runtime_seconds": gate.get("max_runtime_seconds", 30 * 60),
     }
@@ -2215,15 +2249,19 @@ def _should_create_review_gate(
     skill_names = {str(s).strip() for s in (skills or []) if str(s).strip()}
     if skill_names.intersection(set(gate.get("skills") or DEFAULT_REVIEW_GATE_SKILLS)):
         return False, gate
-    if model_override and str(model_override).strip() == gate.get("model"):
+    if gate.get("model") and model_override and str(model_override).strip() == gate.get("model"):
         return False, gate
     if not any(_path_is_under(workspace_path, root) for root in gate.get("roots", [])):
         return False, gate
     return True, gate
 
 
-def _review_gate_body(parent_id: str, parent_title: str, fallback_model: str) -> str:
-    return (
+def _review_gate_body(
+    parent_id: str,
+    parent_title: str,
+    fallback_model: Optional[str] = None,
+) -> str:
+    body = (
         "Run the Hopewell dev code-review gate for the parent implementation card.\n\n"
         f"Parent task: {parent_id}\n"
         f"Parent title: {parent_title.strip()}\n\n"
@@ -2232,10 +2270,15 @@ def _review_gate_body(parent_id: str, parent_title: str, fallback_model: str) ->
         "Use the github-code-review skill. Produce a concise PASS / WARN / BLOCK "
         "result and write durable review artifacts under .code-reviews/feedback/ "
         "when there are findings worth preserving. Do not perform broad unrelated "
-        "refactors.\n\n"
-        f"If the Opus/Nous review run fails due to model/provider/runtime failure, "
-        f"retry the same review with Gemini via model {fallback_model}."
+        "refactors. The review should run on the reviewer profile's default model "
+        "unless the card explicitly sets a model override."
     )
+    if fallback_model:
+        body += (
+            "\n\nIf the pinned review model fails due to model/provider/runtime failure, "
+            f"retry the same review via fallback model {fallback_model}."
+        )
+    return body
 
 
 def create_task(
@@ -2256,6 +2299,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     model_override: Optional[str] = None,
+    reasoning_override: Optional[str] = None,
     max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
@@ -2310,6 +2354,14 @@ def create_task(
         raise ValueError("branch_name is only valid for worktree workspaces")
     if model_override is not None:
         model_override = str(model_override).strip() or None
+    if reasoning_override is not None:
+        from hermes_constants import parse_reasoning_effort
+
+        reasoning_override = str(reasoning_override).strip().lower() or None
+        if reasoning_override and parse_reasoning_effort(reasoning_override) is None:
+            raise ValueError(
+                "reasoning_override must be one of none, minimal, low, medium, high, xhigh"
+            )
     parents = tuple(p for p in parents if p)
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -2446,8 +2498,8 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, model_override, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, model_override, reasoning_override, max_retries, goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2466,6 +2518,7 @@ def create_task(
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         model_override,
+                        reasoning_override,
                         int(max_retries) if max_retries is not None else None,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
@@ -2490,6 +2543,7 @@ def create_task(
                         "workspace_path": effective_workspace_path,
                         "skills": list(skills_list) if skills_list else None,
                         "model_override": model_override,
+                        "reasoning_override": reasoning_override,
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
@@ -2507,11 +2561,7 @@ def create_task(
                     create_task(
                         conn,
                         title=f"review: {title.strip()}",
-                        body=_review_gate_body(
-                            task_id,
-                            title,
-                            str(gate.get("fallback_model") or DEFAULT_REVIEW_GATE_FALLBACK_MODEL),
-                        ),
+                        body=_review_gate_body(task_id, title, gate.get("fallback_model")),
                         assignee=str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
                         created_by=REVIEW_GATE_CREATED_BY,
                         workspace_kind=workspace_kind,
@@ -2523,7 +2573,7 @@ def create_task(
                         idempotency_key=f"{REVIEW_GATE_CREATED_BY}:{task_id}",
                         max_runtime_seconds=int(gate.get("max_runtime_seconds") or 30 * 60),
                         skills=gate.get("skills") or list(DEFAULT_REVIEW_GATE_SKILLS),
-                        model_override=str(gate.get("model") or DEFAULT_REVIEW_GATE_MODEL),
+                        model_override=str(gate["model"]).strip() if gate.get("model") else None,
                         max_retries=1,
                         board=board,
                         auto_review_gate=False,
@@ -5930,12 +5980,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
-def _is_opus_review_gate_card(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True if *task_id* is an Opus review-gate card that would qualify
-    for an automatic Gemini fallback on circuit-breaker trip.
+def _is_pinned_review_gate_card_with_fallback(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True if *task_id* is a pinned review-gate card with a configured
+    fallback model for circuit-breaker recovery.
 
-    Lightweight read-only check — no mutation.
+    The normal Hopewell review gate runs on the reviewer profile's default model
+    and therefore has no automatic model-specific fallback.
     """
+    gate = _review_gate_config()
+    gate_model = gate.get("model")
+    fallback_model = gate.get("fallback_model")
+    if not gate_model or not fallback_model:
+        return False
     row = conn.execute(
         "SELECT created_by, model_override, title FROM tasks WHERE id = ?",
         (task_id,),
@@ -5944,18 +6000,22 @@ def _is_opus_review_gate_card(conn: sqlite3.Connection, task_id: str) -> bool:
         return False
     if row["created_by"] != REVIEW_GATE_CREATED_BY:
         return False
-    if (row["model_override"] or "").strip() != DEFAULT_REVIEW_GATE_MODEL:
+    if (row["model_override"] or "").strip() != str(gate_model).strip():
         return False
     return (row["title"] or "").strip().lower().startswith("review:")
 
 
-def _create_gemini_fallback(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Create a Gemini fallback review card for *task_id* — an Opus
-    review-gate card that just hit the circuit breaker.
+def _create_review_gate_fallback(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Create a configured fallback review card for *task_id*.
 
-    Must be called OUTSIDE any existing write transaction — it opens its
-    own ``write_txn``.
+    Only review gates with an explicit pinned model and explicit fallback model
+    use this path. Default-model review gates should block on failure instead of
+    silently switching models.
     """
+    gate = _review_gate_config()
+    fallback_model = gate.get("fallback_model")
+    if not fallback_model:
+        return False
     row = conn.execute(
         "SELECT title, assignee, workspace_kind, workspace_path, "
         "branch_name, tenant FROM tasks WHERE id = ?",
@@ -5975,12 +6035,12 @@ def _create_gemini_fallback(conn: sqlite3.Connection, task_id: str) -> bool:
     gb = _review_gate_body(
         parent_ids[0] if parent_ids else task_id,
         title,
-        str(DEFAULT_REVIEW_GATE_FALLBACK_MODEL),
+        str(fallback_model),
     )
 
     create_task(
         conn,
-        title=f"{title.strip()} (Gemini retry)",
+        title=f"{title.strip()} (fallback retry)",
         body=gb,
         assignee=(row["assignee"] or DEFAULT_REVIEW_GATE_ASSIGNEE),
         created_by=REVIEW_GATE_CREATED_BY,
@@ -5989,10 +6049,10 @@ def _create_gemini_fallback(conn: sqlite3.Connection, task_id: str) -> bool:
         branch_name=row["branch_name"],
         tenant=row["tenant"],
         parents=parent_ids,
-        idempotency_key=f"{REVIEW_GATE_CREATED_BY}:gemini:{task_id}",
+        idempotency_key=f"{REVIEW_GATE_CREATED_BY}:fallback:{task_id}",
         max_runtime_seconds=30 * 60,
-        skills=list(DEFAULT_REVIEW_GATE_SKILLS),
-        model_override=DEFAULT_REVIEW_GATE_FALLBACK_MODEL,
+        skills=gate.get("skills") or list(DEFAULT_REVIEW_GATE_SKILLS),
+        model_override=str(fallback_model).strip(),
         max_retries=1,
         auto_review_gate=False,
     )
@@ -6047,7 +6107,7 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
-    _should_gemini_fallback = False
+    _should_create_review_fallback = False
     with write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries "
@@ -6071,10 +6131,11 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if failures >= effective_limit:
-            # Before tripping the breaker, record whether this is an
-            # Opus review-gate card (the fallback is created AFTER this
-            # transaction commits, avoiding nested-write-txn deadlock).
-            _should_gemini_fallback = _is_opus_review_gate_card(conn, task_id)
+            # Before tripping the breaker, record whether this is a pinned
+            # review-gate card with a configured fallback model (the fallback is
+            # created AFTER this transaction commits, avoiding nested-write-txn
+            # deadlock).
+            _should_create_review_fallback = _is_pinned_review_gate_card_with_fallback(conn, task_id)
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
@@ -6155,18 +6216,17 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
-    # After the failure transaction commits, create a Gemini fallback
-    # review card if this was an Opus review-gate card that just hit
-    # the circuit breaker.  Runs in its own write_txn to avoid nested-
-    # transaction deadlock.
-    if blocked and _should_gemini_fallback:
+    # After the failure transaction commits, create a configured fallback review
+    # card if this was a pinned review-gate card that just hit the circuit
+    # breaker. Runs in its own write_txn to avoid nested-transaction deadlock.
+    if blocked and _should_create_review_fallback:
         try:
-            _create_gemini_fallback(conn, task_id)
+            _create_review_gate_fallback(conn, task_id)
         except Exception:
-            # Fallback creation is best-effort — do not let a Gemini
-            # card-creation failure shadow the real task failure.
+            # Fallback creation is best-effort — do not let a fallback card
+            # creation failure shadow the real task failure.
             _log.warning(
-                "review-gate: Gemini fallback failed for task %s", task_id,
+                "review-gate: fallback creation failed for task %s", task_id,
                 exc_info=True,
             )
     return blocked
@@ -7227,6 +7287,8 @@ def _default_spawn(
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
+    if task.reasoning_override:
+        cmd.extend(["--reasoning", task.reasoning_override])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])

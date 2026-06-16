@@ -22,7 +22,7 @@ def test_create_task_persists_model_override(tmp_path, monkeypatch):
     assert task.model_override == "claude-opus-4-8"
 
 
-def test_hopewell_dev_task_creates_dependent_opus_review_card(tmp_path, monkeypatch):
+def test_hopewell_dev_task_creates_dependent_default_model_review_card(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     root = tmp_path / "hopewell-dev"
     repo = root / "demo-repo"
@@ -50,10 +50,11 @@ def test_hopewell_dev_task_creates_dependent_opus_review_card(tmp_path, monkeypa
     assert review.status == "todo"
     assert review.workspace_kind == "dir"
     assert review.workspace_path == str(repo)
-    assert review.model_override == "anthropic/claude-opus-4.8"
+    assert review.model_override is None
     assert review.skills == ["github-code-review"]
     assert review.max_retries == 1
-    assert "google/gemini-3-pro-preview" in (review.body or "")
+    assert "default model" in (review.body or "")
+    assert "gemini" not in (review.body or "").lower()
 
     with kb.connect_closing() as conn:
         assert kb.parent_ids(conn, review.id) == [task_id]
@@ -150,9 +151,9 @@ def test_kanban_tool_create_accepts_model_override(tmp_path, monkeypatch):
     assert task.model_override == "claude-opus-4-8"
 
 
-def test_opus_review_gate_failure_creates_gemini_fallback(tmp_path, monkeypatch):
-    """When the circuit breaker trips on an Opus review-gate card,
-    a Gemini fallback review card is automatically created."""
+def test_default_model_review_gate_failure_does_not_create_model_fallback(tmp_path, monkeypatch):
+    """Default-model review-gate cards block on failure instead of silently
+    switching to a different pinned review model."""
     db_path = tmp_path / "kanban.db"
     root = tmp_path / "hopewell-dev"
     repo = root / "demo-repo"
@@ -162,7 +163,8 @@ def test_opus_review_gate_failure_creates_gemini_fallback(tmp_path, monkeypatch)
     monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
 
     with kb.connect_closing() as conn:
-        # Create implementation + auto-review (Opus) card
+        # Create implementation + auto-review card. The review uses the
+        # assignee profile's default model by default.
         impl_id = kb.create_task(
             conn,
             title="implement demo feature",
@@ -172,20 +174,21 @@ def test_opus_review_gate_failure_creates_gemini_fallback(tmp_path, monkeypatch)
         )
         children = kb.child_ids(conn, impl_id)
         assert len(children) == 1
-        opus_review = kb.get_task(conn, children[0])
-        assert opus_review.model_override == "anthropic/claude-opus-4.8"
-        assert opus_review.created_by == "hopewell-dev-review-gate"
+        review = kb.get_task(conn, children[0])
+        assert review is not None
+        assert review.model_override is None
+        assert review.created_by == "hopewell-dev-review-gate"
 
         # Complete the parent so the review card can be promoted to
         # ready (dependencies must be satisfied for the dispatch path).
         kb.complete_task(conn, impl_id, result="done")
         kb.recompute_ready(conn)  # promotes review card to ready
 
-        # Now that it's ready, simulate the Opus card hitting the
+        # Now that it's ready, simulate the review card hitting the
         # circuit breaker (max_retries=1 means first failure trips it).
         blocked = kb._record_task_failure(
             conn,
-            opus_review.id,
+            review.id,
             error="model unavailable",
             outcome="crash",
             release_claim=True,
@@ -193,36 +196,65 @@ def test_opus_review_gate_failure_creates_gemini_fallback(tmp_path, monkeypatch)
         )
         assert blocked  # breaker should trip
 
-        # The Opus card should now be blocked
-        opus = kb.get_task(conn, opus_review.id)
-        assert opus.status == "blocked"
+        # The review card should now be blocked and no fallback card should
+        # have been created because no explicit review model/fallback is set.
+        blocked_review = kb.get_task(conn, review.id)
+        assert blocked_review.status == "blocked"
+        assert kb.child_ids(conn, impl_id) == [review.id]
 
-        # A Gemini fallback card should have been created
+
+def test_pinned_review_gate_failure_creates_configured_fallback(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    repo = root / "demo-repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_MODEL", "review-primary")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_FALLBACK_MODEL", "review-fallback")
+
+    with kb.connect_closing() as conn:
+        impl_id = kb.create_task(
+            conn,
+            title="implement demo feature",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        children = kb.child_ids(conn, impl_id)
+        assert len(children) == 1
+        review = kb.get_task(conn, children[0])
+        assert review is not None
+        assert review.model_override == "review-primary"
+
+        kb.complete_task(conn, impl_id, result="done")
+        kb.recompute_ready(conn)
+        blocked = kb._record_task_failure(
+            conn,
+            review.id,
+            error="model unavailable",
+            outcome="crash",
+            release_claim=True,
+            end_run=True,
+        )
+        assert blocked
+
         all_children = kb.child_ids(conn, impl_id)
-        # There should be 2 children: Opus (blocked) + Gemini (ready/todo)
         assert len(all_children) == 2
-
-        gemini_card = None
-        for cid in all_children:
-            if cid != opus_review.id:
-                gemini_card = kb.get_task(conn, cid)
-                break
-
-        assert gemini_card is not None
-        assert gemini_card.created_by == "hopewell-dev-review-gate"
-        assert gemini_card.model_override == "google/gemini-3-pro-preview"
-        assert gemini_card.skills == ["github-code-review"]
-        assert gemini_card.workspace_path == str(repo)
-        assert gemini_card.workspace_kind == "dir"
-        # It should be a child of the implementation card
-        assert kb.parent_ids(conn, gemini_card.id) == [impl_id]
+        fallback = next(kb.get_task(conn, cid) for cid in all_children if cid != review.id)
+        assert fallback is not None
+        assert fallback.created_by == "hopewell-dev-review-gate"
+        assert fallback.model_override == "review-fallback"
+        assert fallback.skills == ["github-code-review"]
+        assert kb.parent_ids(conn, fallback.id) == [impl_id]
 
 
-def test_non_review_gate_card_does_not_create_gemini_fallback(
+def test_non_review_gate_card_does_not_create_fallback(
     tmp_path, monkeypatch
 ):
-    """Only review-gate cards (created_by='hopewell-dev-review-gate')
-    trigger Gemini fallback; normal cards do not."""
+    """Only review-gate cards created by the review gate can trigger a
+    configured fallback; normal cards do not."""
     db_path = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
 
@@ -247,5 +279,5 @@ def test_non_review_gate_card_does_not_create_gemini_fallback(
             end_run=True,
         )
         assert blocked
-        # No Gemini fallback because created_by != REVIEW_GATE_CREATED_BY
+        # No fallback because created_by != REVIEW_GATE_CREATED_BY
         assert kb.child_ids(conn, task_id) == []
