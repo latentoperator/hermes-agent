@@ -375,6 +375,29 @@ class TestConfig:
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
 
+    def test_get_client_ensures_hindsight_client_for_external_modes(self, monkeypatch):
+        ensured = []
+        captured = {}
+
+        class FakeHindsight:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setitem(sys.modules, "hindsight_client", SimpleNamespace(Hindsight=FakeHindsight))
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda feature, prompt=False: ensured.append((feature, prompt)))
+
+        p = HindsightMemoryProvider()
+        p._mode = "local_external"
+        p._client = None
+        p._api_url = "http://127.0.0.1:8888"
+        p._api_key = ""
+        p._timeout = 12
+
+        p._get_client()
+
+        assert ensured == [("memory.hindsight", False)]
+        assert captured == {"base_url": "http://127.0.0.1:8888", "timeout": 12.0}
+
 
 class TestPostSetup:
     def test_setup_cancel_at_mode_picker_writes_nothing(self, tmp_path, monkeypatch):

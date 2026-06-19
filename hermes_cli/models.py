@@ -33,6 +33,9 @@ COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 # Fallback OpenRouter snapshot used when the live catalog is unavailable.
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
+    # Chris quick picks
+    ("moonshotai/kimi-k2.7-code",              ""),
+    ("z-ai/glm-5.2",                           ""),
     # Anthropic
     ("anthropic/claude-opus-4.8",              ""),
     ("anthropic/claude-opus-4.8-fast",         "2x price, higher output speed"),
@@ -57,7 +60,6 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("qwen/qwen3.6-35b-a3b",                   ""),
     # MoonshotAI
     ("moonshotai/kimi-k2.6",                   "recommended"),
-    ("moonshotai/kimi-k2.7-code",              ""),
     # MiniMax
     ("minimax/minimax-m3",                     ""),
     # Z-AI

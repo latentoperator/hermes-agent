@@ -811,6 +811,7 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
+                reasoning_override=args.get("reasoning_override"),
                 model_override=str(model_override).strip() if model_override else None,
                 goal_mode=goal_mode,
                 goal_max_turns=(
@@ -1405,6 +1406,15 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "reasoning_override": {
+                "type": "string",
+                "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+                "description": (
+                    "Optional per-task reasoning effort override passed to "
+                    "the dispatched worker. Omit to use the assignee "
+                    "profile's configured agent.reasoning_effort."
                 ),
             },
             "model_override": {

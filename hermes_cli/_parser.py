@@ -201,6 +201,12 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--reasoning",
+        default=None,
+        help="Reasoning effort override (none, minimal, low, medium, high, xhigh)",
+    )
+    _inherited_flag(
+        parser,
         "--ignore-user-config",
         action="store_true",
         default=False,
@@ -265,6 +271,12 @@ def build_top_level_parser():
     )
     chat_parser.add_argument(
         "-t", "--toolsets", help="Comma-separated toolsets to enable"
+    )
+    _inherited_flag(
+        chat_parser,
+        "--reasoning",
+        default=None,
+        help="Reasoning effort override (none, minimal, low, medium, high, xhigh)",
     )
     _inherited_flag(
         chat_parser,
