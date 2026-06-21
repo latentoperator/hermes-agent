@@ -116,3 +116,83 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_kanban_worker_skill_probe_respects_disabled_skill(monkeypatch, tmp_path):
+    """A physical bundled skill copy is not enough: disabled skills are fatal
+    when passed via --skills, so the dispatcher must omit kanban-worker.
+    """
+    profile = tmp_path / ".hermes" / "profiles" / "elias"
+    skill = profile / "skills" / "devops" / "kanban-worker"
+    skill.mkdir(parents=True)
+    skill.joinpath("SKILL.md").write_text(
+        "---\nname: kanban-worker\ndescription: worker\n---\nbody\n",
+        encoding="utf-8",
+    )
+    profile.joinpath("config.yaml").write_text(
+        "skills:\n  disabled:\n    - kanban-worker\n",
+        encoding="utf-8",
+    )
+
+    from hermes_cli import kanban_db as kb
+
+    assert kb._kanban_worker_skill_available(str(profile)) is False
+
+
+def test_resolve_worker_cli_toolsets_drops_unknown_legacy_names(monkeypatch, tmp_path):
+    """Old configs may still contain aliases like 'messaging'; do not pass
+    them to the worker CLI where they emit startup warnings.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - terminal
+    - messaging
+    - web
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    resolved = kb._resolve_worker_cli_toolsets(str(profile))
+
+    assert resolved is not None
+    assert "terminal" in resolved
+    assert "web" in resolved
+    assert "messaging" not in resolved
+
+
+def test_review_gate_inherits_root_config_when_profile_has_no_gate(monkeypatch, tmp_path):
+    """Profile workers should honor the machine/root review-gate policy.
+
+    Without this, a profile-scoped worker with no kanban.review_gate stanza
+    falls back to hard-coded defaults and can re-enable a root-disabled gate.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text(
+        """
+kanban:
+  review_gate:
+    enabled: false
+    skills:
+      - github-operations
+""".lstrip(),
+        encoding="utf-8",
+    )
+    profile.joinpath("config.yaml").write_text("model:\n  default: test\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    from hermes_cli import kanban_db as kb
+
+    gate = kb._review_gate_config()
+
+    assert gate["enabled"] is False
+    assert gate["skills"] == ["github-operations"]

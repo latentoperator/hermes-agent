@@ -2156,6 +2156,43 @@ def _review_gate_config() -> dict[str, Any]:
         gate = kanban_cfg.get("review_gate", {}) if isinstance(kanban_cfg, dict) else {}
         if not isinstance(gate, dict):
             gate = {}
+
+        # Dispatcher-spawned profile workers run with a profile-scoped
+        # HERMES_HOME.  Hopewell's review gate is a machine/fleet policy, and
+        # operators normally configure it in the root home.  If the active
+        # profile has no explicit review_gate stanza, inherit the root config
+        # instead of silently falling back to the hard-coded defaults.  Without
+        # this, a profile worker can re-enable a root-disabled review gate and
+        # create child cards with stale forced skills.
+        try:
+            import yaml
+            from hermes_constants import get_hermes_home
+
+            home = get_hermes_home().resolve(strict=False)
+            raw_cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+            raw_kanban = raw_cfg.get("kanban", {}) if isinstance(raw_cfg, dict) else {}
+            current_has_explicit_gate = (
+                isinstance(raw_kanban, dict) and "review_gate" in raw_kanban
+            )
+        except Exception:
+            current_has_explicit_gate = bool(gate)
+
+        if not current_has_explicit_gate:
+            try:
+                import yaml
+                from hermes_constants import get_default_hermes_root, get_hermes_home
+
+                home = get_hermes_home().resolve(strict=False)
+                root = get_default_hermes_root().resolve(strict=False)
+                root_config = root / "config.yaml"
+                if home != root and root_config.exists():
+                    root_cfg = yaml.safe_load(root_config.read_text(encoding="utf-8")) or {}
+                    root_kanban = root_cfg.get("kanban", {}) if isinstance(root_cfg, dict) else {}
+                    root_gate = root_kanban.get("review_gate", {}) if isinstance(root_kanban, dict) else {}
+                    if isinstance(root_gate, dict) and root_gate:
+                        gate = root_gate
+            except Exception:
+                pass
     except Exception:
         gate = {}
 
@@ -7167,6 +7204,24 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     skills_root = base / "skills"
     if not skills_root.is_dir():
         return False
+    # Preloading disabled skills is just as fatal as preloading missing ones.
+    # Many profile homes keep a physical copy of bundled skills while disabling
+    # them in config.yaml for normal prompt-budget hygiene; respect that here.
+    try:
+        import yaml
+
+        cfg = yaml.safe_load((base / "config.yaml").read_text(encoding="utf-8")) or {}
+        skills_cfg = cfg.get("skills", {}) if isinstance(cfg, dict) else {}
+        disabled = skills_cfg.get("disabled", []) if isinstance(skills_cfg, dict) else []
+        if isinstance(disabled, str):
+            disabled_names = {disabled.strip()}
+        else:
+            disabled_names = {str(name).strip() for name in (disabled or [])}
+        if "kanban-worker" in disabled_names:
+            return False
+    except Exception:
+        pass
+
     # Canonical bundled location first (cheap), then a bounded scan for
     # profiles that have it nested elsewhere.
     if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
@@ -7231,7 +7286,18 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         token = set_hermes_home_override(hermes_home)
         try:
             cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            raw_toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            toolsets = [
+                name for name in raw_toolsets
+                if str(name).casefold() in KNOWN_TOOLSET_NAMES
+            ]
+            dropped = sorted(set(raw_toolsets) - set(toolsets))
+            if dropped:
+                _log.debug(
+                    "kanban worker: dropping unknown CLI toolsets for HERMES_HOME=%r: %s",
+                    hermes_home,
+                    ", ".join(dropped),
+                )
         finally:
             reset_hermes_home_override(token)
         return toolsets or None
