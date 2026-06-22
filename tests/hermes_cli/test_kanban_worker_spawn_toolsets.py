@@ -196,3 +196,39 @@ kanban:
 
     assert gate["enabled"] is False
     assert gate["skills"] == ["github-operations"]
+
+
+def test_default_spawn_passes_provider_and_model_overrides(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("toolsets:\n  - hermes-cli\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _make_task(kb, assignee="elias")
+    task.provider_override = "deepseek"
+    task.model_override = "deepseek-v4-pro"
+
+    pid = kb._default_spawn(task, str(workspace))
+
+    assert pid == 4243
+    assert captured["cmd"][captured["cmd"].index("--provider") + 1] == "deepseek"
+    assert captured["cmd"][captured["cmd"].index("-m") + 1] == "deepseek-v4-pro"

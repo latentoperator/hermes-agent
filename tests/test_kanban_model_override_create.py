@@ -5,7 +5,7 @@ from hermes_cli import kanban_db as kb
 from tools import kanban_tools
 
 
-def test_create_task_persists_model_override(tmp_path, monkeypatch):
+def test_create_task_persists_provider_and_model_override(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
 
@@ -14,12 +14,14 @@ def test_create_task_persists_model_override(tmp_path, monkeypatch):
             conn,
             title="review hopewell-dev change",
             assignee="wren",
-            model_override="claude-opus-4-8",
+            provider_override="deepseek",
+            model_override="deepseek-v4-pro",
         )
         task = kb.get_task(conn, task_id)
 
     assert task is not None
-    assert task.model_override == "claude-opus-4-8"
+    assert task.provider_override == "deepseek"
+    assert task.model_override == "deepseek-v4-pro"
 
 
 def test_hopewell_dev_task_creates_dependent_default_model_review_card(tmp_path, monkeypatch):
@@ -50,6 +52,7 @@ def test_hopewell_dev_task_creates_dependent_default_model_review_card(tmp_path,
     assert review.status == "todo"
     assert review.workspace_kind == "dir"
     assert review.workspace_path == str(repo)
+    assert review.provider_override is None
     assert review.model_override is None
     assert review.skills == ["github-code-review"]
     assert review.max_retries == 1
@@ -118,8 +121,10 @@ def test_kanban_cli_create_accepts_model_override(tmp_path, monkeypatch, capsys)
             "review hopewell-dev change",
             "--assignee",
             "wren",
+            "--provider",
+            "deepseek",
             "--model",
-            "claude-opus-4-8",
+            "deepseek-v4-pro",
             "--json",
         ]
     )
@@ -128,7 +133,8 @@ def test_kanban_cli_create_accepts_model_override(tmp_path, monkeypatch, capsys)
 
     assert exit_code == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["model_override"] == "claude-opus-4-8"
+    assert payload["provider_override"] == "deepseek"
+    assert payload["model_override"] == "deepseek-v4-pro"
 
 
 def test_kanban_tool_create_accepts_model_override(tmp_path, monkeypatch):
@@ -139,7 +145,8 @@ def test_kanban_tool_create_accepts_model_override(tmp_path, monkeypatch):
         {
             "title": "review hopewell-dev change",
             "assignee": "wren",
-            "model_override": "claude-opus-4-8",
+            "provider_override": "deepseek",
+            "model_override": "deepseek-v4-pro",
         }
     )
     result = json.loads(raw)
@@ -148,7 +155,8 @@ def test_kanban_tool_create_accepts_model_override(tmp_path, monkeypatch):
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, result["task_id"])
     assert task is not None
-    assert task.model_override == "claude-opus-4-8"
+    assert task.provider_override == "deepseek"
+    assert task.model_override == "deepseek-v4-pro"
 
 
 def test_default_model_review_gate_failure_does_not_create_model_fallback(tmp_path, monkeypatch):
@@ -211,7 +219,9 @@ def test_pinned_review_gate_failure_creates_configured_fallback(tmp_path, monkey
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "true")
     monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_PROVIDER", "review-provider")
     monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_MODEL", "review-primary")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_FALLBACK_PROVIDER", "fallback-provider")
     monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_FALLBACK_MODEL", "review-fallback")
 
     with kb.connect_closing() as conn:
@@ -226,6 +236,7 @@ def test_pinned_review_gate_failure_creates_configured_fallback(tmp_path, monkey
         assert len(children) == 1
         review = kb.get_task(conn, children[0])
         assert review is not None
+        assert review.provider_override == "review-provider"
         assert review.model_override == "review-primary"
 
         kb.complete_task(conn, impl_id, result="done")
@@ -245,6 +256,8 @@ def test_pinned_review_gate_failure_creates_configured_fallback(tmp_path, monkey
         fallback = next(kb.get_task(conn, cid) for cid in all_children if cid != review.id)
         assert fallback is not None
         assert fallback.created_by == "hopewell-dev-review-gate"
+        assert review.provider_override == "review-provider"
+        assert fallback.provider_override == "fallback-provider"
         assert fallback.model_override == "review-fallback"
         assert fallback.skills == ["github-code-review"]
         assert kb.parent_ids(conn, fallback.id) == [impl_id]

@@ -75,6 +75,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "completed_at": t.completed_at,
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
+        "provider_override": t.provider_override,
         "model_override": t.model_override,
         "reasoning_override": t.reasoning_override,
         "max_retries": t.max_retries,
@@ -335,6 +336,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). Appended to the built-in "
                                "kanban-worker skill. Example: "
                                "--skill translation --skill github-code-review")
+    p_create.add_argument("--provider", dest="provider_override", default=None,
+                          help="Per-task provider override passed to the dispatched worker as --provider <provider>.")
     p_create.add_argument("--model", dest="model_override", default=None,
                           help="Per-task model override passed to the dispatched worker as -m <model>.")
     p_create.add_argument("--reasoning", default=None, dest="reasoning_override",
@@ -1349,6 +1352,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
+            provider_override=getattr(args, "provider_override", None),
             model_override=getattr(args, "model_override", None),
             reasoning_override=getattr(args, "reasoning_override", None),
             max_retries=max_retries,
@@ -1526,6 +1530,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  branch:    {task.branch_name}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
+    if task.provider_override:
+        print(f"  provider:  {task.provider_override}")
     if task.model_override:
         print(f"  model:     {task.model_override}")
     if task.reasoning_override:

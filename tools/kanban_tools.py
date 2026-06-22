@@ -325,6 +325,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
+        "provider_override": task.provider_override,
         "model_override": task.model_override,
         "parents": parents,
         "children": children,
@@ -370,6 +371,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "completed_at": t.completed_at,
                     "result": t.result,
                     "current_run_id": t.current_run_id,
+                    "provider_override": t.provider_override,
                     "model_override": t.model_override,
                 }
 
@@ -770,6 +772,7 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"skills must be a list of skill names, got {type(skills).__name__}"
         )
+    provider_override = args.get("provider_override")
     model_override = args.get("model_override")
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
@@ -812,6 +815,9 @@ def _handle_create(args: dict, **kw) -> str:
                 ),
                 skills=skills,
                 reasoning_override=args.get("reasoning_override"),
+                provider_override=(
+                    str(provider_override).strip() if provider_override else None
+                ),
                 model_override=str(model_override).strip() if model_override else None,
                 goal_mode=goal_mode,
                 goal_max_turns=(
@@ -1415,6 +1421,15 @@ KANBAN_CREATE_SCHEMA = {
                     "Optional per-task reasoning effort override passed to "
                     "the dispatched worker. Omit to use the assignee "
                     "profile's configured agent.reasoning_effort."
+                ),
+            },
+            "provider_override": {
+                "type": "string",
+                "description": (
+                    "Optional per-task provider override for the dispatched "
+                    "worker. The dispatcher passes this as --provider "
+                    "<provider>; omit it to use the assignee profile's "
+                    "default provider."
                 ),
             },
             "model_override": {

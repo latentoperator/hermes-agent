@@ -795,6 +795,7 @@ class Task:
     # JSON array of skill names. None = use only the defaults; empty
     # list = explicitly no extra skills.
     skills: Optional[list] = None
+    provider_override: Optional[str] = None
     model_override: Optional[str] = None
     # Per-task reasoning effort override. When set, the dispatcher passes
     # ``--reasoning <level>`` to the worker CLI, overriding the profile's
@@ -889,6 +890,11 @@ class Task:
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
             skills=skills_value,
+            provider_override=(
+                row["provider_override"]
+                if "provider_override" in keys and row["provider_override"]
+                else None
+            ),
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             reasoning_override=(
                 row["reasoning_override"]
@@ -1043,6 +1049,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Appended to the dispatcher's built-in `--skills kanban-worker`.
     -- NULL or empty array = no extras.
     skills               TEXT,
+    -- Per-task provider override. When set, the dispatcher passes
+    -- --provider <provider> to the worker, overriding the profile's
+    -- default provider. NULL = use the profile default.
+    provider_override    TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
@@ -1759,6 +1769,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # they were getting before the column existed).
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
 
+    if "provider_override" not in cols:
+        _add_column_if_missing(conn, "tasks", "provider_override", "provider_override TEXT")
+
     if "model_override" not in cols:
         _add_column_if_missing(conn, "tasks", "model_override", "model_override TEXT")
 
@@ -2233,6 +2246,18 @@ def _review_gate_config() -> dict[str, Any]:
         else:
             skills = list(DEFAULT_REVIEW_GATE_SKILLS)
 
+    raw_provider = os.environ.get("HERMES_KANBAN_REVIEW_GATE_PROVIDER")
+    if raw_provider is None:
+        provider = _optional_model(gate.get("provider"))
+    else:
+        provider = _optional_model(raw_provider)
+
+    raw_fallback_provider = os.environ.get("HERMES_KANBAN_REVIEW_GATE_FALLBACK_PROVIDER")
+    if raw_fallback_provider is None:
+        fallback_provider = _optional_model(gate.get("fallback_provider"))
+    else:
+        fallback_provider = _optional_model(raw_fallback_provider)
+
     raw_model = os.environ.get("HERMES_KANBAN_REVIEW_GATE_MODEL")
     if raw_model is None:
         model = _optional_model(gate.get("model", DEFAULT_REVIEW_GATE_MODEL))
@@ -2254,7 +2279,9 @@ def _review_gate_config() -> dict[str, Any]:
             "HERMES_KANBAN_REVIEW_GATE_ASSIGNEE",
             str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
         ).strip() or DEFAULT_REVIEW_GATE_ASSIGNEE,
+        "provider": provider,
         "model": model,
+        "fallback_provider": fallback_provider,
         "fallback_model": fallback_model,
         "skills": skills or list(DEFAULT_REVIEW_GATE_SKILLS),
         "max_runtime_seconds": gate.get("max_runtime_seconds", 30 * 60),
@@ -2278,6 +2305,7 @@ def _should_create_review_gate(
     workspace_kind: str,
     workspace_path: Optional[str],
     skills: Optional[list[str]],
+    provider_override: Optional[str],
     model_override: Optional[str],
     triage: bool,
 ) -> tuple[bool, dict[str, Any]]:
@@ -2297,7 +2325,10 @@ def _should_create_review_gate(
     if skill_names.intersection(set(gate.get("skills") or DEFAULT_REVIEW_GATE_SKILLS)):
         return False, gate
     if gate.get("model") and model_override and str(model_override).strip() == gate.get("model"):
-        return False, gate
+        gate_provider = str(gate.get("provider") or "").strip()
+        task_provider = str(provider_override or "").strip()
+        if not gate_provider or task_provider == gate_provider:
+            return False, gate
     if not any(_path_is_under(workspace_path, root) for root in gate.get("roots", [])):
         return False, gate
     return True, gate
@@ -2307,6 +2338,7 @@ def _review_gate_body(
     parent_id: str,
     parent_title: str,
     fallback_model: Optional[str] = None,
+    fallback_provider: Optional[str] = None,
 ) -> str:
     body = (
         "Run the Hopewell dev code-review gate for the parent implementation card.\n\n"
@@ -2323,7 +2355,9 @@ def _review_gate_body(
     if fallback_model:
         body += (
             "\n\nIf the pinned review model fails due to model/provider/runtime failure, "
-            f"retry the same review via fallback model {fallback_model}."
+            f"retry the same review via fallback model {fallback_model}"
+            + (f" on provider {fallback_provider}" if fallback_provider else "")
+            + "."
         )
     return body
 
@@ -2345,6 +2379,7 @@ def create_task(
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
+    provider_override: Optional[str] = None,
     model_override: Optional[str] = None,
     reasoning_override: Optional[str] = None,
     max_retries: Optional[int] = None,
@@ -2379,6 +2414,11 @@ def create_task(
     (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
 
+    ``provider_override`` optionally pins the dispatched worker invocation
+    to a specific inference provider. The dispatcher passes it as
+    ``--provider <provider>``; ``None`` means use the assignee profile's
+    default provider.
+
     ``model_override`` optionally pins the dispatched worker invocation
     to a specific model. The dispatcher passes it as ``-m <model>``;
     ``None`` means use the assignee profile's default model.
@@ -2399,6 +2439,8 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if provider_override is not None:
+        provider_override = str(provider_override).strip() or None
     if model_override is not None:
         model_override = str(model_override).strip() or None
     if reasoning_override is not None:
@@ -2545,8 +2587,8 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, model_override, reasoning_override, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, provider_override, model_override, reasoning_override, max_retries, goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2564,6 +2606,7 @@ def create_task(
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
+                        provider_override,
                         model_override,
                         reasoning_override,
                         int(max_retries) if max_retries is not None else None,
@@ -2589,6 +2632,7 @@ def create_task(
                         "branch_name": branch_name,
                         "workspace_path": effective_workspace_path,
                         "skills": list(skills_list) if skills_list else None,
+                        "provider_override": provider_override,
                         "model_override": model_override,
                         "reasoning_override": reasoning_override,
                         "goal_mode": bool(goal_mode) or None,
@@ -2601,6 +2645,7 @@ def create_task(
                     workspace_kind=workspace_kind,
                     workspace_path=effective_workspace_path,
                     skills=skills_list,
+                    provider_override=provider_override,
                     model_override=model_override,
                     triage=triage,
                 )
@@ -2608,7 +2653,12 @@ def create_task(
                     create_task(
                         conn,
                         title=f"review: {title.strip()}",
-                        body=_review_gate_body(task_id, title, gate.get("fallback_model")),
+                        body=_review_gate_body(
+                            task_id,
+                            title,
+                            gate.get("fallback_model"),
+                            gate.get("fallback_provider"),
+                        ),
                         assignee=str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
                         created_by=REVIEW_GATE_CREATED_BY,
                         workspace_kind=workspace_kind,
@@ -2620,6 +2670,9 @@ def create_task(
                         idempotency_key=f"{REVIEW_GATE_CREATED_BY}:{task_id}",
                         max_runtime_seconds=int(gate.get("max_runtime_seconds") or 30 * 60),
                         skills=gate.get("skills") or list(DEFAULT_REVIEW_GATE_SKILLS),
+                        provider_override=(
+                            str(gate["provider"]).strip() if gate.get("provider") else None
+                        ),
                         model_override=str(gate["model"]).strip() if gate.get("model") else None,
                         max_retries=1,
                         board=board,
@@ -6116,11 +6169,12 @@ def _is_pinned_review_gate_card_with_fallback(conn: sqlite3.Connection, task_id:
     """
     gate = _review_gate_config()
     gate_model = gate.get("model")
+    gate_provider = gate.get("provider")
     fallback_model = gate.get("fallback_model")
     if not gate_model or not fallback_model:
         return False
     row = conn.execute(
-        "SELECT created_by, model_override, title FROM tasks WHERE id = ?",
+        "SELECT created_by, provider_override, model_override, title FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -6128,6 +6182,8 @@ def _is_pinned_review_gate_card_with_fallback(conn: sqlite3.Connection, task_id:
     if row["created_by"] != REVIEW_GATE_CREATED_BY:
         return False
     if (row["model_override"] or "").strip() != str(gate_model).strip():
+        return False
+    if gate_provider and (row["provider_override"] or "").strip() != str(gate_provider).strip():
         return False
     return (row["title"] or "").strip().lower().startswith("review:")
 
@@ -6141,6 +6197,7 @@ def _create_review_gate_fallback(conn: sqlite3.Connection, task_id: str) -> bool
     """
     gate = _review_gate_config()
     fallback_model = gate.get("fallback_model")
+    fallback_provider = gate.get("fallback_provider") or gate.get("provider")
     if not fallback_model:
         return False
     row = conn.execute(
@@ -6163,6 +6220,7 @@ def _create_review_gate_fallback(conn: sqlite3.Connection, task_id: str) -> bool
         parent_ids[0] if parent_ids else task_id,
         title,
         str(fallback_model),
+        str(fallback_provider).strip() if fallback_provider else None,
     )
 
     create_task(
@@ -6179,6 +6237,7 @@ def _create_review_gate_fallback(conn: sqlite3.Connection, task_id: str) -> bool
         idempotency_key=f"{REVIEW_GATE_CREATED_BY}:fallback:{task_id}",
         max_runtime_seconds=30 * 60,
         skills=gate.get("skills") or list(DEFAULT_REVIEW_GATE_SKILLS),
+        provider_override=str(fallback_provider).strip() if fallback_provider else None,
         model_override=str(fallback_model).strip(),
         max_retries=1,
         auto_review_gate=False,
@@ -7441,6 +7500,8 @@ def _default_spawn(
         for sk in task.skills:
             if sk and sk != "kanban-worker":
                 cmd.extend(["--skills", sk])
+    if task.provider_override:
+        cmd.extend(["--provider", task.provider_override])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     if task.reasoning_override:
