@@ -230,5 +230,10 @@ def test_default_spawn_passes_provider_and_model_overrides(monkeypatch, tmp_path
     pid = kb._default_spawn(task, str(workspace))
 
     assert pid == 4243
-    assert captured["cmd"][captured["cmd"].index("--provider") + 1] == "deepseek"
-    assert captured["cmd"][captured["cmd"].index("-m") + 1] == "deepseek-v4-pro"
+    chat_idx = captured["cmd"].index("chat")
+    provider_idx = captured["cmd"].index("--provider")
+    model_idx = captured["cmd"].index("-m")
+    assert provider_idx > chat_idx
+    assert model_idx > chat_idx
+    assert captured["cmd"][provider_idx + 1] == "deepseek"
+    assert captured["cmd"][model_idx + 1] == "deepseek-v4-pro"

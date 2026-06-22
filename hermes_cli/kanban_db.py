@@ -7500,17 +7500,24 @@ def _default_spawn(
         for sk in task.skills:
             if sk and sk != "kanban-worker":
                 cmd.extend(["--skills", sk])
+    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    cmd.append("chat")
+    # Per-task runtime overrides must be passed to the `chat` subcommand.
+    # The root parser also accepts -m/--provider/-t for a few entry points,
+    # but `hermes -p wren --provider deepseek -m deepseek-v4-pro chat ...`
+    # is normalized back to the profile default before chat initialization.
+    # Keeping worker overrides after `chat` exercises the same parser path as
+    # humans use (`hermes chat --provider ... -m ...`) and makes the override
+    # observable in agent logs.
     if task.provider_override:
         cmd.extend(["--provider", task.provider_override])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
     if task.reasoning_override:
         cmd.extend(["--reasoning", task.reasoning_override])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
-        "chat",
         "-q", prompt,
     ])
     # Redirect output to a per-task log under <board-root>/logs/.
