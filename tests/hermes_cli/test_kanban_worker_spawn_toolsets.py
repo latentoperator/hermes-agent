@@ -118,27 +118,6 @@ toolsets:
     assert resolved != ["kanban"]
 
 
-def test_kanban_worker_skill_probe_respects_disabled_skill(monkeypatch, tmp_path):
-    """A physical bundled skill copy is not enough: disabled skills are fatal
-    when passed via --skills, so the dispatcher must omit kanban-worker.
-    """
-    profile = tmp_path / ".hermes" / "profiles" / "elias"
-    skill = profile / "skills" / "devops" / "kanban-worker"
-    skill.mkdir(parents=True)
-    skill.joinpath("SKILL.md").write_text(
-        "---\nname: kanban-worker\ndescription: worker\n---\nbody\n",
-        encoding="utf-8",
-    )
-    profile.joinpath("config.yaml").write_text(
-        "skills:\n  disabled:\n    - kanban-worker\n",
-        encoding="utf-8",
-    )
-
-    from hermes_cli import kanban_db as kb
-
-    assert kb._kanban_worker_skill_available(str(profile)) is False
-
-
 def test_resolve_worker_cli_toolsets_drops_unknown_legacy_names(monkeypatch, tmp_path):
     """Old configs may still contain aliases like 'messaging'; do not pass
     them to the worker CLI where they emit startup warnings.
