@@ -76,6 +76,24 @@ def test_normalize_moa_config_tolerates_non_numeric_values():
     assert preset["aggregator_temperature"] == 0.4
 
 
+def test_normalize_moa_config_tolerates_non_list_reference_models():
+    """A hand-edited scalar reference_models must degrade to defaults instead of
+    crashing normalize_moa_config with TypeError (symmetric with the non-numeric
+    scalar-field tolerance)."""
+    cfg = normalize_moa_config(
+        {"presets": {"broken": {"reference_models": 2}}}
+    )
+    assert cfg["presets"]["broken"]["reference_models"] == DEFAULT_MOA_REFERENCE_MODELS
+
+
+def test_normalize_moa_config_wraps_bare_dict_reference_models():
+    """A single reference slot written without the list wrapper is rescued."""
+    cfg = normalize_moa_config(
+        {"presets": {"p": {"reference_models": {"provider": "openai", "model": "gpt-4o"}}}}
+    )
+    assert cfg["presets"]["p"]["reference_models"] == [{"provider": "openai", "model": "gpt-4o"}]
+
+
 def test_normalize_moa_config_coerces_numeric_strings():
     """Valid numeric strings (e.g. from YAML round-trip) must coerce correctly."""
     cfg = normalize_moa_config({"max_tokens": "8192", "reference_temperature": "0.9"})
@@ -100,6 +118,38 @@ def test_exact_preset_matching_is_not_fuzzy():
     assert exact_moa_preset_name(config, "coding") == "coding"
     assert exact_moa_preset_name(config, "cod") is None
     assert exact_moa_preset_name(config, "coding please fix this") is None
+
+
+def test_exact_preset_matching_skips_disabled_presets():
+    """A disabled preset must not match the implicit bare-name switch path.
+
+    Regression for #55187: with ``enabled: false`` presets, a plain model
+    switch whose name collides with a preset key (e.g. ``default``) silently
+    pivoted the session onto the MoA virtual provider. The per-preset
+    ``enabled`` opt-out must gate this implicit match.
+    """
+    config = {
+        "presets": {
+            "default": {"enabled": False},
+            "klo": {"enabled": False},
+        },
+    }
+    assert exact_moa_preset_name(config, "default") is None
+    assert exact_moa_preset_name(config, "klo") is None
+
+
+def test_exact_preset_matching_allows_enabled_presets():
+    """An explicitly enabled preset still matches the bare-name switch path."""
+    config = {
+        "presets": {
+            "fast": {"enabled": True},
+            "slow": {"enabled": False},
+        },
+    }
+    assert exact_moa_preset_name(config, "fast") == "fast"
+    assert exact_moa_preset_name(config, "slow") is None
+    # Default (no explicit enabled key) is enabled and still matches.
+    assert exact_moa_preset_name({"presets": {"x": {}}}, "x") == "x"
 
 
 def test_active_preset_toggle_validation():
