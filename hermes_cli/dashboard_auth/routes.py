@@ -615,7 +615,8 @@ async def api_auth_ws_ticket(request: Request):
     expected pattern.
     """
     sess = getattr(request.state, "session", None)
-    if sess is None:
+    principal = getattr(request.state, "token_principal", None)
+    if sess is None and principal is None:
         # Middleware should already have rejected, but check defensively.
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -623,11 +624,14 @@ async def api_auth_ws_ticket(request: Request):
     # don't load the ticket store.
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    user_id = sess.user_id if sess is not None else principal.principal
+    provider = sess.provider if sess is not None else principal.provider
+
+    ticket = mint_ticket(user_id=user_id, provider=provider)
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
-        provider=sess.provider,
-        user_id=sess.user_id,
+        provider=provider,
+        user_id=user_id,
         ip=_client_ip(request),
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}

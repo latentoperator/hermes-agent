@@ -59,6 +59,42 @@ def test_loopback_protected_route_accepts_session_token(client_loopback):
     )
 
 
+def test_gated_route_rejects_session_token_unless_remote_bridge_enabled(
+    client_loopback, monkeypatch
+):
+    """Public/gated dashboards stay cookie-auth only unless explicitly enabled."""
+    prev_auth = getattr(web_server.app.state, "auth_required", None)
+    web_server.app.state.auth_required = True
+    monkeypatch.delenv("HERMES_DASHBOARD_ALLOW_REMOTE_SESSION_TOKEN", raising=False)
+    try:
+        r = client_loopback.get(
+            "/api/profiles/active",
+            headers={"X-Hermes-Session-Token": web_server._SESSION_TOKEN},
+        )
+    finally:
+        web_server.app.state.auth_required = prev_auth
+    assert r.status_code == 401
+    assert r.json().get("reason") == "no_cookie"
+
+
+def test_gated_route_accepts_session_token_when_remote_bridge_enabled(
+    client_loopback, monkeypatch
+):
+    """Native Desktop can authenticate remote profile dashboards by token."""
+    prev_auth = getattr(web_server.app.state, "auth_required", None)
+    web_server.app.state.auth_required = True
+    monkeypatch.setenv("HERMES_DASHBOARD_ALLOW_REMOTE_SESSION_TOKEN", "1")
+    try:
+        r = client_loopback.get(
+            "/api/profiles/active",
+            headers={"X-Hermes-Session-Token": web_server._SESSION_TOKEN},
+        )
+    finally:
+        web_server.app.state.auth_required = prev_auth
+    assert r.status_code == 200
+    assert {"active", "current"} <= set(r.json())
+
+
 def test_loopback_index_injects_session_token(client_loopback):
     """Loopback mode keeps injecting the SPA token into index.html.
 

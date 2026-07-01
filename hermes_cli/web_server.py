@@ -327,6 +327,22 @@ def _has_valid_session_token(request: Request) -> bool:
     return hmac.compare_digest(auth.encode(), expected.encode())
 
 
+def _remote_session_token_auth_enabled() -> bool:
+    """Whether non-loopback dashboards accept the legacy Desktop token header.
+
+    Upstream gated mode intentionally uses cookies + WS tickets for browser
+    traffic. Hopebox remote profile dashboards also need native Desktop clients
+    that carry the install-scoped ``HERMES_DASHBOARD_SESSION_TOKEN`` instead of
+    a browser cookie. Keep that compatibility path explicitly operator-enabled.
+    """
+    return os.environ.get("HERMES_DASHBOARD_ALLOW_REMOTE_SESSION_TOKEN", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 # Routes that may also authenticate via a ``?token=`` query param, for download
 # links opened by the OS shell or a new browser tab where the session header
 # can't be set. Kept narrow — same query-token tradeoff as the /api/pty WS.
@@ -360,6 +376,8 @@ def _require_token(request: Request) -> None:
       endpoints permanently unreachable behind the gate. Defer to the gate.
     """
     if getattr(request.app.state, "auth_required", False):
+        if getattr(request.state, "token_authenticated", False):
+            return
         # Gate is authoritative. It attaches ``request.state.session`` on
         # success and 401s otherwise, so a request that reached us is already
         # authenticated. Belt-and-braces: confirm the session is present.
@@ -527,6 +545,34 @@ async def _token_auth_seam(request: Request, call_next):
     """
     from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
     return await token_auth_middleware(request, call_next)
+
+
+@app.middleware("http")
+async def _remote_session_token_auth_bridge(request: Request, call_next):
+    """Let native Desktop clients use the dashboard session token remotely.
+
+    Starlette runs the last registered middleware first, so this bridge marks
+    valid token-bearing API requests before the gated cookie middleware checks
+    them. Browser traffic still uses the gated session-cookie path, and public
+    non-loopback dashboards stay cookie/OAuth-only unless the operator enables
+    ``HERMES_DASHBOARD_ALLOW_REMOTE_SESSION_TOKEN``.
+    """
+    path = request.url.path
+    if (
+        getattr(request.app.state, "auth_required", False)
+        and path.startswith("/api/")
+        and _remote_session_token_auth_enabled()
+        and _has_valid_session_token(request)
+    ):
+        from hermes_cli.dashboard_auth.base import TokenPrincipal
+
+        request.state.token_authenticated = True
+        request.state.token_principal = TokenPrincipal(
+            principal="desktop-session-token",
+            provider="dashboard-session-token",
+            scopes=("dashboard",),
+        )
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------

@@ -121,6 +121,19 @@ class TestWsTicketEndpoint:
         assert len(body["ticket"]) >= 32
         assert body["ttl_seconds"] == 30
 
+    def test_remote_desktop_session_token_can_mint(self, gated_app, monkeypatch):
+        monkeypatch.setenv("HERMES_DASHBOARD_ALLOW_REMOTE_SESSION_TOKEN", "1")
+        r = gated_app.post(
+            "/api/auth/ws-ticket",
+            headers={
+                web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN,
+            },
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert isinstance(body["ticket"], str)
+        assert body["ttl_seconds"] == 30
+
     def test_unauthenticated_returns_401_or_redirect(self, gated_app):
         r = gated_app.post("/api/auth/ws-ticket", follow_redirects=False)
         # gated_auth_middleware short-circuits before the route — it
