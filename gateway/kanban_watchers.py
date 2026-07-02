@@ -18,6 +18,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from agent.i18n import t
+
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
@@ -261,12 +263,35 @@ class GatewayKanbanWatchersMixin:
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
-                                owner_profile = sub.get("notifier_profile") or None
+                                task = _kb.get_task(conn, sub["task_id"])
+                                assignee_profile = (
+                                    task.assignee if task and task.assignee else ""
+                                )
+                                assignee_is_profile = False
+                                if assignee_profile:
+                                    try:
+                                        from hermes_cli.profiles import profile_exists
+
+                                        assignee_is_profile = profile_exists(assignee_profile)
+                                    except Exception:
+                                        assignee_is_profile = False
+                                # Terminal task notifications and synthetic wake
+                                # turns belong to the profile assigned to the
+                                # card when the assignee is a real Hermes
+                                # profile. For generic worker labels, older
+                                # tests, or manual rows, fall back to the stored
+                                # notifier_profile so lifecycle pings are not
+                                # stranded behind a non-existent gateway.
+                                owner_profile = (
+                                    assignee_profile
+                                    if assignee_is_profile
+                                    else (sub.get("notifier_profile") or None)
+                                )
                                 if owner_profile and owner_profile != notifier_profile:
                                     _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
                                     if not _owner_adapters:
                                         logger.debug(
-                                            "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
+                                            "kanban notifier: subscription for %s owned by assignee/notifier profile %s; current profile %s has no adapter for it, skipping",
                                             sub.get("task_id"), owner_profile, notifier_profile,
                                         )
                                         continue
@@ -287,7 +312,6 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 if not events:
                                     continue
-                                task = _kb.get_task(conn, sub["task_id"])
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                     len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -299,6 +323,7 @@ class GatewayKanbanWatchersMixin:
                                     "events": events,
                                     "task": task,
                                     "board": slug,
+                                    "delivery_profile": owner_profile or "",
                                 })
                         finally:
                             conn.close()
@@ -319,7 +344,7 @@ class GatewayKanbanWatchersMixin:
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
                         continue
-                    sub_profile = sub.get("notifier_profile") or ""
+                    sub_profile = d.get("delivery_profile") or sub.get("notifier_profile") or ""
                     # Route via the SAME chokepoint the authorization path uses
                     # (gateway/authz_mixin.py::_authorization_adapter): a stamped
                     # profile with its own adapter-registry entry must be served
@@ -506,20 +531,84 @@ class GatewayKanbanWatchersMixin:
                         # same state. See the longer comment on NOTIFY_KINDS
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
-                        # Do not wake the originating agent session here.
-                        # The notifier's job is to send the lightweight Kanban
-                        # lifecycle ping above and advance/unsubscribe the
-                        # subscription.  Synthetic ``handle_message`` injection
-                        # made worker profiles such as Portia/Dante answer in
-                        # the user's origin thread when a card completed,
-                        # producing noisy "I checked it" replies from the
-                        # worker bot rather than a single board notification.
-                        #
-                        # Agent awareness is still durable: dispatch-group
-                        # notices are written by kanban_db and injected into
-                        # the profile's next real user turn by
-                        # agent.conversation_loop.  That preserves context
-                        # without causing autonomous cross-profile chatter.
+                        _WAKE_KINDS = {
+                            "completed",
+                            "gave_up",
+                            "crashed",
+                            "timed_out",
+                            "blocked",
+                        }
+                        _wake_kinds = {
+                            ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS
+                        }
+                        if _wake_kinds:
+                            try:
+                                _session_key = getattr(task, "session_id", None) or ""
+                                if _session_key:
+                                    _title = (task.title if task else sub["task_id"])[:120]
+                                    _assignee = task.assignee if task else ""
+                                    _parts = []
+                                    if "completed" in _wake_kinds:
+                                        _parts.append(t("gateway.kanban.wake.completed"))
+                                    if "gave_up" in _wake_kinds:
+                                        _parts.append(t("gateway.kanban.wake.gave_up"))
+                                    if "crashed" in _wake_kinds:
+                                        _parts.append(t("gateway.kanban.wake.crashed"))
+                                    if "timed_out" in _wake_kinds:
+                                        _parts.append(t("gateway.kanban.wake.timed_out"))
+                                    if "blocked" in _wake_kinds:
+                                        _parts.append(t("gateway.kanban.wake.blocked"))
+                                    _status = (
+                                        t("gateway.kanban.wake.status_joiner").join(_parts)
+                                        or t("gateway.kanban.wake.status_default")
+                                    )
+                                    _synth = t(
+                                        "gateway.kanban.wake.message",
+                                        task_id=sub["task_id"],
+                                        status=_status,
+                                        title=_title,
+                                        assignee=_assignee,
+                                        board=board_slug,
+                                    )
+                                    from gateway.platforms.base import MessageEvent, MessageType
+                                    from gateway.session import SessionSource
+
+                                    # Wake the assignee profile only. The origin
+                                    # subscription stores where to deliver the
+                                    # message; the task owns who should speak.
+                                    _source = SessionSource(
+                                        platform=plat,
+                                        chat_id=sub["chat_id"],
+                                        chat_type="group",
+                                        thread_id=sub.get("thread_id") or None,
+                                        user_id=sub.get("user_id"),
+                                        profile=sub_profile or None,
+                                    )
+                                    _synth_event = MessageEvent(
+                                        text=_synth,
+                                        message_type=MessageType.TEXT,
+                                        source=_source,
+                                        internal=True,
+                                    )
+                                    await adapter.handle_message(_synth_event)
+                                    logger.info(
+                                        "kanban notifier: woke assignee agent for %s on %s/%s profile=%s events=%s",
+                                        sub["task_id"],
+                                        platform_str,
+                                        sub["chat_id"],
+                                        sub_profile or "default",
+                                        _wake_kinds,
+                                    )
+                            except Exception as _wk_err:
+                                # Best-effort: the notification itself already
+                                # delivered and the cursor has advanced, so a
+                                # broken wake path must not wedge the tick.
+                                logger.warning(
+                                    "kanban notifier: assignee wakeup injection failed for %s: %s",
+                                    sub["task_id"],
+                                    _wk_err,
+                                    exc_info=True,
+                                )
                         if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,

@@ -39,11 +39,13 @@ async def _run_one_notifier_tick(monkeypatch, runner):
     await runner._kanban_notifier_watcher(interval=1)
 
 
-def _make_runner(adapter):
+def _make_runner(adapter, profile="worker"):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
     runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = profile
     return runner
 
 
@@ -58,7 +60,7 @@ def _create_completed_subscription(summary="done once"):
         conn.close()
 
 
-def _unseen_terminal_events(tid):
+def _unseen_terminal_events(tid, thread_id=""):
     conn = kb.connect()
     try:
         _, events = kb.unseen_events_for_sub(
@@ -66,6 +68,7 @@ def _unseen_terminal_events(tid):
             task_id=tid,
             platform="telegram",
             chat_id="chat-1",
+            thread_id=thread_id,
             kinds=["completed", "blocked", "gave_up", "crashed", "timed_out"],
         )
         return events
@@ -90,7 +93,7 @@ def test_kanban_notifier_sends_started_ping_on_spawned_event(tmp_path, monkeypat
         conn.close()
 
     adapter = RecordingAdapter()
-    runner = _make_runner(adapter)
+    runner = _make_runner(adapter, profile="wren")
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
@@ -121,24 +124,25 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert tid in adapter.sent[0]["text"]
 
 
-def test_kanban_notifier_does_not_wake_origin_agent_on_completion(tmp_path, monkeypatch):
-    """Kanban completion pings must not synthesize an inbound agent turn.
+def test_kanban_notifier_wakes_assignee_not_origin_profile(tmp_path, monkeypatch):
+    """Terminal events are claimed by the task assignee's gateway/profile.
 
-    The notification row may carry a session_id so the originating profile can
-    receive durable dispatch notices on its *next real user turn*. The gateway
-    notifier itself should only send the lightweight board ping; calling the
-    adapter's handle_message here makes worker bots announce completions inside
-    the user's origin thread.
+    The subscription records where the notification should be delivered and may
+    have been created by a different origin profile. The synthetic internal
+    follow-up should run as the card assignee, not as that origin profile.
     """
-    db_path = tmp_path / "no-wake-on-complete.db"
+    db_path = tmp_path / "wake-assignee.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     kb.init_db()
+    from hermes_cli import profiles as profiles_mod
+
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda name: name == "portia")
 
     conn = kb.connect()
     try:
         tid = kb.create_task(
             conn,
-            title="do not wake origin agent",
+            title="wake the assigned agent",
             assignee="portia",
             session_id="origin-session-1",
         )
@@ -149,21 +153,38 @@ def test_kanban_notifier_does_not_wake_origin_agent_on_completion(tmp_path, monk
             chat_id="chat-1",
             thread_id="thread-1",
             user_id="user-1",
-            notifier_profile="portia",
+            notifier_profile="dante",
         )
-        kb.complete_task(conn, tid, summary="done without agent chatter")
+        kb.complete_task(conn, tid, summary="done with assigned-agent wake")
     finally:
         conn.close()
 
-    adapter = RecordingAdapter()
-    runner = _make_runner(adapter)
-    runner._kanban_notifier_profile = "portia"
+    origin_adapter = RecordingAdapter()
+    asyncio.run(
+        _run_one_notifier_tick(
+            monkeypatch,
+            _make_runner(origin_adapter, profile="dante"),
+        )
+    )
+    assert origin_adapter.sent == []
+    assert origin_adapter.handled == []
+    assert [ev.kind for ev in _unseen_terminal_events(tid, thread_id="thread-1")] == ["completed"]
 
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assignee_adapter = RecordingAdapter()
+    asyncio.run(
+        _run_one_notifier_tick(
+            monkeypatch,
+            _make_runner(assignee_adapter, profile="portia"),
+        )
+    )
 
-    assert len(adapter.sent) == 1
-    assert "done" in adapter.sent[0]["text"].lower()
-    assert adapter.handled == []
+    assert len(assignee_adapter.sent) == 1
+    assert "done" in assignee_adapter.sent[0]["text"].lower()
+    assert len(assignee_adapter.handled) == 1
+    wake_event = assignee_adapter.handled[0]
+    assert wake_event.internal is True
+    assert wake_event.source.profile == "portia"
+    assert tid in wake_event.text
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
@@ -192,7 +213,9 @@ def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypa
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = DisconnectedAdapters({Platform.TELEGRAM: RecordingAdapter()})
+    runner._profile_adapters = {}
     runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "worker"
 
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
