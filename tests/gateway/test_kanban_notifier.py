@@ -10,9 +10,13 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.handled = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def handle_message(self, event):
+        self.handled.append(event)
 
 
 class DisconnectedAdapters(dict):
@@ -115,6 +119,51 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     assert len(adapter.sent) == 1
     assert "Kanban" in adapter.sent[0]["text"]
     assert tid in adapter.sent[0]["text"]
+
+
+def test_kanban_notifier_does_not_wake_origin_agent_on_completion(tmp_path, monkeypatch):
+    """Kanban completion pings must not synthesize an inbound agent turn.
+
+    The notification row may carry a session_id so the originating profile can
+    receive durable dispatch notices on its *next real user turn*. The gateway
+    notifier itself should only send the lightweight board ping; calling the
+    adapter's handle_message here makes worker bots announce completions inside
+    the user's origin thread.
+    """
+    db_path = tmp_path / "no-wake-on-complete.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="do not wake origin agent",
+            assignee="portia",
+            session_id="origin-session-1",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="thread-1",
+            user_id="user-1",
+            notifier_profile="portia",
+        )
+        kb.complete_task(conn, tid, summary="done without agent chatter")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "portia"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "done" in adapter.sent[0]["text"].lower()
+    assert adapter.handled == []
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

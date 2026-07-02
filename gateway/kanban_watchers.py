@@ -18,8 +18,6 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from agent.i18n import t
-
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
@@ -508,78 +506,20 @@ class GatewayKanbanWatchersMixin:
                         # same state. See the longer comment on NOTIFY_KINDS
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                        if _wake_kinds:
-                            try:
-                                _session_key = getattr(task, "session_id", None) or ""
-                                if _session_key:
-                                    _title = (task.title if task else sub["task_id"])[:120]
-                                    _assignee = task.assignee if task else ""
-                                    _parts = []
-                                    if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
-                                    if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
-                                    if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
-                                    if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
-                                    if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
-                                    _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
-                                    _synth = t(
-                                        "gateway.kanban.wake.message",
-                                        task_id=sub["task_id"],
-                                        status=_status,
-                                        title=_title,
-                                        assignee=_assignee,
-                                        board=board_slug,
-                                    )
-                                    from gateway.session import SessionSource
-                                    from gateway.platforms.base import MessageEvent, MessageType
-                                    # KNOWN LIMITATION (tracked follow-up): the
-                                    # subscription row does not persist the
-                                    # creator's chat_type, and it is not carried
-                                    # on the session-context bridge, so we cannot
-                                    # faithfully reconstruct the creator's real
-                                    # session key here. build_session_key() keys
-                                    # DMs (":dm:<chat_id>") on a wholly different
-                                    # shape from group/thread, so any hardcoded
-                                    # value mis-routes some creators. "group" is
-                                    # the least-surprising default for the
-                                    # dashboard/group flows this wake primarily
-                                    # serves; DM-originated creators are handled
-                                    # by the follow-up that stamps + persists
-                                    # chat_type end-to-end. handle_message()
-                                    # get_or_create_session's the target, so a
-                                    # mismatch degrades to "wake lands in a fresh
-                                    # group session" — never an exception.
-                                    _source = SessionSource(
-                                        platform=plat,
-                                        chat_id=sub["chat_id"],
-                                        chat_type="group",
-                                        thread_id=sub.get("thread_id") or None,
-                                        user_id=sub.get("user_id"),
-                                        profile=sub_profile or None,
-                                    )
-                                    _synth_event = MessageEvent(
-                                        text=_synth,
-                                        message_type=MessageType.TEXT,
-                                        source=_source,
-                                        internal=True,
-                                    )
-                                    await adapter.handle_message(_synth_event)
-                                    logger.info(
-                                        "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                                        sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
-                                    )
-                            except Exception as _wk_err:
-                                # Best-effort: the notification itself already
-                                # delivered and the cursor has advanced, so a
-                                # broken wake path must not wedge the tick — but
-                                # log at WARNING with a traceback rather than
-                                # DEBUG so a persistently-failing wake is visible
-                                # in normal logs instead of silently no-op'ing.
-                                logger.warning(
-                                    "kanban notifier: wakeup injection failed for %s: %s",
-                                    sub["task_id"], _wk_err, exc_info=True,
-                                )
+                        # Do not wake the originating agent session here.
+                        # The notifier's job is to send the lightweight Kanban
+                        # lifecycle ping above and advance/unsubscribe the
+                        # subscription.  Synthetic ``handle_message`` injection
+                        # made worker profiles such as Portia/Dante answer in
+                        # the user's origin thread when a card completed,
+                        # producing noisy "I checked it" replies from the
+                        # worker bot rather than a single board notification.
+                        #
+                        # Agent awareness is still durable: dispatch-group
+                        # notices are written by kanban_db and injected into
+                        # the profile's next real user turn by
+                        # agent.conversation_loop.  That preserves context
+                        # without causing autonomous cross-profile chatter.
                         if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
