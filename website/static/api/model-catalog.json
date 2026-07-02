@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-06-18T05:18:56Z",
+  "updated_at": "2026-07-01T20:08:52Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -13,11 +13,7 @@
       },
       "models": [
         {
-          "id": "moonshotai/kimi-k2.7-code",
-          "description": ""
-        },
-        {
-          "id": "z-ai/glm-5.2",
+          "id": "anthropic/claude-fable-5",
           "description": ""
         },
         {
@@ -29,7 +25,7 @@
           "description": "2x price, higher output speed"
         },
         {
-          "id": "anthropic/claude-sonnet-4.6",
+          "id": "anthropic/claude-sonnet-5",
           "description": ""
         },
         {
@@ -89,6 +85,10 @@
           "description": "recommended"
         },
         {
+          "id": "moonshotai/kimi-k2.7-code",
+          "description": ""
+        },
+        {
           "id": "minimax/minimax-m3",
           "description": ""
         },
@@ -114,6 +114,10 @@
         },
         {
           "id": "nvidia/nemotron-3-super-120b-a12b",
+          "description": ""
+        },
+        {
+          "id": "sakana/fugu-ultra",
           "description": ""
         },
         {
@@ -157,10 +161,13 @@
       },
       "models": [
         {
+          "id": "anthropic/claude-fable-5"
+        },
+        {
           "id": "anthropic/claude-opus-4.8"
         },
         {
-          "id": "anthropic/claude-sonnet-4.6"
+          "id": "anthropic/claude-sonnet-5"
         },
         {
           "id": "anthropic/claude-haiku-4.5"
@@ -227,6 +234,9 @@
         },
         {
           "id": "nvidia/nemotron-3-super-120b-a12b"
+        },
+        {
+          "id": "sakana/fugu-ultra"
         }
       ]
     }
