@@ -130,7 +130,9 @@ def _clean_lines(text: str) -> list[str]:
     return [line.strip() for line in str(text or "").splitlines() if line.strip()]
 
 
-def validate_card(question: str, context: str, default_action: str, fire_at: str, requested_by: str) -> None:
+def validate_card(
+    question: str, context: str, default_action: str, fire_at: str, requested_by: str
+) -> None:
     q = str(question or "").strip()
     if not q:
         raise DecisionCardError("question is required")
@@ -197,7 +199,11 @@ def create_card(
     try:
         card_id = "dc_" + secrets.token_hex(8)
         now = _now()
-        payload = action_payload if isinstance(action_payload, str) else json.dumps(action_payload, sort_keys=True)
+        payload = (
+            action_payload
+            if isinstance(action_payload, str)
+            else json.dumps(action_payload, sort_keys=True)
+        )
         conn.execute(
             """
             INSERT INTO decision_cards(
@@ -227,7 +233,10 @@ def create_card(
             card_id,
             "created",
             actor=requested_by.strip(),
-            details={"source_ref": source_ref.strip(), "originating_profile": originating_profile.strip()},
+            details={
+                "source_ref": source_ref.strip(),
+                "originating_profile": originating_profile.strip(),
+            },
         )
         conn.commit()
         return get_card(card_id, conn=conn)
@@ -236,12 +245,16 @@ def create_card(
             conn.close()
 
 
-def get_card(card_id: str, *, conn: Optional[sqlite3.Connection] = None) -> DecisionCard:
+def get_card(
+    card_id: str, *, conn: Optional[sqlite3.Connection] = None
+) -> DecisionCard:
     owns_conn = conn is None
     if conn is None:
         conn = connect()
     try:
-        row = conn.execute("SELECT * FROM decision_cards WHERE id = ?", (card_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM decision_cards WHERE id = ?", (card_id,)
+        ).fetchone()
         if row is None:
             raise DecisionCardError(f"decision card not found: {card_id}")
         return _row_to_card(row)
@@ -250,7 +263,12 @@ def get_card(card_id: str, *, conn: Optional[sqlite3.Connection] = None) -> Deci
             conn.close()
 
 
-def list_cards(statuses: Optional[Iterable[str]] = None, *, limit: int = 50, conn: Optional[sqlite3.Connection] = None) -> list[DecisionCard]:
+def list_cards(
+    statuses: Optional[Iterable[str]] = None,
+    *,
+    limit: int = 50,
+    conn: Optional[sqlite3.Connection] = None,
+) -> list[DecisionCard]:
     owns_conn = conn is None
     if conn is None:
         conn = connect()
@@ -293,14 +311,26 @@ def record_delivery(
                    message_id = ?, updated_at = ?
              WHERE id = ?
             """,
-            (platform, str(chat_id or ""), str(thread_id or ""), str(message_id or ""), _now(), card_id),
+            (
+                platform,
+                str(chat_id or ""),
+                str(thread_id or ""),
+                str(message_id or ""),
+                _now(),
+                card_id,
+            ),
         )
         record_event(
             conn,
             card_id,
             "delivered",
             actor="system",
-            details={"platform": platform, "chat_id": str(chat_id or ""), "thread_id": str(thread_id or ""), "message_id": str(message_id or "")},
+            details={
+                "platform": platform,
+                "chat_id": str(chat_id or ""),
+                "thread_id": str(thread_id or ""),
+                "message_id": str(message_id or ""),
+            },
         )
         conn.commit()
         return get_card(card_id, conn=conn)
@@ -354,14 +384,19 @@ def handle_action(
     if conn is None:
         conn = connect()
     try:
-        row = conn.execute("SELECT * FROM decision_cards WHERE id = ?", (card_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM decision_cards WHERE id = ?", (card_id,)
+        ).fetchone()
         if row is None:
             raise DecisionCardError(f"decision card not found: {card_id}")
         card = _row_to_card(row)
         display_actor = actor or actor_id or "user"
 
         if card.status not in ACTIVE_STATUSES:
-            return card, f"This decision is already closed as `{card.answer or card.status}`. No new action was taken."
+            return (
+                card,
+                f"This decision is already closed as `{card.answer or card.status}`. No new action was taken.",
+            )
 
         now = _now()
         if action == "yes":
@@ -372,7 +407,9 @@ def handle_action(
             )
         elif action == "no":
             status = "answered_no"
-            receipt = "No recorded. The asking agent will stand down and log the decision."
+            receipt = (
+                "No recorded. The asking agent will stand down and log the decision."
+            )
         elif action == "wait":
             status = "waiting"
             receipt = "Wait recorded. This card is snoozed and should resurface in the next morning brief."
@@ -389,14 +426,30 @@ def handle_action(
                    target_thread_id = COALESCE(NULLIF(?, ''), target_thread_id)
              WHERE id = ?
             """,
-            (status, now, now, display_actor, action, receipt, message_id, channel_id, thread_id, card_id),
+            (
+                status,
+                now,
+                now,
+                display_actor,
+                action,
+                receipt,
+                message_id,
+                channel_id,
+                thread_id,
+                card_id,
+            ),
         )
         record_event(
             conn,
             card_id,
             f"button_{action}",
             actor=display_actor,
-            details={"actor_id": actor_id, "message_id": message_id, "channel_id": channel_id, "thread_id": thread_id},
+            details={
+                "actor_id": actor_id,
+                "message_id": message_id,
+                "channel_id": channel_id,
+                "thread_id": thread_id,
+            },
         )
         conn.commit()
         return get_card(card_id, conn=conn), receipt
