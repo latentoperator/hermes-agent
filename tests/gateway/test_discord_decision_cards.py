@@ -104,7 +104,8 @@ async def test_info_button_posts_plain_explanation_without_disabling(queue_db):
     assert updated.status == "info_requested"
     assert not any(getattr(child, "disabled") for child in view.children)
     interaction.response.send_message.assert_awaited_once_with(
-        "This is the plain explanation.", ephemeral=False,
+        "This is the plain explanation.",
+        ephemeral=False,
     )
 
 
