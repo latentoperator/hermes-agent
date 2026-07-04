@@ -1,0 +1,120 @@
+import textwrap
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import PlatformConfig
+from gateway.outbound_discord_allowlist import check_discord_outbound_allowed
+
+
+def _write_allowlist(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        textwrap.dedent(
+            """
+            gateway:
+              outbound_discord_allowlist:
+                enabled: true
+                disabled_profiles:
+                  - rocket
+                profiles:
+                  wren:
+                    channels: ['111']
+                    threads: ['222']
+                  dante:
+                    channels: ['333']
+                    threads: []
+                shared_threads:
+                  decisions:
+                    chat_id: '999'
+                    thread_id: '444'
+                    allowed_profiles: ['dante']
+            """
+        ),
+        encoding="utf-8",
+    )
+    return cfg
+
+
+def test_check_allows_profile_channel_and_thread(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+    monkeypatch.setenv("HERMES_PROFILE", "wren")
+
+    assert check_discord_outbound_allowed("111").allowed is True
+    assert check_discord_outbound_allowed("111", thread_id="222").allowed is True
+
+
+def test_check_denies_unlisted_thread_even_when_parent_channel_allowed(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+    monkeypatch.setenv("HERMES_PROFILE", "wren")
+
+    decision = check_discord_outbound_allowed("111", thread_id="555")
+
+    assert decision.allowed is False
+    assert decision.reason == "thread not allowlisted"
+
+
+def test_shared_thread_is_limited_to_configured_profiles(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+
+    assert check_discord_outbound_allowed("999", thread_id="444", profile="dante").allowed is True
+    assert check_discord_outbound_allowed("999", thread_id="444", profile="wren").allowed is False
+
+
+def test_disabled_profile_is_exempt(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+
+    decision = check_discord_outbound_allowed("anything", thread_id="anywhere", profile="rocket")
+
+    assert decision.allowed is True
+    assert decision.reason == "profile exempt from allowlist"
+
+
+@pytest.mark.asyncio
+async def test_discord_adapter_returns_failed_send_on_allowlist_denial(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+    monkeypatch.setenv("HERMES_PROFILE", "wren")
+
+    # Import after env is set; the adapter module can be imported with a mocked
+    # discord package in this test environment.
+    import sys
+    from types import ModuleType
+
+    if "discord" not in sys.modules:
+        discord_mod = MagicMock()
+        discord_mod.Intents.default.return_value = MagicMock()
+        discord_mod.DMChannel = type("DMChannel", (), {})
+        discord_mod.Thread = type("Thread", (), {})
+        discord_mod.ForumChannel = type("ForumChannel", (), {})
+        discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
+        discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, secondary=2, danger=3, green=1, grey=2, blurple=2, red=3)
+        discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4, purple=lambda: 5)
+        discord_mod.Interaction = object
+        discord_mod.Embed = MagicMock
+        discord_mod.app_commands = SimpleNamespace(describe=lambda **kwargs: (lambda fn: fn), choices=lambda **kwargs: (lambda fn: fn), Choice=lambda **kwargs: SimpleNamespace(**kwargs))
+        commands_mod = MagicMock()
+        commands_mod.Bot = MagicMock
+        ext_mod = ModuleType("discord.ext")
+        setattr(ext_mod, "commands", commands_mod)
+        sys.modules["discord"] = discord_mod
+        sys.modules["discord.ext"] = ext_mod
+        sys.modules["discord.ext.commands"] = commands_mod
+
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    channel = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(id=1234)))
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(get_channel=lambda _id: channel, fetch_channel=AsyncMock())
+
+    result = await adapter.send("111", "blocked", metadata={"thread_id": "555"})
+
+    assert result.success is False
+    assert result.error_kind == "forbidden"
+    assert "Outbound Discord post denied" in (result.error or "")
+    assert channel.send.await_count == 0
