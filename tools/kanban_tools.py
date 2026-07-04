@@ -945,11 +945,14 @@ def _handle_create(args: dict, **kw) -> str:
             )
             new_task = kb.get_task(conn, new_tid)
             # ── Dispatch-group tracking ──
-            # When an agent session creates Kanban tasks, auto-enroll them
-            # in a dispatch group so the origin profile gets notified when
-            # the dispatched work drains.
+            # When an interactive agent session creates Kanban tasks, auto-enroll
+            # them in a dispatch group so the origin profile gets notified when
+            # the dispatched work drains.  Do NOT enroll tasks created by a
+            # dispatcher-spawned Kanban worker: that worker is itself a scoped
+            # child run, and a follow-up drain notice would later wake/pollute the
+            # parent worker's profile/session with the child card's lane content.
             origin_profile = os.environ.get("HERMES_PROFILE")
-            if origin_profile:
+            if origin_profile and not os.environ.get("HERMES_KANBAN_TASK"):
                 try:
                     dg_id = kb.get_or_create_dispatch_group(
                         conn,

@@ -503,13 +503,13 @@ def test_build_dispatch_notices_context_multiple():
 # Tool integration: kanban_create auto-enrollment
 # ---------------------------------------------------------------------------
 
-def test_kanban_create_auto_enrolls_in_dispatch_group(monkeypatch, tmp_path):
-    """When HERMES_PROFILE is set, kanban_create auto-enrolls the task
-    in a dispatch group for that profile+session."""
+def test_kanban_create_auto_enrolls_interactive_session_in_dispatch_group(monkeypatch, tmp_path):
+    """Interactive agent kanban_create auto-enrolls the task in a dispatch group
+    for that profile+session."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake_parent")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_PROFILE", "wren")
     monkeypatch.setenv("HERMES_SESSION_ID", "acp-sess-test")
     from pathlib import Path as _Path
@@ -518,20 +518,11 @@ def test_kanban_create_auto_enrolls_in_dispatch_group(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
-    try:
-        parent_tid = kb.create_task(
-            conn, title="parent", assignee="wren",
-        )
-        kb.claim_task(conn, parent_tid)
-    finally:
-        conn.close()
 
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "auto-enrolled",
         "assignee": "peer",
-        "parents": [parent_tid],
     })
     d = json.loads(out)
     assert d["ok"] is True, f"unexpected error: {d}"
@@ -554,6 +545,51 @@ def test_kanban_create_auto_enrolls_in_dispatch_group(monkeypatch, tmp_path):
         assert g is not None
         assert g["origin_profile"] == "wren"
         assert g["origin_session"] == "acp-sess-test"
+    finally:
+        conn2.close()
+
+
+def test_kanban_worker_create_does_not_enroll_dispatch_group(monkeypatch, tmp_path):
+    """Dispatcher-spawned workers must not create origin-profile drain notices
+    for child cards; those notices wake/pollute the non-assignee profile later."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "sterling")
+    monkeypatch.setenv("HERMES_SESSION_ID", "worker-sess-test")
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)  # noqa: B023
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        parent_tid = kb.create_task(
+            conn, title="parent", assignee="sterling",
+        )
+        kb.claim_task(conn, parent_tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent_tid)
+
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "child should not notify origin",
+        "assignee": "zelda",
+        "parents": [parent_tid],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, f"unexpected error: {d}"
+    new_tid = d["task_id"]
+
+    conn2 = kb.connect()
+    try:
+        cnt = conn2.execute(
+            "SELECT COUNT(*) AS n FROM dispatch_group_tasks WHERE task_id = ?",
+            (new_tid,),
+        ).fetchone()["n"]
+        assert cnt == 0, "worker-created child task should not be dispatch-group enrolled"
     finally:
         conn2.close()
 
