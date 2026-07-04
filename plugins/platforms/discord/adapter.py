@@ -3583,6 +3583,20 @@ class DiscordAdapter(BasePlatformAdapter):
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
 
+            try:
+                from gateway.outbound_discord_allowlist import (
+                    check_discord_outbound_allowed,
+                    deny_message,
+                    log_denial,
+                )
+                decision = check_discord_outbound_allowed(str(chat_id), thread_id=str(thread_id) if thread_id else None)
+                if not decision.allowed:
+                    log_denial(decision)
+                    return SendResult(success=False, error=deny_message(decision), error_kind="forbidden")
+            except Exception as allowlist_exc:
+                logger.error("[%s] Discord outbound allowlist check failed: %s", self.name, allowlist_exc, exc_info=True)
+                return SendResult(success=False, error=f"Discord outbound allowlist check failed: {allowlist_exc}", error_kind="forbidden")
+
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
                 channel = self._client.get_channel(int(thread_id))
@@ -10388,6 +10402,20 @@ async def _standalone_send(
         token = (get_secret("DISCORD_BOT_TOKEN", "") or "").strip()
     if not token:
         return {"error": "Discord standalone send: DISCORD_BOT_TOKEN is not set"}
+
+    try:
+        from gateway.outbound_discord_allowlist import (
+            check_discord_outbound_allowed,
+            deny_message,
+            log_denial,
+        )
+        decision = check_discord_outbound_allowed(str(chat_id), thread_id=str(thread_id) if thread_id else None)
+        if not decision.allowed:
+            log_denial(decision)
+            return {"error": deny_message(decision), "error_kind": "forbidden"}
+    except Exception as allowlist_exc:
+        logger.error("Discord standalone outbound allowlist check failed: %s", allowlist_exc, exc_info=True)
+        return {"error": f"Discord outbound allowlist check failed: {allowlist_exc}", "error_kind": "forbidden"}
 
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
