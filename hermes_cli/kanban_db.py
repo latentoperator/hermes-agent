@@ -6115,7 +6115,7 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)",
     re.IGNORECASE,
 )
 
@@ -7293,7 +7293,98 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+def _github_pr_cache_key(match: re.Match[str]) -> str:
+    """Return a stable cache key for a GitHub PR URL regex match."""
+    owner, repo, number = match.group(1), match.group(2), match.group(3)
+    repo = repo[:-4] if repo.lower().endswith(".git") else repo
+    return f"{owner.lower()}/{repo.lower()}#{int(number)}"
+
+
+def _github_pr_api_path(match: re.Match[str]) -> tuple[str, str, int]:
+    owner, repo, number = match.group(1), match.group(2), match.group(3)
+    repo = repo[:-4] if repo.lower().endswith(".git") else repo
+    return owner, repo, int(number)
+
+
+def _github_pr_is_open(
+    match: re.Match[str],
+    *,
+    cache: Optional[dict[str, Optional[bool]]] = None,
+) -> Optional[bool]:
+    """Return True for an open PR, False for closed/merged, None on failure.
+
+    The respawn guard is conservative: callers treat ``None`` as active so
+    GitHub outages or missing auth don't create duplicate PRs. The cache is
+    per-dispatch tick and keyed by owner/repo/number so repeated task comments
+    do not fan out into repeated API calls.
+    """
+    key = _github_pr_cache_key(match)
+    if cache is not None and key in cache:
+        return cache[key]
+    owner, repo, number = _github_pr_api_path(match)
+    api_path = f"repos/{owner}/{repo}/pulls/{number}"
+    result: Optional[bool] = None
+
+    # Prefer the GitHub CLI when available because it already carries the
+    # operator's auth state and keeps token handling out of Hermes logs.
+    try:
+        proc = subprocess.run(
+            ["gh", "api", api_path, "--jq", ".state"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0:
+            state = (proc.stdout or "").strip().lower()
+            if state in {"open", "closed"}:
+                result = state == "open"
+        else:
+            _log.info(
+                "kanban respawn guard: gh could not check PR %s (%s)",
+                key,
+                (proc.stderr or "").strip()[:200],
+            )
+    except (FileNotFoundError, subprocess.SubprocessError, TimeoutError, OSError) as exc:
+        _log.info("kanban respawn guard: gh PR check failed for %s: %s", key, exc)
+
+    if result is None:
+        token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+        if token:
+            try:
+                import urllib.request
+
+                req = urllib.request.Request(
+                    f"https://api.github.com/{api_path}",
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "Authorization": f"Bearer {token}",
+                        "User-Agent": "hermes-kanban-respawn-guard",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+                state = str(payload.get("state") or "").lower()
+                if state in {"open", "closed"}:
+                    result = state == "open"
+            except Exception as exc:
+                _log.info("kanban respawn guard: GitHub API check failed for %s: %s", key, exc)
+        else:
+            _log.info("kanban respawn guard: no GitHub auth available to check PR %s", key)
+
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+def check_respawn_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    pr_state_cache: Optional[dict[str, Optional[bool]]] = None,
+) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready task in ``dispatch_once`` before any claim attempt.
@@ -7330,9 +7421,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         human review rather than immediately re-spawning.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        A GitHub PR URL appears in a task comment, the last worker run is
+        within ``_RESPAWN_GUARD_PR_WINDOW`` seconds, and GitHub reports the
+        PR is still open (or the PR state cannot be checked). Merged/closed
+        PRs do not guard. The window is measured from the worker run, not
+        comment timestamps, so reviewer comments quoting a URL do not extend
+        the guard forever.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -7398,14 +7492,34 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     ).fetchone():
         return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. GitHub PR URL from prior worker output. Measure the guard window
+    # from the latest worker run, not from comment timestamps: reviewer/CLI
+    # comments quoting an old PR URL must not refresh the 24h hold.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    latest_worker_run = conn.execute(
+        "SELECT MAX(COALESCE(ended_at, started_at, 0)) FROM task_runs "
+        "WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    latest_worker_run_at = int(latest_worker_run[0] or 0) if latest_worker_run else 0
+    if latest_worker_run_at >= pr_cutoff:
+        for c in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchall():
+            body = c["body"] or ""
+            for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body):
+                is_open = _github_pr_is_open(match, cache=pr_state_cache)
+                if is_open is False:
+                    continue
+                if is_open is None:
+                    _log.info(
+                        "kanban respawn guard: deferring %s because PR state "
+                        "for %s could not be verified",
+                        task_id,
+                        _github_pr_cache_key(match),
+                    )
+                return "active_pr"
 
     return None
 
@@ -7480,6 +7594,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    ignore_respawn_guards: Optional[Iterable[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7514,6 +7629,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            ignore_respawn_guards=ignore_respawn_guards,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -7530,6 +7646,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            ignore_respawn_guards=ignore_respawn_guards,
         )
 
 
@@ -7546,6 +7663,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    ignore_respawn_guards: Optional[Iterable[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7659,6 +7777,9 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+    ignored_guard_tasks = set(ignore_respawn_guards or ())
+    pr_state_cache: dict[str, Optional[bool]] = {}
+
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -7766,7 +7887,13 @@ def _dispatch_once_locked(
         # still trips the auto-block circuit breaker after failure_limit
         # consecutive failures, so a persistent auth error eventually
         # blocks via the normal path rather than on first occurrence.
-        guard_reason = check_respawn_guard(conn, row["id"])
+        guard_reason = None
+        if row["id"] not in ignored_guard_tasks:
+            guard_reason = check_respawn_guard(
+                conn,
+                row["id"],
+                pr_state_cache=pr_state_cache,
+            )
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
             # Emit an event so operators can see why the task was

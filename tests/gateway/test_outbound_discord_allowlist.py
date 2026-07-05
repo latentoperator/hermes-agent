@@ -57,6 +57,31 @@ def test_check_denies_unlisted_thread_even_when_parent_channel_allowed(tmp_path,
     assert decision.reason == "thread not allowlisted"
 
 
+def test_check_derives_profile_from_gateway_hermes_home(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    profile_home = tmp_path / "profiles" / "wren"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_ACTIVE_PROFILE", raising=False)
+
+    decision = check_discord_outbound_allowed("111")
+
+    assert decision.allowed is True
+    assert decision.profile == "wren"
+
+
+def test_check_allows_direct_thread_id_chat_target(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+
+    decision = check_discord_outbound_allowed("222", profile="wren")
+
+    assert decision.allowed is True
+    assert decision.reason == "thread allowlisted"
+
+
 def test_shared_thread_is_limited_to_configured_profiles(tmp_path, monkeypatch):
     cfg = _write_allowlist(tmp_path)
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))

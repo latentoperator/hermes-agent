@@ -2562,6 +2562,14 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Optional single-home pin for the embedded dispatcher/notifier. When
+        # set, only that profile's gateway attempts the singleton dispatcher
+        # lock; other profile gateways do not race for the board at all.
+        # Empty preserves the historical "any dispatch-enabled gateway" mode.
+        "dispatcher_profile": "",
+        # Loud alarm threshold for a pinned dispatcher that cannot take the
+        # singleton lock while spawnable ready/review work exists. 0 disables.
+        "no_dispatcher_alarm_after_seconds": 300,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

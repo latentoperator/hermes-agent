@@ -656,6 +656,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
+    p_disp.add_argument("--ignore-guards", action="append", default=[], metavar="TASK_ID",
+                        help="Operator escape hatch: ignore respawn guard for this task id (repeatable)")
     p_disp.add_argument("--json", action="store_true")
 
     # --- daemon (deprecated) ---
@@ -2178,6 +2180,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            ignore_respawn_guards=getattr(args, "ignore_guards", None) or None,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2196,6 +2199,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
+            ],
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
             ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
@@ -2230,6 +2237,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
+    if res.respawn_guarded:
+        for tid, reason in res.respawn_guarded:
+            print(f"Deferred (respawn guard: {reason}): {tid}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "

@@ -57,10 +57,17 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
 
     monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
 
-    args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
+    args = argparse.Namespace(
+        dry_run=True,
+        max=None,
+        failure_limit=2,
+        json=False,
+        ignore_guards=["t_guarded"],
+    )
     kb_cli._cmd_dispatch(args)
 
     # Every config value must have reached dispatch_once.
+    assert captured.get("ignore_respawn_guards") == ["t_guarded"]
     assert captured.get("max_in_progress") == 3, (
         f"CLI must pass kanban.max_in_progress from config; got {captured.get('max_in_progress')!r}"
     )
@@ -114,6 +121,52 @@ def test_cli_invalid_max_in_progress_silently_disables(isolated_kanban_home, mon
             f"invalid max_in_progress={bad_val!r} should fall through to None, "
             f"got {captured.get('max_in_progress')!r}"
         )
+
+
+def test_cli_dispatch_json_surfaces_respawn_guarded(isolated_kanban_home, monkeypatch, capsys):
+    """Guarded ready tasks must be visible in dispatch --json output."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda conn, **kw: kanban_db.DispatchResult(
+            respawn_guarded=[("t_guarded", "active_pr")]
+        ),
+    )
+
+    args = argparse.Namespace(
+        dry_run=True, max=None, failure_limit=2, json=True, ignore_guards=[]
+    )
+    kb_cli._cmd_dispatch(args)
+    out = capsys.readouterr().out
+    assert '"respawn_guarded"' in out
+    assert '"task_id": "t_guarded"' in out
+    assert '"reason": "active_pr"' in out
+
+
+def test_cli_dispatch_human_surfaces_respawn_guarded(isolated_kanban_home, monkeypatch, capsys):
+    """Human dispatch output should name guarded skips too."""
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda conn, **kw: kanban_db.DispatchResult(
+            respawn_guarded=[("t_guarded", "active_pr")]
+        ),
+    )
+
+    args = argparse.Namespace(
+        dry_run=True, max=None, failure_limit=2, json=False, ignore_guards=[]
+    )
+    kb_cli._cmd_dispatch(args)
+    out = capsys.readouterr().out
+    assert "Deferred (respawn guard: active_pr): t_guarded" in out
 
 
 def test_kanban_swarm_uses_existing_humanizer_skill():
