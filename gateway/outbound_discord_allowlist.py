@@ -28,7 +28,19 @@ class DiscordOutboundDecision:
 
 
 def _profile_name() -> str:
-    return (os.getenv("HERMES_PROFILE") or os.getenv("HERMES_ACTIVE_PROFILE") or "default").strip() or "default"
+    explicit = (os.getenv("HERMES_PROFILE") or os.getenv("HERMES_ACTIVE_PROFILE") or "").strip()
+    if explicit:
+        return explicit
+
+    home = Path(os.getenv("HERMES_HOME", "")).expanduser()
+    parts = home.parts
+    # Gateway services for named profiles are launched with only
+    # HERMES_HOME=~/.hermes/profiles/<profile>.  Derive the acting profile
+    # from that profile home instead of falling back to the default profile.
+    if len(parts) >= 2 and parts[-2] == "profiles" and parts[-1]:
+        return parts[-1]
+
+    return "default"
 
 
 def _shared_hermes_home() -> Path:
