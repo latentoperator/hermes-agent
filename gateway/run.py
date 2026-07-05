@@ -7652,6 +7652,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running = False
             self._draining = True
 
+            # Kanban workers are subprocesses spawned by the embedded dispatcher,
+            # not entries in _running_agents.  Under systemd/service-managed
+            # restarts the gateway unit cgroup kills those children after this
+            # process exits, so pre-release this gateway's exact claims now.  Do
+            # NOT do this for ordinary in-process/detached restarts: those
+            # start_new_session workers can survive, and requeueing would create
+            # duplicate workers.
+            if (
+                sys.platform.startswith("linux")
+                and os.environ.get("INVOCATION_ID")
+                and (self._restart_via_service or getattr(self, "_signal_initiated_shutdown", False))
+            ):
+                try:
+                    from hermes_cli import kanban_db as _kb
+
+                    _requeued_total = 0
+                    try:
+                        _boards = _kb.list_boards(include_archived=False)
+                    except Exception:
+                        _boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+                    for _b in _boards:
+                        _slug = _b.get("slug") or _kb.DEFAULT_BOARD
+                        _conn = None
+                        try:
+                            _conn = _kb.connect(board=_slug)
+                            _requeued = _kb.requeue_workers_for_gateway_restart(
+                                _conn,
+                                reason=(
+                                    "gateway_service_restart"
+                                    if self._restart_via_service
+                                    else "gateway_signal_restart"
+                                ),
+                            )
+                            _requeued_total += len(_requeued)
+                        finally:
+                            if _conn is not None:
+                                try:
+                                    _conn.close()
+                                except Exception:
+                                    pass
+                    if _requeued_total:
+                        logger.warning(
+                            "Kanban shutdown preflight requeued %d worker(s) "
+                            "owned by this gateway before service cgroup teardown",
+                            _requeued_total,
+                        )
+                except Exception as _e:
+                    logger.debug("Kanban shutdown preflight requeue failed: %s", _e, exc_info=True)
+
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
             await self._notify_active_sessions_of_shutdown()

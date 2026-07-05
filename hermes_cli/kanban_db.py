@@ -7271,6 +7271,73 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
+def requeue_workers_for_gateway_restart(
+    conn: sqlite3.Connection,
+    *,
+    claimer: Optional[str] = None,
+    reason: str = "gateway_restart",
+) -> list[str]:
+    """Cleanly requeue workers claimed by the current gateway before cgroup teardown.
+
+    The embedded dispatcher uses the gateway process's ``host:pid`` claimer.  On
+    systemd-managed restarts, worker subprocesses remain in the gateway unit's
+    cgroup even though they are started in a new session; restarting the unit can
+    therefore SIGTERM/SIGKILL them mid-task.  If the gateway is shutting down via
+    a service/cgroup path, release only claims owned by this exact gateway
+    claimer and close their active run as ``gateway_restarted``.  The next
+    dispatcher tick can retry them without burning the task failure counter, and
+    the event trail names the restart instead of blaming the card.
+
+    This function deliberately does not signal the worker PID.  The service
+    manager owns cgroup teardown; doing only the DB transition here keeps the
+    path safe and bounded during shutdown.
+    """
+    claim = claimer or _claimer_id()
+    now = int(time.time())
+    requeued: list[str] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, worker_pid, current_run_id FROM tasks "
+            "WHERE status = 'running' AND claim_lock IS ?",
+            (claim,),
+        ).fetchall()
+        for row in rows:
+            tid = row["id"]
+            pid = row["worker_pid"]
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+                (tid, claim),
+            )
+            if cur.rowcount != 1:
+                continue
+            payload = {
+                "reason": reason,
+                "claimer": claim,
+                "pid": int(pid) if pid is not None else None,
+                "requeued_at": now,
+            }
+            run_id = _end_run(
+                conn,
+                tid,
+                outcome="gateway_restarted",
+                status="gateway_restarted",
+                error=f"requeued during {reason}; failure counter not incremented",
+                metadata=payload,
+            )
+            _append_event(
+                conn,
+                tid,
+                "gateway_restart_requeued",
+                payload,
+                run_id=run_id,
+            )
+            requeued.append(tid)
+    return requeued
+
+
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     """Reset the unified consecutive-failures counter.
 

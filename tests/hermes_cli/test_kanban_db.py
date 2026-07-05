@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -724,6 +725,75 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["last_heartbeat_at"] == hb_at
         assert payload["worker_pid"] == 12345
         assert payload["host_local"] is True
+
+
+def test_gateway_restart_requeue_releases_exact_gateway_claim_without_failure(
+    kanban_home,
+):
+    """Service-managed gateway restarts should make owned workers retryable
+    without burning the dispatcher's failure budget.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="long worker", assignee="a")
+        claimed = kb.claim_task(conn, tid, claimer="host:gateway")
+        assert claimed is not None
+        kb._set_worker_pid(conn, tid, 42424)
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = ?, last_heartbeat_at = ? WHERE id = ?",
+            (1, int(time.time()), tid),
+        )
+        conn.commit()
+
+        requeued = kb.requeue_workers_for_gateway_restart(
+            conn,
+            claimer="host:gateway",
+            reason="gateway_service_restart",
+        )
+
+        assert requeued == [tid]
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert task.consecutive_failures == 1
+        assert task.last_failure_error is None
+
+        run = conn.execute(
+            "SELECT outcome, error, metadata FROM task_runs WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+        assert run["outcome"] == "gateway_restarted"
+        assert "failure counter not incremented" in run["error"]
+
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'gateway_restart_requeued'",
+            (tid,),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload["reason"] == "gateway_service_restart"
+        assert payload["claimer"] == "host:gateway"
+        assert payload["pid"] == 42424
+
+
+def test_gateway_restart_requeue_ignores_other_claimers(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="other", assignee="a")
+        assert kb.claim_task(conn, tid, claimer="host:other-gateway") is not None
+        kb._set_worker_pid(conn, tid, 52525)
+
+        assert kb.requeue_workers_for_gateway_restart(
+            conn,
+            claimer="host:gateway",
+        ) == []
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_lock == "host:other-gateway"
+        assert task.worker_pid == 52525
 
 
 def test_detect_crashed_workers_systemic_failure_fast_block(
