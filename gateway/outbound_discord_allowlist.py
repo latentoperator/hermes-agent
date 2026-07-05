@@ -171,6 +171,12 @@ def check_discord_outbound_allowed(
     if target_chat_id in channels:
         return DiscordOutboundDecision(True, "channel allowlisted", active_profile, target_chat_id, None)
 
+    # Discord threads are channels at the API level.  Some send paths address a
+    # thread directly as chat_id without separate metadata.thread_id, so honor
+    # thread allowlist entries for the direct target ID as well.
+    if target_chat_id in threads or _shared_thread_allowed(cfg, active_profile, target_chat_id):
+        return DiscordOutboundDecision(True, "thread allowlisted", active_profile, target_chat_id, None)
+
     return DiscordOutboundDecision(False, "channel not allowlisted", active_profile, target_chat_id, None)
 
 
