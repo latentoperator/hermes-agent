@@ -575,6 +575,23 @@ def test_stranded_in_ready_falls_back_to_created_at():
     assert stranded[0].data["age_seconds"] == 4 * 3600
 
 
+def test_stranded_in_ready_names_respawn_guard_reason():
+    """Guarded ready tasks should name the guard, not guess about worker pools."""
+    now = 100_000
+    task = _task(status="ready", assignee="demo", id="t_guarded")
+    events = [
+        _event("created", ts=now - 4 * 3600),
+        _event("respawn_guarded", ts=now - 60, reason="active_pr"),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=now)
+    stranded = [d for d in diags if d.kind == "stranded_in_ready"]
+    assert len(stranded) == 1
+    d = stranded[0]
+    assert "respawn guard" in d.title
+    assert d.data["respawn_guard_reason"] == "active_pr"
+    assert any("--ignore-guards t_guarded" in a.payload.get("command", "") for a in d.actions)
+
+
 def test_stranded_in_ready_works_on_real_db_row(kanban_home):
     """Round-trip through real kanban_db.connect() — confirms the rule
     works on sqlite3.Row objects, not just dicts."""

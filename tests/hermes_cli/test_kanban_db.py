@@ -1893,16 +1893,61 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
     assert reason is None
 
 
-def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+def test_respawn_guard_active_pr_in_comment(kanban_home, monkeypatch):
+    """An open GitHub PR URL plus a recent worker run triggers active_pr."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 120, now - 60),
+        )
         kb.add_comment(
             conn, t, "worker",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
+
+
+def test_respawn_guard_merged_pr_in_comments_not_guarded(kanban_home, monkeypatch):
+    """Merged/closed PRs are ignored so completed review flow can respawn."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="merged-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        kb.add_comment(
+            conn, t, "worker",
+            "Merged PR: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_reviewer_comment_does_not_refresh_pr_window(kanban_home, monkeypatch):
+    """A fresh reviewer comment quoting a PR URL does not extend an old worker-run window."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewer-quote", assignee="alice")
+        old_end = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, old_end - 120, old_end),
+        )
+        kb.add_comment(
+            conn, t, "reviewer",
+            "Reviewing https://github.com/totemx-AI/subsidysmart/pull/42 again",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
@@ -1992,9 +2037,10 @@ def test_dispatch_respawn_guard_skips_recent_success(
 
 
 def test_dispatch_respawn_guard_skips_active_pr(
-    kanban_home, all_assignees_spawnable
+    kanban_home, all_assignees_spawnable, monkeypatch
 ):
     """dispatch_once skips (but does not block) a task with an active PR comment."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -2002,6 +2048,12 @@ def test_dispatch_respawn_guard_skips_active_pr(
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 300, now - 60),
+        )
         kb.add_comment(
             conn, t, "worker",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
@@ -2049,6 +2101,29 @@ def test_dispatch_respawn_guard_allows_clean_task(
     assert t in spawned_ids
     assert not res.respawn_guarded
     assert t not in res.auto_blocked
+
+
+def test_dispatch_ignore_respawn_guard_escape_hatch(
+    kanban_home, all_assignees_spawnable
+):
+    """Operator escape hatch bypasses a known guard for one dispatch tick."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="quota-storm", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("rate limit exceeded: 429 Too Many Requests", t),
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=fake_spawn, ignore_respawn_guards=[t]
+        )
+
+    assert t in spawned_ids
+    assert not res.respawn_guarded
 
 
 def test_dispatch_respawn_guard_emits_event_for_skipped_task(
