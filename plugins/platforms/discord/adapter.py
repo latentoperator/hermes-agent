@@ -1949,34 +1949,50 @@ class DiscordAdapter(BasePlatformAdapter):
                 thread_id = metadata["thread_id"]
             nonconversational = _metadata_marks_nonconversational(metadata)
 
+            channel = None
+            parent_channel_id = None
+            if thread_id:
+                # Fetch the thread before allowlist enforcement so the checker
+                # can allow all threads under an approved parent channel while
+                # still denying unrelated threads before any outbound post.
+                channel = self._client.get_channel(int(thread_id))
+                if not channel:
+                    channel = await self._client.fetch_channel(int(thread_id))
+                if not channel:
+                    return SendResult(success=False, error=f"Thread {thread_id} not found")
+                parent_id = getattr(channel, "parent_id", None)
+                if parent_id:
+                    parent_channel_id = str(parent_id)
+            else:
+                # Get the target channel up front. Discord threads are channels
+                # at the API level, so a direct thread target can also expose a
+                # parent_id here for parent-channel allowlist checks.
+                channel = self._client.get_channel(int(chat_id))
+                if not channel:
+                    channel = await self._client.fetch_channel(int(chat_id))
+                if not channel:
+                    return SendResult(success=False, error=f"Channel {chat_id} not found")
+                parent_id = getattr(channel, "parent_id", None)
+                if parent_id:
+                    parent_channel_id = str(parent_id)
+
             try:
                 from gateway.outbound_discord_allowlist import (
                     check_discord_outbound_allowed,
                     deny_message,
                     log_denial,
                 )
-                decision = check_discord_outbound_allowed(str(chat_id), thread_id=str(thread_id) if thread_id else None)
+                decision = check_discord_outbound_allowed(
+                    str(chat_id),
+                    thread_id=str(thread_id) if thread_id else None,
+                    parent_channel_id=parent_channel_id,
+                )
                 if not decision.allowed:
                     log_denial(decision)
                     return SendResult(success=False, error=deny_message(decision), error_kind="forbidden")
             except Exception as allowlist_exc:
                 logger.error("[%s] Discord outbound allowlist check failed: %s", self.name, allowlist_exc, exc_info=True)
                 return SendResult(success=False, error=f"Discord outbound allowlist check failed: {allowlist_exc}", error_kind="forbidden")
-
-            if thread_id:
-                # Fetch the thread directly — threads are addressed by their own ID.
-                channel = self._client.get_channel(int(thread_id))
-                if not channel:
-                    channel = await self._client.fetch_channel(int(thread_id))
-                if not channel:
-                    return SendResult(success=False, error=f"Thread {thread_id} not found")
-            else:
-                # Get the parent channel
-                channel = self._client.get_channel(int(chat_id))
-                if not channel:
-                    channel = await self._client.fetch_channel(int(chat_id))
-                if not channel:
-                    return SendResult(success=False, error=f"Channel {chat_id} not found")
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
