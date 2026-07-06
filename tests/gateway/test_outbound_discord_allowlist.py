@@ -22,6 +22,7 @@ def _write_allowlist(tmp_path):
                   wren:
                     channels: ['111']
                     threads: ['222']
+                    thread_parent_channels: ['777']
                   dante:
                     channels: ['333']
                     threads: []
@@ -55,6 +56,17 @@ def test_check_denies_unlisted_thread_even_when_parent_channel_allowed(tmp_path,
 
     assert decision.allowed is False
     assert decision.reason == "thread not allowlisted"
+
+
+def test_check_allows_thread_under_allowlisted_parent_channel(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+    monkeypatch.setenv("HERMES_PROFILE", "wren")
+
+    decision = check_discord_outbound_allowed("555", thread_id="555", parent_channel_id="777")
+
+    assert decision.allowed is True
+    assert decision.reason == "thread parent channel allowlisted"
 
 
 def test_check_derives_profile_from_gateway_hermes_home(tmp_path, monkeypatch):
@@ -143,3 +155,44 @@ async def test_discord_adapter_returns_failed_send_on_allowlist_denial(tmp_path,
     assert result.error_kind == "forbidden"
     assert "Outbound Discord post denied" in (result.error or "")
     assert channel.send.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_discord_adapter_allows_thread_under_allowlisted_parent(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+    monkeypatch.setenv("HERMES_PROFILE", "wren")
+
+    import sys
+    from types import ModuleType
+
+    if "discord" not in sys.modules:
+        discord_mod = MagicMock()
+        discord_mod.Intents.default.return_value = MagicMock()
+        discord_mod.DMChannel = type("DMChannel", (), {})
+        discord_mod.Thread = type("Thread", (), {})
+        discord_mod.ForumChannel = type("ForumChannel", (), {})
+        discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
+        discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, secondary=2, danger=3, green=1, grey=2, blurple=2, red=3)
+        discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4, purple=lambda: 5)
+        discord_mod.Interaction = object
+        discord_mod.Embed = MagicMock
+        discord_mod.app_commands = SimpleNamespace(describe=lambda **kwargs: (lambda fn: fn), choices=lambda **kwargs: (lambda fn: fn), Choice=lambda **kwargs: SimpleNamespace(**kwargs))
+        commands_mod = MagicMock()
+        commands_mod.Bot = MagicMock
+        ext_mod = ModuleType("discord.ext")
+        setattr(ext_mod, "commands", commands_mod)
+        sys.modules["discord"] = discord_mod
+        sys.modules["discord.ext"] = ext_mod
+        sys.modules["discord.ext.commands"] = commands_mod
+
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    thread = SimpleNamespace(parent_id="777", send=AsyncMock(return_value=SimpleNamespace(id=1234)))
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._client = SimpleNamespace(get_channel=lambda _id: thread, fetch_channel=AsyncMock())
+
+    result = await adapter.send("555", "allowed", metadata={"thread_id": "555"})
+
+    assert result.success is True
+    assert thread.send.await_count == 1
