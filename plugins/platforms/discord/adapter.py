@@ -8546,6 +8546,45 @@ class DiscordAdapter(BasePlatformAdapter):
         # When auto-threading kicked in, route responses to the new thread
         effective_channel = auto_threaded_channel or message.channel
 
+        # Preflight the same outbound allowlist used by send().  Mentions are
+        # otherwise accepted inbound, the agent spends tokens and may run tools,
+        # then every progress/final send is denied.  Fail before invoking the
+        # agent when this profile cannot answer in the target Discord thread.
+        if not isinstance(message.channel, discord.DMChannel):
+            try:
+                from gateway.outbound_discord_allowlist import (
+                    check_discord_outbound_allowed,
+                    deny_message,
+                    log_denial,
+                )
+
+                _effective_chat_id = str(getattr(effective_channel, "id", "") or "")
+                _effective_thread_id = thread_id if is_thread else None
+                _effective_parent_id = parent_channel_id
+                if not _effective_parent_id:
+                    _effective_parent_id = self._get_parent_channel_id(effective_channel)
+                decision = check_discord_outbound_allowed(
+                    _effective_chat_id,
+                    thread_id=_effective_thread_id,
+                    parent_channel_id=_effective_parent_id,
+                )
+                if not decision.allowed:
+                    log_denial(decision)
+                    logger.warning(
+                        "[%s] Ignoring inbound Discord message because outbound target is denied: %s",
+                        self.name,
+                        deny_message(decision),
+                    )
+                    return
+            except Exception as allowlist_exc:
+                logger.error(
+                    "[%s] Discord outbound allowlist preflight failed: %s",
+                    self.name,
+                    allowlist_exc,
+                    exc_info=True,
+                )
+                return
+
         # Determine chat type
         if isinstance(message.channel, discord.DMChannel):
             chat_type = "dm"
