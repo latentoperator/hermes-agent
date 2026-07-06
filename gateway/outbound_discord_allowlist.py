@@ -25,6 +25,7 @@ class DiscordOutboundDecision:
     profile: str
     chat_id: str
     thread_id: str | None = None
+    parent_channel_id: str | None = None
 
 
 def _profile_name() -> str:
@@ -127,6 +128,7 @@ def check_discord_outbound_allowed(
     chat_id: str,
     *,
     thread_id: str | None = None,
+    parent_channel_id: str | None = None,
     profile: str | None = None,
 ) -> DiscordOutboundDecision:
     """Return whether the active profile may post to this Discord target.
@@ -141,6 +143,7 @@ def check_discord_outbound_allowed(
               wren:
                 channels: ["150..."]
                 threads: ["150..."]
+                thread_parent_channels: ["150..."]
             shared_threads:
               decisions:
                 chat_id: "150..."
@@ -150,6 +153,7 @@ def check_discord_outbound_allowed(
     active_profile = (profile or _profile_name()).strip() or "default"
     target_chat_id = _normalize_id(chat_id)
     target_thread_id = _normalize_id(thread_id) or None
+    target_parent_channel_id = _normalize_id(parent_channel_id) or None
 
     cfg = _load_allowlist_config()
     if not cfg or not bool(cfg.get("enabled", False)):
@@ -162,11 +166,16 @@ def check_discord_outbound_allowed(
     block = _profile_block(cfg, active_profile)
     channels = _id_set(block.get("channels"))
     threads = _id_set(block.get("threads"))
+    thread_parent_channels = _id_set(block.get("thread_parent_channels"))
 
     if target_thread_id:
         if target_thread_id in threads or _shared_thread_allowed(cfg, active_profile, target_thread_id):
-            return DiscordOutboundDecision(True, "thread allowlisted", active_profile, target_chat_id, target_thread_id)
-        return DiscordOutboundDecision(False, "thread not allowlisted", active_profile, target_chat_id, target_thread_id)
+            return DiscordOutboundDecision(True, "thread allowlisted", active_profile, target_chat_id, target_thread_id, target_parent_channel_id)
+        if target_parent_channel_id and (
+            target_parent_channel_id in thread_parent_channels or "*" in thread_parent_channels
+        ):
+            return DiscordOutboundDecision(True, "thread parent channel allowlisted", active_profile, target_chat_id, target_thread_id, target_parent_channel_id)
+        return DiscordOutboundDecision(False, "thread not allowlisted", active_profile, target_chat_id, target_thread_id, target_parent_channel_id)
 
     if target_chat_id in channels:
         return DiscordOutboundDecision(True, "channel allowlisted", active_profile, target_chat_id, None)
@@ -176,6 +185,11 @@ def check_discord_outbound_allowed(
     # thread allowlist entries for the direct target ID as well.
     if target_chat_id in threads or _shared_thread_allowed(cfg, active_profile, target_chat_id):
         return DiscordOutboundDecision(True, "thread allowlisted", active_profile, target_chat_id, None)
+
+    if target_parent_channel_id and (
+        target_parent_channel_id in thread_parent_channels or "*" in thread_parent_channels
+    ):
+        return DiscordOutboundDecision(True, "thread parent channel allowlisted", active_profile, target_chat_id, None, target_parent_channel_id)
 
     return DiscordOutboundDecision(False, "channel not allowlisted", active_profile, target_chat_id, None)
 
