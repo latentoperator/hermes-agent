@@ -96,6 +96,17 @@ summary in one place.
 
 Files that don't exist on disk when the notifier runs are silently skipped.
 
+That upload path is delivery, not durability. If a worker produces a report,
+manifest, hash inventory, rollback note, verification checklist, or any other
+evidence another person or later worker may need after the card completes, save
+a durable copy outside the task's scratch workspace before calling
+`kanban_complete`. Scratch workspaces are disposable working desks; a path under
+`~/.hermes/kanban/workspaces/<task-id>/` is acceptable as the sole artifact only
+when the file is ephemeral and its purpose is immediate chat upload. For durable
+handoff evidence, point `artifacts=[...]` and/or `metadata` at the durable copy,
+such as a repo file, a persistent `dir:` workspace, or an agreed notes/runbook
+location.
+
 ## Connecting more services with MCP
 
 Beyond the artifact-delivery pipeline, the agent can reach into other
