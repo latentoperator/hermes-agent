@@ -147,6 +147,9 @@ DEFAULT_REVIEW_GATE_MODEL: Optional[str] = None
 DEFAULT_REVIEW_GATE_FALLBACK_MODEL: Optional[str] = None
 DEFAULT_REVIEW_GATE_SKILLS = ("github-code-review",)
 REVIEW_GATE_CREATED_BY = "hopewell-dev-review-gate"
+REVIEW_LOOP_CREATED_BY = "kanban-review-loop"
+REVIEW_LOOP_IDEMPOTENCY_PREFIX = "review-loop"
+DEFAULT_REVIEW_LOOP_MAX_ROUNDS = 2
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -2606,6 +2609,17 @@ def _review_gate_config() -> dict[str, Any]:
         "fallback_model": fallback_model,
         "skills": skills or list(DEFAULT_REVIEW_GATE_SKILLS),
         "max_runtime_seconds": gate.get("max_runtime_seconds", 30 * 60),
+        "closed_loop_enabled": _env_bool(
+            "HERMES_KANBAN_REVIEW_LOOP_ENABLED",
+            bool(gate.get("closed_loop_enabled", True)),
+        ),
+        "closed_loop_max_rounds": int(
+            os.environ.get(
+                "HERMES_KANBAN_REVIEW_LOOP_MAX_ROUNDS",
+                gate.get("closed_loop_max_rounds", DEFAULT_REVIEW_LOOP_MAX_ROUNDS),
+            )
+            or DEFAULT_REVIEW_LOOP_MAX_ROUNDS
+        ),
     }
 
 
@@ -2681,6 +2695,247 @@ def _review_gate_body(
             + "."
         )
     return body
+
+
+def _is_review_required_reason(reason: Optional[str]) -> bool:
+    return bool(str(reason or "").strip().lower().startswith("review-required:"))
+
+
+def _review_loop_rounds_created(conn: sqlite3.Connection, source_task_id: str) -> int:
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_loop_requested'",
+        (source_task_id,),
+    ).fetchall()
+    rounds: set[int] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+            round_no = int(payload.get("round") or 0)
+        except Exception:
+            round_no = 0
+        if round_no > 0:
+            rounds.add(round_no)
+    return len(rounds)
+
+
+def _review_loop_source_from_task(task: Optional[Task]) -> Optional[tuple[str, int]]:
+    if task is None:
+        return None
+    idem = (task.idempotency_key or "").strip()
+    prefix = f"{REVIEW_LOOP_IDEMPOTENCY_PREFIX}:"
+    if idem.startswith(prefix):
+        parts = idem.split(":")
+        if len(parts) >= 3 and parts[1]:
+            try:
+                return parts[1], int(parts[2])
+            except (TypeError, ValueError):
+                return parts[1], 0
+    body = task.body or ""
+    m = re.search(r"^Source task:\s*(t_[a-f0-9]{8,})\s*$", body, re.MULTILINE)
+    if m:
+        return m.group(1), 0
+    return None
+
+
+def _review_loop_body(source: Task, round_no: int, max_rounds: int) -> str:
+    return (
+        "Run closed-loop code review for the blocked source task.\n\n"
+        f"Source task: {source.id}\n"
+        f"Source title: {source.title}\n"
+        f"Review round: {round_no}/{max_rounds}\n"
+        f"Workspace: {source.workspace_path or ''}\n"
+        f"Branch: {source.branch_name or ''}\n\n"
+        "Read the source task comments and handoff evidence first. Review the changed diff, "
+        "test output, and operational risk. Add a concise comment to the source task when "
+        "findings matter. Complete this review card with metadata.verdict set to one of: "
+        "approved, changes_requested, cannot_review. If metadata is unavailable, start the "
+        "summary with PASS, BLOCK, WARN, or CANNOT_REVIEW. Do not edit the implementation."
+    )
+
+
+def _maybe_create_review_loop_task(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    reason: Optional[str],
+) -> Optional[str]:
+    gate = _review_gate_config()
+    if not gate.get("enabled") or not gate.get("closed_loop_enabled"):
+        return None
+    source = get_task(conn, source_task_id)
+    if source is None:
+        return None
+    if source.workspace_kind not in {"dir", "worktree"} or not source.workspace_path:
+        return None
+    if not any(_path_is_under(source.workspace_path, root) for root in gate.get("roots", [])):
+        return None
+    max_rounds = max(1, int(gate.get("closed_loop_max_rounds") or DEFAULT_REVIEW_LOOP_MAX_ROUNDS))
+    existing_rounds = _review_loop_rounds_created(conn, source_task_id)
+    if existing_rounds >= max_rounds:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                source_task_id,
+                "review_escalation",
+                {
+                    "reason": "max_review_rounds_reached",
+                    "rounds": existing_rounds,
+                    "max_rounds": max_rounds,
+                    "block_reason": reason,
+                },
+            )
+        return None
+    round_no = existing_rounds + 1
+    idem = f"{REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_task_id}:{round_no}"
+    review_id = create_task(
+        conn,
+        title=f"review loop r{round_no}: {source.title}",
+        body=_review_loop_body(source, round_no, max_rounds),
+        assignee=str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
+        created_by=REVIEW_LOOP_CREATED_BY,
+        workspace_kind=source.workspace_kind,
+        workspace_path=source.workspace_path,
+        branch_name=source.branch_name,
+        tenant=source.tenant,
+        priority=source.priority,
+        idempotency_key=idem,
+        max_runtime_seconds=int(gate.get("max_runtime_seconds") or 30 * 60),
+        skills=gate.get("skills") or list(DEFAULT_REVIEW_GATE_SKILLS),
+        provider_override=(str(gate["provider"]).strip() if gate.get("provider") else None),
+        model_override=str(gate["model"]).strip() if gate.get("model") else None,
+        max_retries=1,
+        board=get_current_board(),
+        auto_review_gate=False,
+    )
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_loop_requested' "
+            "AND payload LIKE ? LIMIT 1",
+            (source_task_id, f'%"round": {round_no}%'),
+        ).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    source_task_id,
+                    REVIEW_LOOP_CREATED_BY,
+                    f"Closed-loop code review round {round_no}/{max_rounds} queued as {review_id}.",
+                    int(time.time()),
+                ),
+            )
+            _append_event(
+                conn,
+                source_task_id,
+                "review_loop_requested",
+                {"review_task_id": review_id, "round": round_no, "max_rounds": max_rounds},
+            )
+    return review_id
+
+
+def _extract_review_loop_verdict(
+    *,
+    metadata: Optional[dict],
+    summary: Optional[str],
+    result: Optional[str],
+) -> str:
+    if isinstance(metadata, dict):
+        raw = metadata.get("verdict") or metadata.get("review_verdict")
+        if raw is None and "approved" in metadata:
+            return "approved" if bool(metadata.get("approved")) else "changes_requested"
+        if raw is not None:
+            value = str(raw).strip().lower().replace("-", "_").replace(" ", "_")
+            if value in {"approved", "approve", "pass", "passed", "lgtm"}:
+                return "approved"
+            if value in {"changes_requested", "request_changes", "block", "blocked", "warn", "warning"}:
+                return "changes_requested"
+            if value in {"cannot_review", "unable_to_review", "failed", "error"}:
+                return "cannot_review"
+    text = " ".join(part for part in [summary, result] if part).strip().lower()
+    first = text.splitlines()[0][:80] if text else ""
+    if first.startswith(("pass", "approved", "approve", "lgtm")):
+        return "approved"
+    if first.startswith(("block", "changes requested", "request changes", "warn")):
+        return "changes_requested"
+    if first.startswith(("cannot_review", "cannot review", "unable to review")):
+        return "cannot_review"
+    return "cannot_review"
+
+
+def _apply_review_loop_outcome(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> None:
+    review_task = get_task(conn, review_task_id)
+    if review_task is None or review_task.created_by != REVIEW_LOOP_CREATED_BY:
+        return
+    source_info = _review_loop_source_from_task(review_task)
+    if source_info is None:
+        return
+    source_task_id, round_no = source_info
+    source = get_task(conn, source_task_id)
+    if source is None:
+        return
+    verdict = _extract_review_loop_verdict(metadata=metadata, summary=summary, result=result)
+    line = (summary or result or "").strip().splitlines()[0][:400]
+    if verdict == "approved":
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    source_task_id,
+                    REVIEW_LOOP_CREATED_BY,
+                    f"Review round {round_no or '?'} approved by {review_task.assignee or 'reviewer'} via {review_task_id}." + (f"\n{line}" if line else ""),
+                    int(time.time()),
+                ),
+            )
+            _append_event(
+                conn,
+                source_task_id,
+                "review_approved",
+                {"review_task_id": review_task_id, "round": round_no, "summary": line or None},
+            )
+        unblock_task(conn, source_task_id)
+        return
+    if verdict == "changes_requested":
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    source_task_id,
+                    REVIEW_LOOP_CREATED_BY,
+                    f"Review round {round_no or '?'} requested changes via {review_task_id}." + (f"\n{line}" if line else ""),
+                    int(time.time()),
+                ),
+            )
+            _append_event(
+                conn,
+                source_task_id,
+                "review_changes_requested",
+                {"review_task_id": review_task_id, "round": round_no, "summary": line or None},
+            )
+        # Return the original owner to the same task/branch so it can apply the
+        # requested edits and re-block as review-required if another round is needed.
+        unblock_task(conn, source_task_id)
+        return
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (
+                source_task_id,
+                REVIEW_LOOP_CREATED_BY,
+                f"Review round {round_no or '?'} could not complete via {review_task_id}." + (f"\n{line}" if line else ""),
+                int(time.time()),
+            ),
+        )
+        _append_event(
+            conn,
+            source_task_id,
+            "review_escalation",
+            {"review_task_id": review_task_id, "round": round_no, "verdict": verdict, "summary": line or None},
+        )
 
 
 def create_task(
@@ -4577,6 +4832,16 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    try:
+        _apply_review_loop_outcome(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+        )
+    except Exception:
+        _log.debug("failed to apply closed-loop review outcome for %s", task_id, exc_info=True)
     return True
 
 
@@ -4987,6 +5252,7 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    review_required = _is_review_required_reason(reason)
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -5059,6 +5325,21 @@ def block_task(
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
 
+        if review_required and recurrences >= BLOCK_RECURRENCE_LIMIT:
+            try:
+                gate = _review_gate_config()
+                max_rounds = max(
+                    1,
+                    int(gate.get("closed_loop_max_rounds") or DEFAULT_REVIEW_LOOP_MAX_ROUNDS),
+                )
+                if _review_loop_rounds_created(conn, task_id) < max_rounds:
+                    # A review-required block is an intentional agent↔reviewer
+                    # loop, not the generic unblock/re-block failure mode. Let
+                    # it reach the configured review-loop cap before triaging.
+                    recurrences = BLOCK_RECURRENCE_LIMIT - 1
+            except Exception:
+                pass
+
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
@@ -5098,6 +5379,18 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            if review_required:
+                _append_event(
+                    conn,
+                    task_id,
+                    "review_escalation",
+                    {
+                        "reason": "max_review_rounds_reached",
+                        "block_reason": reason,
+                        "recurrences": recurrences,
+                    },
+                    run_id=run_id,
+                )
             routed_to = "triage"
         else:
             if expected_run_id is None:
@@ -5160,6 +5453,11 @@ def block_task(
             check_task_dispatch_blocked(conn, task_id)
         except Exception:
             pass
+        if review_required:
+            try:
+                _maybe_create_review_loop_task(conn, task_id, reason)
+            except Exception:
+                _log.debug("failed to create closed-loop review task for %s", task_id, exc_info=True)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,

@@ -252,6 +252,9 @@ class GatewayKanbanWatchersMixin:
             "crashed",
             "timed_out",
             "status",
+            "review_approved",
+            "review_changes_requested",
+            "review_escalation",
             "archived",
             "unblocked",
         )
@@ -517,6 +520,23 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                        elif kind == "review_approved":
+                            detail = ""
+                            if ev.payload and ev.payload.get("summary"):
+                                detail = f"\n{str(ev.payload['summary'])[:200]}"
+                            msg = f"✅ {board_tag}{tag}Kanban {sub['task_id']} review approved — {title}{detail}"
+                        elif kind == "review_changes_requested":
+                            detail = ""
+                            if ev.payload and ev.payload.get("summary"):
+                                detail = f"\n{str(ev.payload['summary'])[:200]}"
+                            msg = f"🔁 {board_tag}{tag}Kanban {sub['task_id']} review requested changes — {title}{detail}"
+                        elif kind == "review_escalation":
+                            detail = ""
+                            if ev.payload and ev.payload.get("summary"):
+                                detail = f"\n{str(ev.payload['summary'])[:200]}"
+                            elif ev.payload and ev.payload.get("reason"):
+                                detail = f"\n{str(ev.payload['reason'])[:200]}"
+                            msg = f"⚠ {board_tag}{tag}Kanban {sub['task_id']} review needs human attention — {title}{detail}"
                         else:
                             # archived / unblocked are claimed by NOTIFY_KINDS
                             # (so the cursor advances past them and they can't
@@ -616,6 +636,9 @@ class GatewayKanbanWatchersMixin:
                             "crashed",
                             "timed_out",
                             "blocked",
+                            "review_approved",
+                            "review_changes_requested",
+                            "review_escalation",
                         }
                         _wake_kinds = {
                             ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS
@@ -637,6 +660,12 @@ class GatewayKanbanWatchersMixin:
                                         _parts.append(t("gateway.kanban.wake.timed_out"))
                                     if "blocked" in _wake_kinds:
                                         _parts.append(t("gateway.kanban.wake.blocked"))
+                                    if "review_approved" in _wake_kinds:
+                                        _parts.append("review approved")
+                                    if "review_changes_requested" in _wake_kinds:
+                                        _parts.append("review requested changes")
+                                    if "review_escalation" in _wake_kinds:
+                                        _parts.append("review needs human attention")
                                     _status = (
                                         t("gateway.kanban.wake.status_joiner").join(_parts)
                                         or t("gateway.kanban.wake.status_default")

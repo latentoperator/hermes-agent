@@ -294,3 +294,126 @@ def test_non_review_gate_card_does_not_create_fallback(
         assert blocked
         # No fallback because created_by != REVIEW_GATE_CREATED_BY
         assert kb.child_ids(conn, task_id) == []
+
+
+def test_review_required_block_creates_ready_closed_loop_review_card(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    repo = root / "demo-repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="implement closed loop feature",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: branch pushed")
+        source = kb.get_task(conn, source_id)
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+
+    assert source is not None
+    assert source.status == "blocked"
+    assert len(reviews) == 1
+    review = reviews[0]
+    assert review.status == "ready"
+    assert review.assignee == "code-reviewer"
+    assert review.workspace_path == str(repo)
+    assert review.idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
+    assert f"Source task: {source_id}" in (review.body or "")
+
+
+def test_review_loop_approval_unblocks_source_task(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    repo = root / "demo-repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="implement approved feature",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: ready")
+        review = next(
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        )
+        assert kb.complete_task(
+            conn,
+            review.id,
+            summary="PASS: looks good",
+            metadata={"verdict": "approved"},
+        )
+        source = kb.get_task(conn, source_id)
+        comments = kb.list_comments(conn, source_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, source_id)]
+
+    assert source is not None
+    assert source.status == "ready"
+    assert any("approved" in comment.body for comment in comments)
+    assert "review_approved" in event_kinds
+
+
+def test_review_loop_allows_second_round_before_loop_breaker(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    repo = root / "demo-repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_MAX_ROUNDS", "2")
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="implement changes feature",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: round one")
+        review1 = next(
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        )
+        assert kb.complete_task(
+            conn,
+            review1.id,
+            summary="BLOCK: fix this",
+            metadata={"verdict": "changes_requested"},
+        )
+        assert kb.get_task(conn, source_id).status == "ready"
+        assert kb.block_task(conn, source_id, reason="review-required: round two")
+        source = kb.get_task(conn, source_id)
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+
+    assert source is not None
+    assert source.status == "blocked"
+    assert len(reviews) == 2
+    assert sorted(review.idempotency_key for review in reviews) == [
+        f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1",
+        f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:2",
+    ]
