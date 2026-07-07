@@ -169,25 +169,29 @@ def check_discord_outbound_allowed(
     thread_parent_channels = _id_set(block.get("thread_parent_channels"))
 
     if target_thread_id:
-        if target_thread_id in threads or _shared_thread_allowed(cfg, active_profile, target_thread_id):
+        if (
+            "*" in threads
+            or target_thread_id in threads
+            or _shared_thread_allowed(cfg, active_profile, target_thread_id)
+        ):
             return DiscordOutboundDecision(True, "thread allowlisted", active_profile, target_chat_id, target_thread_id, target_parent_channel_id)
-        if target_parent_channel_id and (
-            target_parent_channel_id in thread_parent_channels or "*" in thread_parent_channels
+        if "*" in thread_parent_channels or (
+            target_parent_channel_id and target_parent_channel_id in thread_parent_channels
         ):
             return DiscordOutboundDecision(True, "thread parent channel allowlisted", active_profile, target_chat_id, target_thread_id, target_parent_channel_id)
         return DiscordOutboundDecision(False, "thread not allowlisted", active_profile, target_chat_id, target_thread_id, target_parent_channel_id)
 
-    if target_chat_id in channels:
+    if "*" in channels or target_chat_id in channels:
         return DiscordOutboundDecision(True, "channel allowlisted", active_profile, target_chat_id, None)
 
     # Discord threads are channels at the API level.  Some send paths address a
     # thread directly as chat_id without separate metadata.thread_id, so honor
     # thread allowlist entries for the direct target ID as well.
-    if target_chat_id in threads or _shared_thread_allowed(cfg, active_profile, target_chat_id):
+    if "*" in threads or target_chat_id in threads or _shared_thread_allowed(cfg, active_profile, target_chat_id):
         return DiscordOutboundDecision(True, "thread allowlisted", active_profile, target_chat_id, None)
 
-    if target_parent_channel_id and (
-        target_parent_channel_id in thread_parent_channels or "*" in thread_parent_channels
+    if "*" in thread_parent_channels or (
+        target_parent_channel_id and target_parent_channel_id in thread_parent_channels
     ):
         return DiscordOutboundDecision(True, "thread parent channel allowlisted", active_profile, target_chat_id, None, target_parent_channel_id)
 
