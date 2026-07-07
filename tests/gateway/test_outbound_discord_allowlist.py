@@ -23,9 +23,10 @@ def _write_allowlist(tmp_path):
                     channels: ['111']
                     threads: ['222']
                     thread_parent_channels: ['777']
-                  dante:
-                    channels: ['333']
-                    threads: []
+                  wildcard:
+                    channels: ['*']
+                    threads: ['*']
+                    thread_parent_channels: ['*']
                 shared_threads:
                   decisions:
                     chat_id: '999'
@@ -100,6 +101,30 @@ def test_shared_thread_is_limited_to_configured_profiles(tmp_path, monkeypatch):
 
     assert check_discord_outbound_allowed("999", thread_id="444", profile="dante").allowed is True
     assert check_discord_outbound_allowed("999", thread_id="444", profile="wren").allowed is False
+
+
+def test_wildcard_profile_allows_any_channel_or_thread(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+
+    assert check_discord_outbound_allowed("random-channel", profile="wildcard").allowed is True
+    assert check_discord_outbound_allowed("random-channel", thread_id="random-thread", profile="wildcard").allowed is True
+    assert check_discord_outbound_allowed("direct-thread", profile="wildcard").allowed is True
+
+
+def test_thread_parent_wildcard_allows_thread_without_known_parent(tmp_path, monkeypatch):
+    cfg = _write_allowlist(tmp_path)
+    monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
+
+    decision = check_discord_outbound_allowed(
+        "private-thread",
+        thread_id="private-thread",
+        parent_channel_id=None,
+        profile="wildcard",
+    )
+
+    assert decision.allowed is True
+    assert decision.reason == "thread allowlisted"
 
 
 def test_disabled_profile_is_exempt(tmp_path, monkeypatch):
