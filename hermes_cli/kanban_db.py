@@ -3026,6 +3026,21 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                if initial_status == "blocked":
+                    # ``initial_status='blocked'`` is an intentional human/operator
+                    # gate. Mark it with the same sticky signal as ``block_task`` so
+                    # parent completion / dispatcher recompute cannot silently move
+                    # it into the runnable queue before an explicit unblock.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial_status=blocked",
+                            "kind": None,
+                            "source": "initial_status",
+                        },
+                    )
             if auto_review_gate:
                 should_review, gate = _should_create_review_gate(
                     title=title,

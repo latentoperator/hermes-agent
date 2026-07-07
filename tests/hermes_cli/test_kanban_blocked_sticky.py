@@ -29,6 +29,7 @@ landed via #28754 / #28781 ahead of this fix.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -46,6 +47,47 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
+
+
+# ---------------------------------------------------------------------------
+# Deliberately-created blocked tasks must be sticky
+# ---------------------------------------------------------------------------
+
+
+def test_initial_status_blocked_child_is_not_auto_promoted_after_parent_completion(kanban_home: Path) -> None:
+    """A child created with ``initial_status='blocked'`` is an intentional
+    human/operator gate, not a dependency wait. Parent completion must not
+    silently move it into the runnable queue."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="implementation")
+        child = kb.create_task(
+            conn,
+            title="approval gate",
+            body="requires exact operator approval before DB write",
+            parents=[parent],
+            initial_status="blocked",
+        )
+
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+        blocked_event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked' "
+            "ORDER BY id DESC LIMIT 1",
+            (child,),
+        ).fetchone()
+        assert blocked_event is not None
+        assert json.loads(blocked_event["payload"])["source"] == "initial_status"
+        kb.complete_task(conn, parent, result="implementation complete")
+
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
 
 
 # ---------------------------------------------------------------------------
