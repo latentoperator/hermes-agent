@@ -2611,7 +2611,7 @@ def _review_gate_config() -> dict[str, Any]:
         "max_runtime_seconds": gate.get("max_runtime_seconds", 30 * 60),
         "closed_loop_enabled": _env_bool(
             "HERMES_KANBAN_REVIEW_LOOP_ENABLED",
-            bool(gate.get("closed_loop_enabled", True)),
+            bool(gate.get("closed_loop_enabled", gate.get("enabled", False))),
         ),
         "closed_loop_max_rounds": int(
             os.environ.get(
@@ -2762,7 +2762,7 @@ def _maybe_create_review_loop_task(
     reason: Optional[str],
 ) -> Optional[str]:
     gate = _review_gate_config()
-    if not gate.get("enabled") or not gate.get("closed_loop_enabled"):
+    if not gate.get("closed_loop_enabled"):
         return None
     source = get_task(conn, source_task_id)
     if source is None:

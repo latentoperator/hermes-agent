@@ -417,3 +417,36 @@ def test_review_loop_allows_second_round_before_loop_breaker(tmp_path, monkeypat
         f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1",
         f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:2",
     ]
+
+
+def test_review_loop_can_run_without_create_time_review_gate(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    repo = root / "demo-repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="implementation should not get create-time review gate",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        after_create = kb.list_tasks(conn, include_archived=True)
+        assert [task for task in after_create if task.created_by == kb.REVIEW_GATE_CREATED_BY] == []
+
+        assert kb.block_task(conn, source_id, reason="review-required: PR ready")
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+
+    assert len(reviews) == 1
+    assert reviews[0].assignee == "code-reviewer"
+    assert reviews[0].idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
