@@ -231,6 +231,95 @@ def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
+def test_review_loop_records_latency_in_reviews_db_and_board_events(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo_root = tmp_path / "reviewed-repo"
+    repo_root.mkdir()
+    review_artifact = repo_root / ".code-reviews" / "review.md"
+    reviews_db = tmp_path / "reviews.db"
+    monkeypatch.setenv("HERMES_REVIEWS_DB", str(reviews_db))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(repo_root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+    now = [1_000.0]
+    monkeypatch.setattr(kb.time, "time", lambda: now[0])
+
+    with kb.connect() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="implementation needing review",
+            assignee="wren",
+            workspace_kind="dir",
+            workspace_path=str(repo_root),
+            auto_review_gate=False,
+        )
+        now[0] = 1_010.0
+        assert kb.block_task(conn, source_id, reason="review-required: verify it")
+        review_task_row = conn.execute(
+            "SELECT id FROM tasks WHERE created_by = ?",
+            (kb.REVIEW_LOOP_CREATED_BY,),
+        ).fetchone()
+        assert review_task_row is not None
+        review_id = review_task_row["id"]
+
+        now[0] = 1_130.0
+        assert kb.claim_task(conn, review_id) is not None
+        now[0] = 1_250.0
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="PASS review approved",
+            metadata={"verdict": "approved", "artifact_path": str(review_artifact)},
+        )
+        source_events = [
+            e for e in kb.list_events(conn, source_id)
+            if e.kind == "review_latency_recorded"
+        ]
+        review_events = [
+            e for e in kb.list_events(conn, review_id)
+            if e.kind == "review_latency_recorded"
+        ]
+
+    assert source_events
+    assert review_events
+    review_payload = review_events[-1].payload or {}
+    assert review_payload["review_dispatch_latency_seconds"] == 120.0
+    assert review_payload["review_runtime_seconds"] == 120.0
+    assert review_payload["source_to_review_completed_seconds"] == 240.0
+
+    with sqlite3.connect(reviews_db) as rconn:
+        rconn.row_factory = sqlite3.Row
+        row = rconn.execute(
+            """
+            SELECT status, completed_at, implementation_task_id,
+                   originating_assignee, artifact_path,
+                   review_task_created_at, review_task_started_at,
+                   review_task_completed_at, review_dispatch_latency_seconds,
+                   review_runtime_seconds, source_to_review_completed_seconds
+              FROM reviews
+             WHERE kanban_task_id = ?
+            """,
+            (review_id,),
+        ).fetchone()
+    row_dict = dict(row) if row is not None else None
+
+    assert row_dict is not None
+    assert row_dict["status"] == "approved"
+    assert row_dict["completed_at"] is not None
+    assert row_dict["implementation_task_id"] == source_id
+    assert row_dict["originating_assignee"] == "wren"
+    assert row_dict["artifact_path"] == str(review_artifact)
+    assert row_dict["review_task_created_at"] is not None
+    assert row_dict["review_task_started_at"] is not None
+    assert row_dict["review_task_completed_at"] is not None
+    assert row_dict["review_dispatch_latency_seconds"] == 120.0
+    assert row_dict["review_runtime_seconds"] == 120.0
+    assert row_dict["source_to_review_completed_seconds"] == 240.0
+
+
 def test_create_task_unknown_parent_errors(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="unknown parent"):
         kb.create_task(conn, title="orphan", parents=["t_ghost"])

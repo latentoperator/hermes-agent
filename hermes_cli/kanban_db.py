@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -403,6 +404,204 @@ def kanban_home() -> Path:
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
     return get_default_hermes_root()
+
+REVIEW_LEDGER_STATUSES = {
+    "pending", "running", "approved", "changes_requested", "commented", "blocked", "errored",
+}
+
+
+def _review_ledger_path() -> Path:
+    override = os.environ.get("HERMES_REVIEWS_DB", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return kanban_home() / "reviews" / "reviews.db"
+
+
+def _epoch_to_review_iso(value: Optional[int | float]) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _review_seconds(start: Optional[int | float], end: Optional[int | float]) -> Optional[float]:
+    if start is None or end is None:
+        return None
+    try:
+        return round(float(end) - float(start), 3)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ensure_review_ledger_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            source TEXT,
+            repo_path TEXT,
+            repo_url TEXT,
+            branch TEXT,
+            base_sha TEXT,
+            head_sha TEXT,
+            pr_url TEXT,
+            kanban_task_id TEXT,
+            hermes_session_id TEXT,
+            provider TEXT,
+            model TEXT,
+            verdict TEXT,
+            summary TEXT,
+            metadata_json TEXT,
+            implementation_task_id TEXT,
+            originating_assignee TEXT,
+            remediation_task_ids_json TEXT,
+            artifact_path TEXT,
+            source_blocked_at TEXT,
+            review_task_created_at TEXT,
+            review_task_started_at TEXT,
+            review_task_completed_at TEXT,
+            review_dispatch_latency_seconds REAL,
+            review_runtime_seconds REAL,
+            source_to_review_created_seconds REAL,
+            source_to_review_completed_seconds REAL
+        )
+    """)
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(reviews)")}
+    additions = {
+        "implementation_task_id": "implementation_task_id TEXT",
+        "originating_assignee": "originating_assignee TEXT",
+        "remediation_task_ids_json": "remediation_task_ids_json TEXT",
+        "artifact_path": "artifact_path TEXT",
+        "source_blocked_at": "source_blocked_at TEXT",
+        "review_task_created_at": "review_task_created_at TEXT",
+        "review_task_started_at": "review_task_started_at TEXT",
+        "review_task_completed_at": "review_task_completed_at TEXT",
+        "review_dispatch_latency_seconds": "review_dispatch_latency_seconds REAL",
+        "review_runtime_seconds": "review_runtime_seconds REAL",
+        "source_to_review_created_seconds": "source_to_review_created_seconds REAL",
+        "source_to_review_completed_seconds": "source_to_review_completed_seconds REAL",
+    }
+    for name, decl in additions.items():
+        if name not in cols:
+            conn.execute(f"ALTER TABLE reviews ADD COLUMN {decl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_kanban ON reviews(kanban_task_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_impl ON reviews(implementation_task_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reviews_latency_status ON reviews(status, review_task_created_at)")
+
+
+def _review_ledger_status_from_verdict(verdict: Optional[str], fallback: str = "commented") -> str:
+    value = str(verdict or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if value in {"approved", "approve", "pass", "passed", "lgtm"}:
+        return "approved"
+    if value in {"changes_requested", "request_changes", "block", "blocked", "warn", "warning"}:
+        return "changes_requested"
+    if value in {"cannot_review", "unable_to_review", "failed", "error", "errored"}:
+        return "errored"
+    return fallback if fallback in REVIEW_LEDGER_STATUSES else "commented"
+
+
+def _review_artifact_from_metadata(metadata: Optional[dict]) -> Optional[str]:
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("artifact_path", "review_artifact", "diff_path"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    artifacts = metadata.get("artifacts")
+    if isinstance(artifacts, (list, tuple)):
+        for value in artifacts:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _sync_review_ledger(conn: sqlite3.Connection, review_task_id: str, *, event: str, result: Optional[str] = None, summary: Optional[str] = None, metadata: Optional[dict] = None) -> Optional[dict]:
+    review_task = get_task(conn, review_task_id)
+    source_info = _review_loop_source_from_task(review_task)
+    if review_task is None or source_info is None:
+        return None
+    source_task_id, round_no = source_info
+    source = get_task(conn, source_task_id)
+    task_row = conn.execute("SELECT created_at, started_at, completed_at FROM tasks WHERE id = ?", (review_task_id,)).fetchone()
+    if task_row is None:
+        return None
+    blocked_row = conn.execute("""
+        SELECT created_at FROM task_events
+         WHERE task_id = ? AND kind IN ('blocked', 'review_loop_requested')
+         ORDER BY created_at ASC LIMIT 1
+    """, (source_task_id,)).fetchone()
+    source_blocked_at = int(blocked_row["created_at"]) if blocked_row else None
+    created_at = int(task_row["created_at"]) if task_row["created_at"] is not None else None
+    started_at = int(task_row["started_at"]) if task_row["started_at"] is not None else None
+    completed_at = int(task_row["completed_at"]) if task_row["completed_at"] is not None else None
+    verdict = _extract_review_loop_verdict(metadata=metadata, summary=summary, result=result) if event == "completed" else None
+    status = "running" if event == "claimed" else "pending"
+    if event == "completed":
+        status = _review_ledger_status_from_verdict(verdict)
+    payload = {
+        "review_task_id": review_task_id,
+        "source_task_id": source_task_id,
+        "round": round_no,
+        "event": event,
+        "review_dispatch_latency_seconds": _review_seconds(created_at, started_at),
+        "review_runtime_seconds": _review_seconds(started_at, completed_at),
+        "source_to_review_created_seconds": _review_seconds(source_blocked_at, created_at),
+        "source_to_review_completed_seconds": _review_seconds(source_blocked_at, completed_at),
+    }
+    ledger_path = _review_ledger_path()
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(str(ledger_path), timeout=5) as rconn:
+        rconn.row_factory = sqlite3.Row
+        _ensure_review_ledger_schema(rconn)
+        existing = rconn.execute("SELECT id FROM reviews WHERE kanban_task_id = ? ORDER BY id DESC LIMIT 1", (review_task_id,)).fetchone()
+        fields = {
+            "created_at": _epoch_to_review_iso(created_at) or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "completed_at": _epoch_to_review_iso(completed_at) if event == "completed" else None,
+            "status": status,
+            "source": "kanban",
+            "kanban_task_id": review_task_id,
+            "implementation_task_id": source_task_id,
+            "originating_assignee": source.assignee if source else None,
+            "provider": review_task.provider_override,
+            "model": review_task.model_override,
+            "verdict": verdict,
+            "summary": (summary if summary is not None else result),
+            "metadata_json": json.dumps(metadata, sort_keys=True) if isinstance(metadata, dict) else None,
+            "artifact_path": _review_artifact_from_metadata(metadata),
+            "source_blocked_at": _epoch_to_review_iso(source_blocked_at),
+            "review_task_created_at": _epoch_to_review_iso(created_at),
+            "review_task_started_at": _epoch_to_review_iso(started_at),
+            "review_task_completed_at": _epoch_to_review_iso(completed_at) if completed_at else None,
+            "review_dispatch_latency_seconds": payload["review_dispatch_latency_seconds"],
+            "review_runtime_seconds": payload["review_runtime_seconds"],
+            "source_to_review_created_seconds": payload["source_to_review_created_seconds"],
+            "source_to_review_completed_seconds": payload["source_to_review_completed_seconds"],
+        }
+        if existing:
+            assignments = ", ".join(f"{key} = ?" for key in fields)
+            rconn.execute(f"UPDATE reviews SET {assignments} WHERE id = ?", tuple(fields.values()) + (existing["id"],))
+        else:
+            columns = ", ".join(fields)
+            placeholders = ", ".join("?" for _ in fields)
+            rconn.execute(f"INSERT INTO reviews ({columns}) VALUES ({placeholders})", tuple(fields.values()))
+    return payload
+
+
+def _record_review_latency_event(conn: sqlite3.Connection, payload: Optional[dict]) -> None:
+    if not payload:
+        return
+    review_task_id = payload.get("review_task_id")
+    source_task_id = payload.get("source_task_id")
+    if not review_task_id:
+        return
+    with write_txn(conn):
+        _append_event(conn, str(review_task_id), "review_latency_recorded", payload)
+        if source_task_id and source_task_id != review_task_id:
+            _append_event(conn, str(source_task_id), "review_latency_recorded", payload)
 
 
 def boards_root() -> Path:
@@ -2831,6 +3030,10 @@ def _maybe_create_review_loop_task(
                 "review_loop_requested",
                 {"review_task_id": review_id, "round": round_no, "max_rounds": max_rounds},
             )
+    try:
+        _record_review_latency_event(conn, _sync_review_ledger(conn, review_id, event="created"))
+    except Exception:
+        _log.debug("failed to sync review latency creation for %s", review_id, exc_info=True)
     return review_id
 
 
@@ -4140,6 +4343,10 @@ def claim_task(
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
+    try:
+        _record_review_latency_event(conn, _sync_review_ledger(conn, task_id, event="claimed"))
+    except Exception:
+        _log.debug("failed to sync review latency claim for %s", task_id, exc_info=True)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
@@ -4222,7 +4429,12 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
-        return get_task(conn, task_id)
+        claimed = get_task(conn, task_id)
+    try:
+        _record_review_latency_event(conn, _sync_review_ledger(conn, task_id, event="claimed"))
+    except Exception:
+        _log.debug("failed to sync review latency claim for %s", task_id, exc_info=True)
+    return claimed
 
 
 def heartbeat_claim(
@@ -4835,6 +5047,20 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    try:
+        _record_review_latency_event(
+            conn,
+            _sync_review_ledger(
+                conn,
+                task_id,
+                event="completed",
+                result=result,
+                summary=summary,
+                metadata=metadata,
+            ),
+        )
+    except Exception:
+        _log.debug("failed to sync review latency completion for %s", task_id, exc_info=True)
     try:
         _apply_review_loop_outcome(
             conn,
