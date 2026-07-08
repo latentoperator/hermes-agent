@@ -755,31 +755,41 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
     monkeypatch.delenv("MY_BSM_KEY", raising=False)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("DANTE_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("UNUSED_KEY", raising=False)
 
     called = {"n": 0}
-    def fake_apply(**kwargs):
+
+    def fake_fetch(**kwargs):
         called["n"] += 1
-        assert kwargs["enabled"] is True
         assert kwargs["project_id"] == "proj-1"
-        assert kwargs["override_existing"] is False
-        assert kwargs["aliases"] == {"DANTE_TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN"}
-        assert kwargs["include_keys"] == ["DANTE_TELEGRAM_BOT_TOKEN", "MY_BSM_KEY"]
-        os.environ["MY_BSM_KEY"] = "from-bsm"
-        return bw.FetchResult(
-            secrets={"MY_BSM_KEY": "from-bsm"},
-            applied=["MY_BSM_KEY"],
-        )
+        return {
+            "DANTE_TELEGRAM_BOT_TOKEN": "from-bsm",
+            "MY_BSM_KEY": "from-bsm",
+            "UNUSED_KEY": "skip-me",
+        }, []
 
     monkeypatch.setattr(
-        "agent.secret_sources.bitwarden.apply_bitwarden_secrets",
-        fake_apply,
+        "agent.secret_sources.bitwarden.find_bws",
+        lambda **_kw: Path("/fake/bws"),
     )
+    monkeypatch.setattr(
+        "agent.secret_sources.bitwarden.fetch_bitwarden_secrets",
+        fake_fetch,
+    )
+    from agent.secret_sources import registry as reg_module
+
+    reg_module._reset_registry_for_tests()
 
     from hermes_cli.env_loader import _apply_external_secret_sources
     _apply_external_secret_sources(home)
 
     assert called["n"] == 1
     assert os.environ.get("MY_BSM_KEY") == "from-bsm"
+    assert os.environ.get("TELEGRAM_BOT_TOKEN") == "from-bsm"
+    assert os.environ.get("DANTE_TELEGRAM_BOT_TOKEN") is None
+    assert os.environ.get("UNUSED_KEY") is None
 
 
 # ---------------------------------------------------------------------------
