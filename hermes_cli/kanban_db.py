@@ -2633,6 +2633,116 @@ def _path_is_under(path: str | Path, root: str | Path) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class ReviewSource:
+    repo_path: str
+    branch: Optional[str] = None
+    head_sha: Optional[str] = None
+    pr_url: Optional[str] = None
+    changed_files: tuple[str, ...] = ()
+    tests_run: tuple[str, ...] = ()
+
+
+def _string_list(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return (stripped,) if stripped else ()
+    if isinstance(value, (list, tuple)):
+        return tuple(str(v).strip() for v in value if str(v).strip())
+    return ()
+
+
+def _review_source_from_mapping(raw: Any, gate: dict[str, Any]) -> Optional[ReviewSource]:
+    if not isinstance(raw, dict):
+        return None
+    source = raw.get("review_source") or raw.get("review_required_source") or raw.get("source")
+    if isinstance(source, dict):
+        raw = source
+    repo_raw = (
+        raw.get("repo_path")
+        or raw.get("workspace_path")
+        or raw.get("worktree")
+        or raw.get("path")
+        or raw.get("repo")
+    )
+    if not repo_raw:
+        return None
+    try:
+        repo_path = Path(str(repo_raw).strip()).expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    if not repo_path.exists():
+        return None
+    if not any(_path_is_under(repo_path, root) for root in gate.get("roots", [])):
+        return None
+    return ReviewSource(
+        repo_path=str(repo_path),
+        branch=str(raw.get("branch") or "").strip() or None,
+        head_sha=str(raw.get("head_sha") or raw.get("commit") or "").strip() or None,
+        pr_url=str(raw.get("pr_url") or raw.get("pr") or "").strip() or None,
+        changed_files=_string_list(raw.get("changed_files")),
+        tests_run=_string_list(raw.get("tests_run") or raw.get("verification")),
+    )
+
+
+def _json_candidates_from_text(text: str) -> list[Any]:
+    candidates: list[Any] = []
+    for match in re.finditer(r"```(?:json)?\s*(.*?)```", text or "", re.IGNORECASE | re.DOTALL):
+        try:
+            candidates.append(json.loads(match.group(1).strip()))
+        except Exception:
+            pass
+    stripped = (text or "").strip()
+    if stripped.startswith("{"):
+        try:
+            candidates.append(json.loads(stripped))
+        except Exception:
+            pass
+    return candidates
+
+
+def _structured_review_source_from_comments(
+    conn: sqlite3.Connection,
+    source: Task,
+    gate: dict[str, Any],
+) -> Optional[ReviewSource]:
+    """Return a trusted structured review source from recent source comments.
+
+    Scratch workspaces are intentionally disposable.  To let a scratch source
+    task enter the closed-loop review path, the source owner must leave a JSON
+    handoff with a `review_source` object naming an allowed repo path.  We do
+    not infer from loose prose paths or PR URLs.
+    """
+    trusted_authors = {"worker"}
+    if source.assignee:
+        trusted_authors.add(str(source.assignee).strip())
+    if source.created_by:
+        trusted_authors.add(str(source.created_by).strip())
+    for comment in reversed(list_comments(conn, source.id)):
+        if comment.author not in trusted_authors:
+            continue
+        for candidate in reversed(_json_candidates_from_text(comment.body or "")):
+            review_source = _review_source_from_mapping(candidate, gate)
+            if review_source is not None:
+                return review_source
+    return None
+
+
+def _review_source_for_review_loop(
+    conn: sqlite3.Connection,
+    source: Task,
+    gate: dict[str, Any],
+) -> Optional[ReviewSource]:
+    if source.workspace_kind in {"dir", "worktree"} and source.workspace_path:
+        path = Path(source.workspace_path).expanduser().resolve(strict=False)
+        if path.exists() and any(_path_is_under(path, root) for root in gate.get("roots", [])):
+            return ReviewSource(repo_path=str(path), branch=source.branch_name)
+        return None
+    if source.workspace_kind == "scratch":
+        return _structured_review_source_from_comments(conn, source, gate)
+    return None
+
+
 def _should_create_review_gate(
     *,
     title: str,
@@ -2737,14 +2847,15 @@ def _review_loop_source_from_task(task: Optional[Task]) -> Optional[tuple[str, i
     return None
 
 
-def _review_loop_body(source: Task, round_no: int, max_rounds: int) -> str:
-    return (
+def _review_loop_body(source: Task, round_no: int, max_rounds: int, review_source: ReviewSource) -> str:
+    body = (
         "Run closed-loop code review for the blocked source task.\n\n"
         f"Source task: {source.id}\n"
         f"Source title: {source.title}\n"
         f"Review round: {round_no}/{max_rounds}\n"
         f"Workspace: {source.workspace_path or ''}\n"
-        f"Branch: {source.branch_name or ''}\n\n"
+        f"Review source: {review_source.repo_path}\n"
+        f"Branch: {review_source.branch or source.branch_name or ''}\n\n"
         "Read the source task comments and handoff evidence first. Review the changed diff, "
         "test output, and operational risk for merge/deploy/production handoff. This path is "
         "for genuine review-worthy dev work (PRs before merge, deployment-impacting changes, "
@@ -2754,6 +2865,15 @@ def _review_loop_body(source: Task, round_no: int, max_rounds: int) -> str:
         "approved, changes_requested, cannot_review. If metadata is unavailable, start the "
         "summary with PASS, BLOCK, WARN, or CANNOT_REVIEW. Do not edit the implementation."
     )
+    if review_source.pr_url:
+        body += f"\nPR: {review_source.pr_url}"
+    if review_source.head_sha:
+        body += f"\nHead SHA: {review_source.head_sha}"
+    if review_source.changed_files:
+        body += "\nChanged files: " + ", ".join(review_source.changed_files)
+    if review_source.tests_run:
+        body += "\nTests/verification from handoff: " + "; ".join(review_source.tests_run)
+    return body
 
 
 def _maybe_create_review_loop_task(
@@ -2767,9 +2887,8 @@ def _maybe_create_review_loop_task(
     source = get_task(conn, source_task_id)
     if source is None:
         return None
-    if source.workspace_kind not in {"dir", "worktree"} or not source.workspace_path:
-        return None
-    if not any(_path_is_under(source.workspace_path, root) for root in gate.get("roots", [])):
+    review_source = _review_source_for_review_loop(conn, source, gate)
+    if review_source is None:
         return None
     max_rounds = max(1, int(gate.get("closed_loop_max_rounds") or DEFAULT_REVIEW_LOOP_MAX_ROUNDS))
     existing_rounds = _review_loop_rounds_created(conn, source_task_id)
@@ -2792,12 +2911,12 @@ def _maybe_create_review_loop_task(
     review_id = create_task(
         conn,
         title=f"review loop r{round_no}: {source.title}",
-        body=_review_loop_body(source, round_no, max_rounds),
+        body=_review_loop_body(source, round_no, max_rounds, review_source),
         assignee=str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
         created_by=REVIEW_LOOP_CREATED_BY,
-        workspace_kind=source.workspace_kind,
-        workspace_path=source.workspace_path,
-        branch_name=source.branch_name,
+        workspace_kind=(source.workspace_kind if source.workspace_kind in {"dir", "worktree"} else "dir"),
+        workspace_path=review_source.repo_path,
+        branch_name=(source.branch_name if source.workspace_kind == "worktree" else None),
         tenant=source.tenant,
         priority=source.priority,
         idempotency_key=idem,
@@ -2874,12 +2993,21 @@ def _metadata_review_source_task_id(metadata: Optional[dict]) -> Optional[str]:
         return None
     candidates: list[Any] = [
         metadata.get("source_task_id"),
+        metadata.get("source_task"),
+        metadata.get("implementation_task"),
+        metadata.get("implementation_task_id"),
         metadata.get("review_source_task_id"),
         metadata.get("review_required_source_task_id"),
     ]
     nested = metadata.get("review")
     if isinstance(nested, dict):
-        candidates.extend([nested.get("source_task_id"), nested.get("task_id")])
+        candidates.extend([
+            nested.get("source_task_id"),
+            nested.get("source_task"),
+            nested.get("implementation_task"),
+            nested.get("implementation_task_id"),
+            nested.get("task_id"),
+        ])
     for raw in candidates:
         if raw is None:
             continue

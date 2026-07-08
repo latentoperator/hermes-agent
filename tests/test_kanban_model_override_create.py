@@ -452,6 +452,95 @@ def test_review_loop_can_run_without_create_time_review_gate(tmp_path, monkeypat
     assert reviews[0].idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
 
 
+def test_review_loop_uses_structured_review_source_for_scratch_card(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    repo = root / "gathings-agent"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="Dante PR follow-up in scratch",
+            assignee="dante",
+            workspace_kind="scratch",
+            auto_review_gate=False,
+        )
+        kb.add_comment(
+            conn,
+            source_id,
+            "dante",
+            "review-required handoff:\n```json\n"
+            + json.dumps(
+                {
+                    "review_source": {
+                        "repo_path": str(repo),
+                        "branch": "dante/gathings-deploy-runner",
+                        "head_sha": "abc123",
+                        "pr_url": "https://github.com/latentoperator/gathings-agent/pull/92",
+                        "changed_files": ["scripts/deploy.sh"],
+                        "tests_run": ["bash -n scripts/deploy.sh"],
+                    }
+                }
+            )
+            + "\n```",
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: PR ready")
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+
+    assert len(reviews) == 1
+    review = reviews[0]
+    assert review.status == "ready"
+    assert review.assignee == "code-reviewer"
+    assert review.workspace_kind == "dir"
+    assert review.workspace_path == str(repo)
+    assert review.idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
+    assert f"Source task: {source_id}" in (review.body or "")
+    assert f"Review source: {repo}" in (review.body or "")
+    assert "dante/gathings-deploy-runner" in (review.body or "")
+
+
+def test_review_loop_ignores_scratch_review_source_outside_allowed_roots(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    external_repo = tmp_path / "other" / "repo"
+    external_repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="scratch card with untrusted repo",
+            assignee="dante",
+            workspace_kind="scratch",
+            auto_review_gate=False,
+        )
+        kb.add_comment(
+            conn,
+            source_id,
+            "dante",
+            json.dumps({"review_source": {"repo_path": str(external_repo)}}),
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: PR ready")
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+
+    assert reviews == []
+
+
 def _configure_explicit_review_test(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -572,3 +661,39 @@ def test_non_review_task_cannot_spoof_explicit_review_unblock(tmp_path, monkeypa
     assert source is not None
     assert source.status == "blocked"
     assert "review_approved" not in event_kinds
+
+
+def test_explicit_review_accepts_implementation_task_metadata_key(tmp_path, monkeypatch):
+    _configure_explicit_review_test(tmp_path, monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, review_id = _make_blocked_source_and_explicit_review(conn)
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="PASS: explicit review approved",
+            metadata={"implementation_task": source_id, "verdict": "approved"},
+        )
+        source = kb.get_task(conn, source_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, source_id)]
+
+    assert source is not None
+    assert source.status == "ready"
+    assert "review_approved" in event_kinds
+
+
+def test_explicit_review_accepts_source_task_metadata_key(tmp_path, monkeypatch):
+    _configure_explicit_review_test(tmp_path, monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, review_id = _make_blocked_source_and_explicit_review(conn)
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="PASS: explicit review approved",
+            metadata={"source_task": source_id, "verdict": "approved"},
+        )
+        source = kb.get_task(conn, source_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, source_id)]
+
+    assert source is not None
+    assert source.status == "ready"
+    assert "review_approved" in event_kinds
