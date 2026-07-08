@@ -150,6 +150,22 @@ REVIEW_GATE_CREATED_BY = "hopewell-dev-review-gate"
 REVIEW_LOOP_CREATED_BY = "kanban-review-loop"
 REVIEW_LOOP_IDEMPOTENCY_PREFIX = "review-loop"
 DEFAULT_REVIEW_LOOP_MAX_ROUNDS = 2
+DEFAULT_REVIEW_GOAL_MAX_TURNS = 3
+DEFAULT_REVIEW_GOAL_CONTRACT_FILES = (
+    "REVIEW-RULES.md",
+    "RUNBOOK.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".cursorrules",
+    "docs/REVIEW-RULES.md",
+    "docs/RUNBOOK.md",
+    ".github/REVIEW-RULES.md",
+    ".github/RUNBOOK.md",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/pull_request_template.md",
+    ".github/copilot-instructions.md",
+    ".github/instructions/*.instructions.md",
+)
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -2570,6 +2586,20 @@ def _review_gate_config() -> dict[str, Any]:
         else:
             skills = list(DEFAULT_REVIEW_GATE_SKILLS)
 
+    raw_goal_contract_files = os.environ.get("HERMES_KANBAN_REVIEW_GOAL_CONTRACT_FILES")
+    if raw_goal_contract_files is not None:
+        goal_contract_files = [
+            p.strip() for p in raw_goal_contract_files.split(os.pathsep) if p.strip()
+        ]
+    else:
+        configured_goal_contract_files = gate.get("goal_contract_files")
+        if isinstance(configured_goal_contract_files, (list, tuple)):
+            goal_contract_files = [
+                str(p).strip() for p in configured_goal_contract_files if str(p).strip()
+            ]
+        else:
+            goal_contract_files = list(DEFAULT_REVIEW_GOAL_CONTRACT_FILES)
+
     raw_provider = os.environ.get("HERMES_KANBAN_REVIEW_GATE_PROVIDER")
     if raw_provider is None:
         provider = _optional_model(gate.get("provider"))
@@ -2620,6 +2650,18 @@ def _review_gate_config() -> dict[str, Any]:
             )
             or DEFAULT_REVIEW_LOOP_MAX_ROUNDS
         ),
+        "goal_loop_enabled": _env_bool(
+            "HERMES_KANBAN_REVIEW_GOAL_LOOP_ENABLED",
+            bool(gate.get("goal_loop_enabled", True)),
+        ),
+        "goal_loop_max_turns": int(
+            os.environ.get(
+                "HERMES_KANBAN_REVIEW_GOAL_MAX_TURNS",
+                gate.get("goal_loop_max_turns", DEFAULT_REVIEW_GOAL_MAX_TURNS),
+            )
+            or DEFAULT_REVIEW_GOAL_MAX_TURNS
+        ),
+        "goal_contract_files": goal_contract_files,
     }
 
 
@@ -2741,6 +2783,84 @@ def _review_source_for_review_loop(
     if source.workspace_kind == "scratch":
         return _structured_review_source_from_comments(conn, source, gate)
     return None
+
+
+def _review_contract_exists(repo_path: Optional[str], gate: dict[str, Any]) -> bool:
+    """Return true when a repo/workspace exposes a review/runbook contract.
+
+    Goal-mode review cards should be reserved for code-review work with durable
+    project-specific acceptance criteria.  We intentionally check only local
+    checkout files under a small configurable candidate set rather than treating
+    every repository or every GitHub workflow as a runbook.
+    """
+    if not repo_path:
+        return False
+    try:
+        root = Path(repo_path).expanduser().resolve(strict=False)
+    except OSError:
+        return False
+    if not root.exists():
+        return False
+    for raw in gate.get("goal_contract_files") or DEFAULT_REVIEW_GOAL_CONTRACT_FILES:
+        rel = str(raw or "").strip().lstrip("/")
+        if not rel or rel.startswith(".."):
+            continue
+        try:
+            matches = list(root.glob(rel)) if any(ch in rel for ch in "*?[") else [root / rel]
+        except (OSError, ValueError):
+            continue
+        if any(path.is_file() for path in matches):
+            return True
+    return False
+
+
+def _looks_like_code_review_task(
+    *,
+    title: str,
+    created_by: Optional[str],
+    assignee: Optional[str],
+    skills: Optional[list[str]],
+    gate: dict[str, Any],
+) -> bool:
+    if created_by in {REVIEW_GATE_CREATED_BY, REVIEW_LOOP_CREATED_BY}:
+        return True
+    review_skills = {
+        str(s).strip()
+        for s in (gate.get("skills") or DEFAULT_REVIEW_GATE_SKILLS)
+        if str(s).strip()
+    }
+    skill_names = {str(s).strip() for s in (skills or []) if str(s).strip()}
+    if skill_names.intersection(review_skills):
+        return True
+    review_assignee = str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE).strip()
+    if review_assignee and (assignee or "").strip() == review_assignee:
+        return True
+    lower_title = (title or "").strip().lower()
+    return lower_title.startswith(("review:", "code review:", "review ", "review loop "))
+
+
+def _should_enable_review_goal_loop(
+    *,
+    title: str,
+    created_by: Optional[str],
+    assignee: Optional[str],
+    workspace_path: Optional[str],
+    skills: Optional[list[str]],
+) -> tuple[bool, Optional[int]]:
+    gate = _review_gate_config()
+    if not gate.get("goal_loop_enabled"):
+        return False, None
+    if not _looks_like_code_review_task(
+        title=title,
+        created_by=created_by,
+        assignee=assignee,
+        skills=skills,
+        gate=gate,
+    ):
+        return False, None
+    if not _review_contract_exists(workspace_path, gate):
+        return False, None
+    return True, max(1, int(gate.get("goal_loop_max_turns") or DEFAULT_REVIEW_GOAL_MAX_TURNS))
 
 
 def _should_create_review_gate(
@@ -3560,6 +3680,22 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                effective_goal_mode = bool(goal_mode)
+                effective_goal_max_turns = (
+                    int(goal_max_turns) if goal_max_turns is not None else None
+                )
+                if not effective_goal_mode:
+                    auto_goal, auto_goal_max_turns = _should_enable_review_goal_loop(
+                        title=title,
+                        created_by=created_by,
+                        assignee=assignee,
+                        workspace_path=effective_workspace_path,
+                        skills=skills_list,
+                    )
+                    if auto_goal:
+                        effective_goal_mode = True
+                        effective_goal_max_turns = auto_goal_max_turns
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3590,8 +3726,8 @@ def create_task(
                         model_override,
                         reasoning_override,
                         int(max_retries) if max_retries is not None else None,
-                        1 if goal_mode else 0,
-                        int(goal_max_turns) if goal_max_turns is not None else None,
+                        1 if effective_goal_mode else 0,
+                        effective_goal_max_turns,
                         session_id,
                     ),
                 )
@@ -3616,7 +3752,7 @@ def create_task(
                         "provider_override": provider_override,
                         "model_override": model_override,
                         "reasoning_override": reasoning_override,
-                        "goal_mode": bool(goal_mode) or None,
+                        "goal_mode": bool(effective_goal_mode) or None,
                     },
                 )
                 if initial_status == "blocked":

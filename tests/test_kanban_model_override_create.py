@@ -63,6 +63,57 @@ def test_hopewell_dev_task_creates_dependent_default_model_review_card(tmp_path,
         assert kb.parent_ids(conn, review.id) == [task_id]
 
 
+def test_review_gate_card_gets_goal_mode_when_repo_has_review_contract(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    repo = root / "demo-repo"
+    repo.mkdir(parents=True)
+    (repo / "REVIEW-RULES.md").write_text("Run the project review checklist.\n")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="implement demo feature",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        review = kb.get_task(conn, kb.child_ids(conn, task_id)[0])
+
+    assert review is not None
+    assert review.created_by == kb.REVIEW_GATE_CREATED_BY
+    assert review.goal_mode is True
+    assert review.goal_max_turns == 3
+
+
+def test_review_gate_card_stays_one_shot_without_review_contract(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    repo = root / "demo-repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="implement demo feature",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+        )
+        review = kb.get_task(conn, kb.child_ids(conn, task_id)[0])
+
+    assert review is not None
+    assert review.created_by == kb.REVIEW_GATE_CREATED_BY
+    assert review.goal_mode is False
+    assert review.goal_max_turns is None
+
+
 def test_non_hopewell_dev_task_does_not_create_review_card(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     root = tmp_path / "hopewell-dev"
@@ -331,6 +382,70 @@ def test_review_required_block_creates_ready_closed_loop_review_card(tmp_path, m
     assert review.workspace_path == str(repo)
     assert review.idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
     assert f"Source task: {source_id}" in (review.body or "")
+
+
+def test_review_loop_card_gets_goal_mode_when_repo_has_review_contract(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    repo = root / "demo-repo"
+    repo.mkdir(parents=True)
+    (repo / ".github").mkdir()
+    (repo / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text("Review checklist\n")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="implement closed loop feature",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: branch pushed")
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+
+    assert len(reviews) == 1
+    review = reviews[0]
+    assert review.goal_mode is True
+    assert review.goal_max_turns == 3
+
+
+def test_review_loop_card_stays_one_shot_without_review_contract(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    repo = root / "demo-repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="implement closed loop feature",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: branch pushed")
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+
+    assert len(reviews) == 1
+    review = reviews[0]
+    assert review.goal_mode is False
+    assert review.goal_max_turns is None
 
 
 def test_review_loop_approval_unblocks_source_task(tmp_path, monkeypatch):
