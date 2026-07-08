@@ -2842,8 +2842,13 @@ def _extract_review_loop_verdict(
 ) -> str:
     if isinstance(metadata, dict):
         raw = metadata.get("verdict") or metadata.get("review_verdict")
+        nested = metadata.get("review")
+        if raw is None and isinstance(nested, dict):
+            raw = nested.get("verdict") or nested.get("review_verdict")
         if raw is None and "approved" in metadata:
             return "approved" if bool(metadata.get("approved")) else "changes_requested"
+        if raw is None and isinstance(nested, dict) and "approved" in nested:
+            return "approved" if bool(nested.get("approved")) else "changes_requested"
         if raw is not None:
             value = str(raw).strip().lower().replace("-", "_").replace(" ", "_")
             if value in {"approved", "approve", "pass", "passed", "lgtm"}:
@@ -2861,6 +2866,183 @@ def _extract_review_loop_verdict(
     if first.startswith(("cannot_review", "cannot review", "unable to review")):
         return "cannot_review"
     return "cannot_review"
+
+
+def _metadata_review_source_task_id(metadata: Optional[dict]) -> Optional[str]:
+    """Return the structured source task id from explicit review metadata."""
+    if not isinstance(metadata, dict):
+        return None
+    candidates: list[Any] = [
+        metadata.get("source_task_id"),
+        metadata.get("review_source_task_id"),
+        metadata.get("review_required_source_task_id"),
+    ]
+    nested = metadata.get("review")
+    if isinstance(nested, dict):
+        candidates.extend([nested.get("source_task_id"), nested.get("task_id")])
+    for raw in candidates:
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if re.fullmatch(r"t_[a-f0-9]{8,}", value):
+            return value
+    return None
+
+
+def _metadata_has_structured_review_verdict(metadata: Optional[dict]) -> bool:
+    """True when metadata, not prose, carries an explicit review verdict."""
+    if not isinstance(metadata, dict):
+        return False
+    if any(key in metadata for key in ("verdict", "review_verdict", "approved")):
+        return True
+    nested = metadata.get("review")
+    return isinstance(nested, dict) and any(
+        key in nested for key in ("verdict", "review_verdict", "approved")
+    )
+
+
+def _review_gate_source_from_task(conn: sqlite3.Connection, task: Task) -> Optional[str]:
+    """Resolve the source for a review-gate card from durable task relations."""
+    idem = (task.idempotency_key or "").strip()
+    prefix = f"{REVIEW_GATE_CREATED_BY}:"
+    if idem.startswith(prefix):
+        candidate = idem[len(prefix):].split(":", 1)[0]
+        if re.fullmatch(r"t_[a-f0-9]{8,}", candidate):
+            return candidate
+    body = task.body or ""
+    m = re.search(r"^Parent task:\s*(t_[a-f0-9]{8,})\s*$", body, re.MULTILINE)
+    if m:
+        return m.group(1)
+    parents = parent_ids(conn, task.id)
+    if len(parents) == 1 and re.fullmatch(r"t_[a-f0-9]{8,}", parents[0]):
+        return parents[0]
+    return None
+
+
+def _explicit_review_source_from_task(
+    conn: sqlite3.Connection,
+    task: Optional[Task],
+    metadata: Optional[dict],
+) -> Optional[str]:
+    """Resolve a source task for non-loop review cards with a safe contract.
+
+    Closed-loop cards are handled by ``_apply_review_loop_outcome``.  This
+    helper covers explicit/manual review cards without letting arbitrary tasks
+    spoof an approval: a source id must be structured metadata and the review
+    card must itself look like a review surface (review-gate created, assigned
+    to the configured review assignee, or carrying review skills).
+    """
+    if task is None or task.created_by == REVIEW_LOOP_CREATED_BY:
+        return None
+    source_task_id = _metadata_review_source_task_id(metadata)
+    if source_task_id is None and task.created_by == REVIEW_GATE_CREATED_BY:
+        source_task_id = _review_gate_source_from_task(conn, task)
+    if source_task_id is None:
+        return None
+    if not _metadata_has_structured_review_verdict(metadata):
+        return None
+
+    gate = _review_gate_config()
+    review_assignee = str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE).strip()
+    skill_names = set(task.skills or [])
+    review_skills = {str(s).strip() for s in (gate.get("skills") or DEFAULT_REVIEW_GATE_SKILLS) if str(s).strip()}
+
+    trusted = False
+    if task.created_by == REVIEW_GATE_CREATED_BY:
+        trusted = True
+    elif review_assignee and (task.assignee or "").strip() == review_assignee:
+        trusted = True
+    elif bool(skill_names.intersection(review_skills)):
+        trusted = True
+    if not trusted:
+        return None
+    return source_task_id
+
+
+def _record_source_review_outcome(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    review_task: Task,
+    verdict: str,
+    line: str,
+    round_no: Optional[int] = None,
+    actor: str,
+) -> None:
+    round_label = f" round {round_no}" if round_no else ""
+    suffix = f"\n{line}" if line else ""
+    if verdict == "approved":
+        body = (
+            f"Review{round_label} approved by "
+            f"{review_task.assignee or 'reviewer'} via {review_task.id}."
+            f"{suffix}"
+        )
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (source_task_id, actor, body, int(time.time())),
+            )
+            _append_event(
+                conn,
+                source_task_id,
+                "review_approved",
+                {"review_task_id": review_task.id, "round": round_no, "summary": line or None},
+            )
+        unblock_task(conn, source_task_id)
+        return
+    if verdict == "changes_requested":
+        body = f"Review{round_label} requested changes via {review_task.id}.{suffix}"
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (source_task_id, actor, body, int(time.time())),
+            )
+            _append_event(
+                conn,
+                source_task_id,
+                "review_changes_requested",
+                {"review_task_id": review_task.id, "round": round_no, "summary": line or None},
+            )
+        unblock_task(conn, source_task_id)
+        return
+    with write_txn(conn):
+        body = f"Review{round_label} could not complete via {review_task.id}.{suffix}"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (source_task_id, actor, body, int(time.time())),
+        )
+        _append_event(
+            conn,
+            source_task_id,
+            "review_escalation",
+            {"review_task_id": review_task.id, "round": round_no, "verdict": verdict, "summary": line or None},
+        )
+
+
+def _apply_explicit_review_outcome(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> None:
+    review_task = get_task(conn, review_task_id)
+    source_task_id = _explicit_review_source_from_task(conn, review_task, metadata)
+    if review_task is None or source_task_id is None:
+        return
+    if get_task(conn, source_task_id) is None:
+        return
+    verdict = _extract_review_loop_verdict(metadata=metadata, summary=summary, result=result)
+    line = (summary or result or "").strip().splitlines()[0][:400]
+    _record_source_review_outcome(
+        conn,
+        source_task_id=source_task_id,
+        review_task=review_task,
+        verdict=verdict,
+        line=line,
+        actor=REVIEW_GATE_CREATED_BY if review_task.created_by == REVIEW_GATE_CREATED_BY else "explicit-review",
+    )
 
 
 def _apply_review_loop_outcome(
@@ -4962,6 +5144,16 @@ def complete_task(
         )
     except Exception:
         _log.debug("failed to apply closed-loop review outcome for %s", task_id, exc_info=True)
+    try:
+        _apply_explicit_review_outcome(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+        )
+    except Exception:
+        _log.debug("failed to apply explicit review outcome for %s", task_id, exc_info=True)
     return True
 
 

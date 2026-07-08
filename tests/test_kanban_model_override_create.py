@@ -450,3 +450,125 @@ def test_review_loop_can_run_without_create_time_review_gate(tmp_path, monkeypat
     assert len(reviews) == 1
     assert reviews[0].assignee == "code-reviewer"
     assert reviews[0].idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
+
+
+def _configure_explicit_review_test(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+
+def _make_blocked_source_and_explicit_review(conn, *, assignee="code-reviewer"):
+    source_id = kb.create_task(
+        conn,
+        title="implementation awaiting explicit review",
+        assignee="dante",
+        auto_review_gate=False,
+    )
+    assert kb.block_task(conn, source_id, reason="review-required: ready for explicit review")
+    review_id = kb.create_task(
+        conn,
+        title="review: implementation awaiting explicit review",
+        assignee=assignee,
+        auto_review_gate=False,
+    )
+    return source_id, review_id
+
+
+def test_explicit_review_metadata_approval_unblocks_source_task(tmp_path, monkeypatch):
+    _configure_explicit_review_test(tmp_path, monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, review_id = _make_blocked_source_and_explicit_review(conn)
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="PASS: explicit review approved",
+            metadata={"source_task_id": source_id, "verdict": "approved"},
+        )
+        source = kb.get_task(conn, source_id)
+        comments = kb.list_comments(conn, source_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, source_id)]
+
+    assert source is not None
+    assert source.status == "ready"
+    assert any(f"via {review_id}" in comment.body and "approved" in comment.body for comment in comments)
+    assert "review_approved" in event_kinds
+
+
+def test_explicit_review_metadata_changes_requested_unblocks_source_for_fixes(tmp_path, monkeypatch):
+    _configure_explicit_review_test(tmp_path, monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, review_id = _make_blocked_source_and_explicit_review(conn)
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="BLOCK: fix test coverage",
+            metadata={"review": {"source_task_id": source_id, "verdict": "changes_requested"}},
+        )
+        source = kb.get_task(conn, source_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, source_id)]
+
+    assert source is not None
+    assert source.status == "ready"
+    assert "review_changes_requested" in event_kinds
+
+
+def test_review_gate_relation_with_verdict_metadata_unblocks_source(tmp_path, monkeypatch):
+    _configure_explicit_review_test(tmp_path, monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, review_id = _make_blocked_source_and_explicit_review(conn)
+        conn.execute(
+            "UPDATE tasks SET created_by = ?, idempotency_key = ? WHERE id = ?",
+            (kb.REVIEW_GATE_CREATED_BY, f"{kb.REVIEW_GATE_CREATED_BY}:{source_id}", review_id),
+        )
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="PASS: gate relation approved",
+            metadata={"verdict": "approved"},
+        )
+        source = kb.get_task(conn, source_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, source_id)]
+
+    assert source is not None
+    assert source.status == "ready"
+    assert "review_approved" in event_kinds
+
+
+def test_explicit_review_metadata_cannot_review_leaves_source_blocked(tmp_path, monkeypatch):
+    _configure_explicit_review_test(tmp_path, monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, review_id = _make_blocked_source_and_explicit_review(conn)
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="CANNOT_REVIEW: no diff available",
+            metadata={"source_task_id": source_id, "verdict": "cannot_review"},
+        )
+        source = kb.get_task(conn, source_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, source_id)]
+
+    assert source is not None
+    assert source.status == "blocked"
+    assert "review_escalation" in event_kinds
+    assert "review_approved" not in event_kinds
+
+
+def test_non_review_task_cannot_spoof_explicit_review_unblock(tmp_path, monkeypatch):
+    _configure_explicit_review_test(tmp_path, monkeypatch)
+    with kb.connect_closing() as conn:
+        source_id, review_id = _make_blocked_source_and_explicit_review(conn, assignee="dante")
+        assert kb.complete_task(
+            conn,
+            review_id,
+            summary="PASS: pretending to approve",
+            metadata={"source_task_id": source_id, "verdict": "approved"},
+        )
+        source = kb.get_task(conn, source_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, source_id)]
+
+    assert source is not None
+    assert source.status == "blocked"
+    assert "review_approved" not in event_kinds
