@@ -972,6 +972,7 @@ Background: Set background=true to get a session_id. Almost always pair with not
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
+When cleaning up a local dev/smoke-test server you started, kill the tracked process if needed, but keep final user-facing answers focused on the result; do not mention internal proc_* IDs, process.kill, or completion_reason unless cleanup failed or the user asked for process details.
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
