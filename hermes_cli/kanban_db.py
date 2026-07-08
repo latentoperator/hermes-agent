@@ -6429,6 +6429,11 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
+# If a ready task keeps being deferred by the respawn guard after a deliberate
+# unblock, surface a separate event so operators can distinguish "correctly
+# waiting" from "review unblock did not actually make progress".
+_RESPAWN_GUARD_ALERT_SECONDS = 15 * 60
+
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)",
@@ -7695,6 +7700,85 @@ def _github_pr_is_open(
     return result
 
 
+def _latest_event_created_at(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kinds: Iterable[str],
+) -> int:
+    """Return the newest event timestamp for ``task_id`` among ``kinds``."""
+    kind_list = [k for k in kinds if k]
+    if not kind_list:
+        return 0
+    placeholders = ",".join("?" for _ in kind_list)
+    row = conn.execute(
+        f"SELECT MAX(created_at) FROM task_events "
+        f"WHERE task_id = ? AND kind IN ({placeholders})",
+        (task_id, *kind_list),
+    ).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _payload_reason_matches(payload_text: Optional[str], reason: str) -> bool:
+    """Return True when a task event payload carries ``reason``."""
+    if not payload_text:
+        return False
+    try:
+        payload = json.loads(payload_text)
+    except Exception:
+        return False
+    return isinstance(payload, dict) and payload.get("reason") == reason
+
+
+def _respawn_guard_age_alert_payload(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    now: int,
+) -> Optional[dict[str, Any]]:
+    """Build a guard-age alert payload when a post-unblock guard persists.
+
+    The alert is intentionally anchored to the latest ``unblocked`` event: old
+    guard history from before a review decision should not page the operator.
+    A matching ``respawn_guard_age_alert`` event suppresses duplicates for the
+    same post-unblock guarded span.
+    """
+    unblocked_at = _latest_event_created_at(conn, task_id, ["unblocked"])
+    if not unblocked_at:
+        return None
+
+    first_guarded_at = 0
+    already_alerted = False
+    for event in conn.execute(
+        "SELECT kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND created_at >= ? "
+        "AND kind IN ('respawn_guarded', 'respawn_guard_age_alert') "
+        "ORDER BY created_at ASC, id ASC",
+        (task_id, unblocked_at),
+    ):
+        if not _payload_reason_matches(event["payload"], reason):
+            continue
+        if event["kind"] == "respawn_guarded" and not first_guarded_at:
+            first_guarded_at = int(event["created_at"] or 0)
+        elif event["kind"] == "respawn_guard_age_alert":
+            already_alerted = True
+
+    if not first_guarded_at or already_alerted:
+        return None
+
+    age_seconds = max(0, int(now) - first_guarded_at)
+    if age_seconds < _RESPAWN_GUARD_ALERT_SECONDS:
+        return None
+
+    return {
+        "reason": reason,
+        "age_seconds": age_seconds,
+        "threshold_seconds": _RESPAWN_GUARD_ALERT_SECONDS,
+        "since_unblocked_at": unblocked_at,
+        "first_guarded_at": first_guarded_at,
+    }
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7737,12 +7821,14 @@ def check_respawn_guard(
         human review rather than immediately re-spawning.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a task comment, the last worker run is
-        within ``_RESPAWN_GUARD_PR_WINDOW`` seconds, and GitHub reports the
-        PR is still open (or the PR state cannot be checked). Merged/closed
-        PRs do not guard. The window is measured from the worker run, not
-        comment timestamps, so reviewer comments quoting a URL do not extend
-        the guard forever.
+        A GitHub PR URL appears in a task comment newer than the latest
+        deliberate unblock, the last worker run is within
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds, and GitHub reports the PR is
+        still open (or the PR state cannot be checked). Merged/closed PRs do
+        not guard. The window is measured from the worker run, not comment
+        timestamps, so reviewer comments quoting a URL do not extend the guard
+        forever. Ignoring PR comments at or before the latest unblock lets a
+        review-approved card respawn once even while its PR remains open.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -7819,10 +7905,16 @@ def check_respawn_guard(
     ).fetchone()
     latest_worker_run_at = int(latest_worker_run[0] or 0) if latest_worker_run else 0
     if latest_worker_run_at >= pr_cutoff:
+        latest_unblocked_at = _latest_event_created_at(conn, task_id, ["unblocked"])
         for c in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ?",
+            "SELECT body, created_at FROM task_comments WHERE task_id = ?",
             (task_id,),
         ).fetchall():
+            # A review/unblock decision supersedes PR URLs already known at
+            # unblock time. Only PR activity after that decision can re-arm the
+            # active-PR guard; otherwise approved cards stay stranded in ready.
+            if latest_unblocked_at and int(c["created_at"] or 0) <= latest_unblocked_at:
+                continue
             body = c["body"] or ""
             for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body):
                 is_open = _github_pr_is_open(match, cache=pr_state_cache)
@@ -8216,11 +8308,24 @@ def _dispatch_once_locked(
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
             if not dry_run:
+                now = int(time.time())
                 with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
+                    alert_payload = _respawn_guard_age_alert_payload(
+                        conn, row["id"], guard_reason, now=now
                     )
+                    payload = {"reason": guard_reason}
+                    if alert_payload is not None:
+                        payload["alert"] = "guard_persisted_after_unblock"
+                        payload["age_seconds"] = alert_payload["age_seconds"]
+                        payload["threshold_seconds"] = alert_payload["threshold_seconds"]
+                    _append_event(
+                        conn, row["id"], "respawn_guarded", payload
+                    )
+                    if alert_payload is not None:
+                        _append_event(
+                            conn, row["id"], "respawn_guard_age_alert",
+                            alert_payload,
+                        )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))

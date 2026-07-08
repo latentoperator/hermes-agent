@@ -1950,6 +1950,61 @@ def test_respawn_guard_reviewer_comment_does_not_refresh_pr_window(kanban_home, 
     assert reason is None
 
 
+def test_respawn_guard_active_pr_comment_before_unblock_not_guarded(
+    kanban_home, monkeypatch
+):
+    """A review unblock supersedes already-known PR comments so the card can respawn."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+    now = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review-approved", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 120, now - 90),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "PR: https://github.com/totemx-AI/subsidysmart/pull/42", now - 80),
+        )
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (t,))
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now - 60),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_active_pr_comment_after_unblock_still_guarded(
+    kanban_home, monkeypatch
+):
+    """New PR activity after an unblock re-arms the active-PR guard."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+    now = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="new-pr-after-unblock", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 120, now - 90),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now - 80),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "Updated PR: https://github.com/totemx-AI/subsidysmart/pull/42", now - 60),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
@@ -2065,6 +2120,81 @@ def test_dispatch_respawn_guard_skips_active_pr(
     assert t not in res.auto_blocked
     with kb.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_post_review_unblock_respawns_despite_open_pr(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """A reviewer unblock is a fresh decision; the old open PR must not strand ready."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    now = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review-approved", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 300, now - 120),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "Opened https://github.com/totemx-AI/subsidysmart/pull/99", now - 110),
+        )
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (t,))
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now - 60),
+        )
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (t,))
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert t in spawned_ids
+    assert not res.respawn_guarded
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+    assert task is not None
+    assert task.status == "running"
+
+
+def test_dispatch_respawn_guard_emits_age_alert_after_unblock(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """A post-unblock guard persisting past 15m emits a distinct alert event."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stuck-after-unblock", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("quota exceeded", t),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', NULL, ?)",
+            (t, now - kb._RESPAWN_GUARD_ALERT_SECONDS - 30),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'respawn_guarded', ?, ?)",
+            (t, '{"reason":"blocker_auth"}', now - kb._RESPAWN_GUARD_ALERT_SECONDS - 5),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events = kb.list_events(conn, t)
+
+    assert (t, "blocker_auth") in res.respawn_guarded
+    alerts = [e for e in events if e.kind == "respawn_guard_age_alert"]
+    assert len(alerts) == 1
+    payload = alerts[0].payload
+    assert payload is not None
+    assert payload["reason"] == "blocker_auth"
+    assert payload["age_seconds"] >= kb._RESPAWN_GUARD_ALERT_SECONDS
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
