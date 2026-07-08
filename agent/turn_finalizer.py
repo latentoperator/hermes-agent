@@ -27,6 +27,93 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
+def _kanban_budget_checkpoint_reason(api_call_count: int, max_iterations: int) -> str:
+    return (
+        f"checkpoint: iteration budget exhausted ({api_call_count}/{max_iterations}); "
+        "resumable code/worktree task blocked instead of marked timed_out"
+    )
+
+
+def _should_checkpoint_kanban_budget_exhaustion(task) -> bool:
+    """Return True for code-lane tasks where a summary is better than a blind retry.
+
+    Worktree tasks have durable git state to resume from. Dante is Hopewell's
+    coding executor lane, and its long code tasks are exactly the failure class
+    D2 targets. Other tasks keep the existing timed_out/circuit-breaker path so
+    non-code loops still produce a retry/failure signal.
+    """
+    if task is None:
+        return False
+    workspace_kind = (getattr(task, "workspace_kind", "") or "").strip().casefold()
+    assignee = (getattr(task, "assignee", "") or "").strip().casefold()
+    return workspace_kind == "worktree" or assignee == "dante"
+
+
+def _checkpoint_kanban_budget_exhaustion(
+    _kb,
+    conn,
+    task_id: str,
+    *,
+    final_response: str,
+    api_call_count: int,
+    max_iterations: int,
+    session_id: str | None,
+    logger,
+) -> bool:
+    """Block a resumable code task with a checkpoint comment.
+
+    Returns True only when the task state transition succeeded. Comment creation
+    is best-effort after the block; the blocked run summary is the durable
+    minimum needed for the board.
+    """
+    reason = _kanban_budget_checkpoint_reason(api_call_count, max_iterations)
+    raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    expected_run_id = None
+    if raw_run_id:
+        try:
+            expected_run_id = int(raw_run_id)
+        except ValueError:
+            expected_run_id = None
+
+    blocked = _kb.block_task(
+        conn,
+        task_id,
+        reason=reason,
+        kind="transient",
+        expected_run_id=expected_run_id,
+    )
+    if not blocked and expected_run_id is not None:
+        # The env run id is a guard, not a hard dependency; if it is stale or
+        # absent from an older dispatcher, retry without it before falling back
+        # to the timed_out failure path.
+        blocked = _kb.block_task(conn, task_id, reason=reason, kind="transient")
+    if not blocked:
+        return False
+
+    summary = (final_response or "").strip()
+    if len(summary) > 4000:
+        summary = summary[:4000] + "… [truncated]"
+    comment = (
+        "Iteration-budget checkpoint created automatically.\n\n"
+        f"Budget: {api_call_count}/{max_iterations} model calls.\n"
+        f"Session: {session_id or '(unknown)'}\n"
+        "Resume note: this was a code/worktree-lane task, so the worker "
+        "preserved the model's final summary instead of recording a timed_out "
+        "failure. Re-dispatch after reviewing the workspace/branch state.\n\n"
+        "Model summary at checkpoint:\n"
+        f"{summary or '(empty summary)'}"
+    )
+    try:
+        _kb.add_comment(conn, task_id, "worker", comment)
+    except Exception:
+        logger.warning(
+            "Failed to add budget-checkpoint comment for task %s",
+            task_id,
+            exc_info=True,
+        )
+    return True
+
+
 def finalize_turn(
     agent,
     *,
@@ -75,40 +162,57 @@ def finalize_turn(
         # _handle_max_iterations, so the model cannot call kanban_block
         # itself — we must do it on its behalf.
         #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the
-        # ``consecutive_failures`` counter and the dispatcher's
-        # ``failure_limit`` circuit breaker (#29747 gap 2).  Without this,
-        # a task whose worker keeps exhausting its budget would block
-        # silently each run, get auto-promoted by the operator (or never
-        # surface), and re-block in an endless loop with no signal.
+        # Non-code tasks keep the existing ``timed_out`` failure path so
+        # repeated budget exhaustion still trips the dispatcher's failure
+        # circuit breaker. Resumable code/worktree tasks instead get a
+        # checkpoint block with the final summary attached: they usually have
+        # useful branch/workspace state, and blindly killing/retrying them is
+        # the failure class D2 is meant to avoid.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
-                    _kb._record_task_failure(
-                        _conn,
-                        _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
-                    )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
+                    _task = _kb.get_task(_conn, _kanban_task)
+                    if _should_checkpoint_kanban_budget_exhaustion(_task) and (
+                        _checkpoint_kanban_budget_exhaustion(
+                            _kb,
+                            _conn,
+                            _kanban_task,
+                            final_response=final_response or "",
+                            api_call_count=api_call_count,
+                            max_iterations=agent.max_iterations,
+                            session_id=getattr(agent, "session_id", None),
+                            logger=logger,
+                        )
+                    ):
+                        logger.info(
+                            "checkpointed budget-exhausted code task %s (%d/%d)",
+                            _kanban_task, api_call_count, agent.max_iterations,
+                        )
+                    else:
+                        _kb._record_task_failure(
+                            _conn,
+                            _kanban_task,
+                            error=(
+                                f"Iteration budget exhausted "
+                                f"({api_call_count}/{agent.max_iterations}) — "
+                                "task could not complete within the allowed "
+                                "iterations"
+                            ),
+                            outcome="timed_out",
+                            release_claim=True,
+                            end_run=True,
+                            event_payload_extra={
+                                "budget_used": api_call_count,
+                                "budget_max": agent.max_iterations,
+                            },
+                        )
+                        logger.info(
+                            "recorded budget-exhausted failure for task %s (%d/%d)",
+                            _kanban_task, api_call_count, agent.max_iterations,
+                        )
                 finally:
                     try:
                         _conn.close()
@@ -116,7 +220,7 @@ def finalize_turn(
                         pass
             except Exception:
                 logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
+                    "Failed to record budget-exhausted outcome for task %s",
                     _kanban_task,
                     exc_info=True,
                 )
