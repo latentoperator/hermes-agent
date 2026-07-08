@@ -609,6 +609,7 @@ class CreateTaskBody(BaseModel):
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
+    supersedes: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
@@ -633,6 +634,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,
+            supersedes=payload.supersedes,
             triage=payload.triage,
             idempotency_key=payload.idempotency_key,
             max_runtime_seconds=payload.max_runtime_seconds,

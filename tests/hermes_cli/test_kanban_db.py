@@ -236,6 +236,83 @@ def test_create_task_unknown_parent_errors(kanban_home):
         kb.create_task(conn, title="orphan", parents=["t_ghost"])
 
 
+def test_create_task_with_explicit_supersedes_closes_blocked_original(kanban_home):
+    with kb.connect() as conn:
+        original = kb.create_task(
+            conn,
+            title="overscoped original",
+            assignee="dante",
+            initial_status="blocked",
+        )
+
+        continuation = kb.create_task(
+            conn,
+            title="smaller continuation",
+            assignee="dante",
+            parents=[original],
+            supersedes=[original],
+            created_by="wren-test",
+        )
+
+        original_task = kb.get_task(conn, original)
+        continuation_task = kb.get_task(conn, continuation)
+        assert original_task is not None
+        assert continuation_task is not None
+        assert original_task.status == "done"
+        assert original_task.result == f"Superseded by continuation card {continuation}"
+        assert continuation_task.status == "ready"
+
+        events = kb.list_events(conn, original)
+        superseded = [e for e in events if e.kind == "superseded"]
+        assert superseded
+        assert superseded[-1].payload == {
+            "continuation_task_id": continuation,
+            "actor": "wren-test",
+        }
+        run = kb.latest_run(conn, original)
+        assert run is not None
+        assert run.outcome == "superseded"
+        assert run.metadata is not None
+        assert run.metadata["superseded_by"] == continuation
+
+
+def test_create_task_parent_without_supersedes_does_not_close_blocked_original(kanban_home):
+    with kb.connect() as conn:
+        original = kb.create_task(
+            conn,
+            title="still needs decision",
+            assignee="dante",
+            initial_status="blocked",
+        )
+
+        child = kb.create_task(
+            conn,
+            title="ordinary follow-up",
+            assignee="dante",
+            parents=[original],
+        )
+
+        original_task = kb.get_task(conn, original)
+        child_task = kb.get_task(conn, child)
+        assert original_task is not None
+        assert child_task is not None
+        assert original_task.status == "blocked"
+        assert child_task.status == "todo"
+        assert not [e for e in kb.list_events(conn, original) if e.kind == "superseded"]
+
+
+def test_create_task_supersedes_must_also_be_parent(kanban_home):
+    with kb.connect() as conn:
+        original = kb.create_task(conn, title="original", assignee="dante")
+        with pytest.raises(ValueError, match="must also be listed as parents"):
+            kb.create_task(
+                conn,
+                title="bad continuation",
+                assignee="dante",
+                supersedes=[original],
+            )
+
+
 def test_workspace_kind_validation(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="workspace_kind"):
         kb.create_task(conn, title="bad ws", workspace_kind="cloud")

@@ -182,6 +182,49 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_dashboard_create_with_supersedes_closes_original(client):
+    original = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "overscoped original", "assignee": "wren"},
+    ).json()["task"]
+    client.patch(
+        f"/api/plugins/kanban/tasks/{original['id']}",
+        json={"status": "blocked", "block_reason": "split into continuation"},
+    )
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "safe continuation",
+            "assignee": "wren",
+            "parents": [original["id"]],
+            "supersedes": [original["id"]],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    continuation = response.json()["task"]
+    assert continuation["status"] == "ready"
+
+    original_detail = client.get(
+        f"/api/plugins/kanban/tasks/{original['id']}"
+    ).json()
+    assert original_detail["task"]["status"] == "done"
+    assert original_detail["task"]["result"] == (
+        f"Superseded by continuation card {continuation['id']}"
+    )
+    superseded = [
+        event
+        for event in original_detail["events"]
+        if event["kind"] == "superseded"
+    ]
+    assert superseded
+    assert superseded[-1]["payload"] == {
+        "continuation_task_id": continuation["id"],
+        "actor": "dashboard",
+    }
+
+
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
     """Scheduled/time-delay tasks must not be silently bucketed into todo."""
 

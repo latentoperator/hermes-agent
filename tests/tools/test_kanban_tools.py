@@ -979,6 +979,32 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_with_supersedes_marks_original_done(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_create({
+        "title": "continuation task",
+        "assignee": "test-worker",
+        "parents": [worker_env],
+        "supersedes": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "ready"
+
+    conn = kb.connect()
+    try:
+        original = kb.get_task(conn, worker_env)
+        assert original is not None
+        assert original.status == "done"
+        assert original.result == f"Superseded by continuation card {d['task_id']}"
+        events = [e for e in kb.list_events(conn, worker_env) if e.kind == "superseded"]
+        assert events
+    finally:
+        conn.close()
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen

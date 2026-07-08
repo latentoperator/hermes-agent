@@ -889,6 +889,13 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    supersedes = args.get("supersedes") or args.get("supersedes_task_id")
+    if isinstance(supersedes, str):
+        supersedes = [supersedes]
+    if supersedes is not None and not isinstance(supersedes, (list, tuple)):
+        return tool_error(
+            f"supersedes must be a list of task ids, got {type(supersedes).__name__}"
+        )
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -940,6 +947,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                supersedes=supersedes,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
@@ -1469,6 +1477,18 @@ KANBAN_CREATE_SCHEMA = {
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
+                ),
+            },
+            "supersedes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Original task ids this card explicitly replaces as a "
+                    "continuation. Each id must also be listed in parents. "
+                    "Hermes marks those originals done/superseded with an "
+                    "audit event so they do not linger blocked. Do not use "
+                    "for ordinary fan-out or follow-up work where the parent "
+                    "still has independent unresolved scope."
                 ),
             },
             "tenant": {

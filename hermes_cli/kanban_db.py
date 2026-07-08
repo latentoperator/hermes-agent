@@ -2969,6 +2969,7 @@ def create_task(
     board: Optional[str] = None,
     auto_review_gate: bool = True,
     project_id: Optional[str] = None,
+    supersedes: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3001,6 +3002,12 @@ def create_task(
     ``model_override`` optionally pins the dispatched worker invocation
     to a specific model. The dispatcher passes it as ``-m <model>``;
     ``None`` means use the assignee profile's default model.
+
+    ``supersedes`` is an explicit continuation-card contract. Every listed
+    original must also be a parent of the new task; after the child is created,
+    the original is closed as ``done`` with a superseded audit event. This keeps
+    replaced cards out of the blocked queue without guessing from ordinary
+    dependency edges.
     """
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -3072,7 +3079,25 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
-    parents = tuple(p for p in parents if p)
+    parents = tuple(str(p).strip() for p in parents if str(p).strip())
+    supersedes_ids: tuple[str, ...] = tuple(
+        str(s).strip() for s in (supersedes or ()) if str(s).strip()
+    )
+    if supersedes_ids:
+        deduped_supersedes: list[str] = []
+        seen_supersedes: set[str] = set()
+        for sid in supersedes_ids:
+            if sid in seen_supersedes:
+                continue
+            seen_supersedes.add(sid)
+            deduped_supersedes.append(sid)
+        supersedes_ids = tuple(deduped_supersedes)
+        not_parent = [sid for sid in supersedes_ids if sid not in set(parents)]
+        if not_parent:
+            raise ValueError(
+                "superseded task(s) must also be listed as parents: "
+                + ", ".join(not_parent)
+            )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3339,6 +3364,14 @@ def create_task(
                         board=board,
                         auto_review_gate=False,
                     )
+            if supersedes_ids:
+                _mark_tasks_superseded_by_continuation(
+                    conn,
+                    supersedes_ids,
+                    continuation_task_id=task_id,
+                    actor=created_by,
+                )
+                recompute_ready(conn)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3346,6 +3379,90 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def _mark_tasks_superseded_by_continuation(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    continuation_task_id: str,
+    actor: Optional[str] = None,
+) -> list[str]:
+    """Close explicit continuation predecessors as superseded.
+
+    Creating a child dependency is not enough to close a parent: many child
+    cards are fan-out or follow-on work, and their parents still need a normal
+    result. This helper is only called for the explicit ``supersedes`` contract
+    on task creation, so the audit log carries an unambiguous replacement edge.
+    """
+    now = int(time.time())
+    closed: list[str] = []
+    with write_txn(conn):
+        for original_id in task_ids:
+            row = conn.execute(
+                "SELECT id, status FROM tasks WHERE id = ?",
+                (original_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown superseded task: {original_id}")
+            if original_id == continuation_task_id:
+                raise ValueError("a task cannot supersede itself")
+            status = row["status"]
+            if status in {"done", "archived"}:
+                _append_event(
+                    conn,
+                    original_id,
+                    "superseded_noop",
+                    {
+                        "continuation_task_id": continuation_task_id,
+                        "actor": actor,
+                        "status": status,
+                    },
+                )
+                continue
+
+            result = f"Superseded by continuation card {continuation_task_id}"
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'done',
+                       result        = ?,
+                       completed_at  = ?,
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status NOT IN ('done', 'archived')
+                """,
+                (result, now, original_id),
+            )
+            run_id = _end_run(
+                conn,
+                original_id,
+                outcome="superseded",
+                status="done",
+                summary=result,
+                metadata={"superseded_by": continuation_task_id, "actor": actor},
+            )
+            if run_id is None:
+                run_id = _synthesize_ended_run(
+                    conn,
+                    original_id,
+                    outcome="superseded",
+                    summary=result,
+                    metadata={"superseded_by": continuation_task_id, "actor": actor},
+                )
+            _append_event(
+                conn,
+                original_id,
+                "superseded",
+                {"continuation_task_id": continuation_task_id, "actor": actor},
+                run_id=run_id,
+            )
+            closed.append(original_id)
+    return closed
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
