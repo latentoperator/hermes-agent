@@ -1089,10 +1089,11 @@ def test_create_with_supersedes_marks_original_done(worker_env):
         conn.close()
 
 
-def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
-    """A worker scoped to a dir: task that spawns a child without a
-    workspace arg inherits the dir, not scratch (so follow-up code-gen
-    lands in the same project)."""
+@pytest.mark.parametrize("workspace_kind", ["dir", "worktree"])
+def test_create_inherits_worker_persistent_workspace(
+    monkeypatch, worker_env, workspace_kind,
+):
+    """Children may inherit persistent dir/worktree project workspaces."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
 
@@ -1100,8 +1101,8 @@ def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     conn = kb.connect()
     try:
         self_tid = kb.create_task(
-            conn, title="dir worker", assignee="test-worker",
-            workspace_kind="dir", workspace_path=proj,
+            conn, title="persistent worker", assignee="test-worker",
+            workspace_kind=workspace_kind, workspace_path=proj,
         )
         kb.claim_task(conn, self_tid)
     finally:
@@ -1113,8 +1114,83 @@ def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     conn = kb.connect()
     try:
         child = kb.get_task(conn, d["task_id"])
-        assert child.workspace_kind == "dir"
+        assert child is not None
+        assert child.workspace_kind == workspace_kind
         assert child.workspace_path == proj
+    finally:
+        conn.close()
+
+
+def test_create_scratch_children_get_task_scoped_workspaces(monkeypatch, worker_env):
+    """Parallel children of a scratch worker must not share its workspace.
+
+    The dispatcher persists a scratch parent's resolved path before spawning it.
+    A child that inherits that concrete path will collide with every sibling,
+    so scratch children must stay unresolved until dispatch can key each path on
+    the child task id. Dependency promotion and parallel dispatch still apply.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import profiles
+
+    conn = kb.connect()
+    try:
+        parent = kb.get_task(conn, worker_env)
+        assert parent is not None
+        parent_workspace = kb.resolve_workspace(parent)
+        kb.set_workspace_path(conn, worker_env, parent_workspace)
+    finally:
+        conn.close()
+
+    child_ids = []
+    for title in ("parallel child a", "parallel child b"):
+        result = json.loads(kt._handle_create({
+            "title": title,
+            "assignee": "peer",
+            "parents": [worker_env],
+        }))
+        assert result["ok"] is True
+        assert result["status"] == "todo"
+        child_ids.append(result["task_id"])
+
+    conn = kb.connect()
+    try:
+        children = []
+        for task_id in child_ids:
+            child = kb.get_task(conn, task_id)
+            assert child is not None
+            children.append(child)
+        assert all(child.workspace_kind == "scratch" for child in children)
+        assert all(child.workspace_path is None for child in children)
+
+        kb.complete_task(conn, worker_env, result="fan out")
+        for task_id in child_ids:
+            child = kb.get_task(conn, task_id)
+            assert child is not None
+            assert child.status == "ready"
+
+        monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+        dispatch = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: None,
+            max_spawn=2,
+        )
+
+        spawned_paths = {
+            task_id: workspace
+            for task_id, _assignee, workspace in dispatch.spawned
+            if task_id in child_ids
+        }
+        assert set(spawned_paths) == set(child_ids)
+        assert len(set(spawned_paths.values())) == 2
+        assert set(spawned_paths.values()) == {
+            str(kb.workspaces_root() / task_id) for task_id in child_ids
+        }
+        assert str(parent_workspace) not in spawned_paths.values()
+        for task_id in child_ids:
+            child = kb.get_task(conn, task_id)
+            assert child is not None
+            assert child.status == "running"
     finally:
         conn.close()
 
