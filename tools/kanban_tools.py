@@ -871,15 +871,16 @@ def _handle_create(args: dict, **kw) -> str:
     priority = args.get("priority")
     # Resolve workspace. If the caller passed one explicitly, honor it.
     # Otherwise, a dispatcher-spawned worker (HERMES_KANBAN_TASK set)
-    # inherits its own running task's workspace, so a worker editing a
-    # dir:/worktree project that spawns a follow-up child keeps the child
-    # in that project instead of a throwaway scratch dir. Orchestrators
-    # (kanban toolset, no HERMES_KANBAN_TASK) and CLI/dashboard callers
-    # fall back to scratch as before. Explicit None path stays None.
+    # may inherit its own running task's persistent dir/worktree workspace,
+    # so a worker editing a project keeps follow-up work in that project.
+    # Scratch workspaces are deliberately not inherited: their concrete path
+    # is task-scoped, and the dispatcher resolves a fresh <root>/<task-id>
+    # directory for each child. Orchestrators (kanban toolset, no
+    # HERMES_KANBAN_TASK) and CLI/dashboard callers fall back to scratch.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
-    _inherit_workspace = workspace_kind is None and workspace_path is None
+    _inherit_persistent_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")
@@ -919,13 +920,18 @@ def _handle_create(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            # Inherit the spawning worker's own task workspace when the
-            # caller didn't specify one (see resolution note above).
-            if _inherit_workspace:
+            # Inherit only persistent workspaces when the caller did not
+            # specify one. A scratch parent's persisted path belongs to that
+            # parent alone; leaving the child unresolved lets dispatch create
+            # a task-scoped sibling workspace instead of a shared directory.
+            if _inherit_persistent_workspace:
                 _self_tid = os.environ.get("HERMES_KANBAN_TASK")
                 if _self_tid:
                     _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.workspace_kind:
+                    if (
+                        _self_task is not None
+                        and _self_task.workspace_kind in {"dir", "worktree"}
+                    ):
                         workspace_kind = _self_task.workspace_kind
                         workspace_path = _self_task.workspace_path
                         # Keep follow-up children inside the same project so the
