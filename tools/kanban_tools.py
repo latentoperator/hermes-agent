@@ -63,20 +63,24 @@ def _profile_has_kanban_toolset() -> bool:
 
 
 def _check_kanban_mode() -> bool:
-    """Task-lifecycle tools are available when:
+    """Shared Kanban routing tools are available when:
 
     1. ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), OR
     2. The current profile has ``kanban`` in its toolsets config
        (orchestrator profiles like techlead that route work via Kanban).
 
-    Humans running ``hermes chat`` without the kanban toolset see zero
-    kanban tools. Workers spawned by the kanban dispatcher (gateway-
-    embedded by default) and orchestrator profiles with the kanban
-    toolset enabled see the Kanban lifecycle tool surface.
+    This gate is only for tools useful in both contexts (show, comment,
+    create, and link). Worker lifecycle mutations use the stricter
+    :func:`_check_kanban_worker_mode` gate below.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
     return _profile_has_kanban_toolset()
+
+
+def _check_kanban_worker_mode() -> bool:
+    """Worker lifecycle tools require positive dispatcher task scope."""
+    return bool(os.environ.get("HERMES_KANBAN_TASK"))
 
 
 def _check_kanban_orchestrator_mode() -> bool:
@@ -1709,7 +1713,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
     handler=_handle_complete,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_worker_mode,
     emoji="✔",
 )
 
@@ -1718,7 +1722,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_BLOCK_SCHEMA,
     handler=_handle_block,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_worker_mode,
     emoji="⏸",
 )
 
@@ -1727,7 +1731,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_HEARTBEAT_SCHEMA,
     handler=_handle_heartbeat,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_worker_mode,
     emoji="💓",
 )
 
