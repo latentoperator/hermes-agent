@@ -5714,6 +5714,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reply_to_message_id=reply_to_message_id,
                     adapter=adapter,
                 )
+                # Discord lifecycle notices are best-effort status messages,
+                # not part of the conversation history. The adapter uses this
+                # marker to keep expected inaccessible-target failures quiet
+                # while preserving failed SendResult details for this caller.
+                if platform == Platform.DISCORD:
+                    metadata = dict(metadata or {})
+                    metadata["non_conversational"] = True
 
                 result = await adapter.send(chat_id, msg, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
@@ -5795,6 +5802,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.thread_id,
                     adapter=adapter,
                 )
+                if platform == Platform.DISCORD:
+                    metadata = dict(metadata or {})
+                    metadata["non_conversational"] = True
                 if metadata:
                     result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
                 else:

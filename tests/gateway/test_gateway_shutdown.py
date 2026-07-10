@@ -203,6 +203,45 @@ async def test_restart_shutdown_warning_uses_restart_command_reply_anchor_for_ac
 
 
 @pytest.mark.asyncio
+async def test_discord_shutdown_warning_is_marked_nonconversational():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="555")
+    source.platform = Platform.DISCORD
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: MagicMock()}
+    runner._cache_session_source(session_key, source)
+    runner.config.platforms[Platform.DISCORD] = runner.config.platforms.pop(Platform.TELEGRAM)
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent_calls = getattr(adapter, "sent_calls")
+    assert len(sent_calls) == 1
+    _chat_id, _message, metadata = sent_calls[0]
+    assert metadata["non_conversational"] is True
+
+
+@pytest.mark.asyncio
+async def test_discord_home_shutdown_warning_is_marked_nonconversational():
+    runner, adapter = make_restart_runner()
+    discord_config = runner.config.platforms.pop(Platform.TELEGRAM)
+    discord_config.home_channel = HomeChannel(
+        platform=Platform.DISCORD,
+        chat_id="home-555",
+        name="Discord Home",
+    )
+    runner.config.platforms[Platform.DISCORD] = discord_config
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    sent_calls = getattr(adapter, "sent_calls")
+    assert len(sent_calls) == 1
+    _chat_id, _message, metadata = sent_calls[0]
+    assert metadata["non_conversational"] is True
+
+
+@pytest.mark.asyncio
 async def test_in_chat_restart_skips_home_shutdown_even_with_active_session():
     runner, adapter = make_restart_runner()
     source = make_restart_source(thread_id="42")
