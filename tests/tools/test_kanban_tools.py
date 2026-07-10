@@ -1,8 +1,9 @@
 """Tests for the Kanban tool surface (tools/kanban_tools.py).
 
 Verifies:
-  - Tools are gated on HERMES_KANBAN_TASK: a normal chat session sees
-    zero kanban tools in its schema; a worker session sees the kanban set.
+  - Worker lifecycle tools are gated on HERMES_KANBAN_TASK. Unconfigured
+    normal sessions see no kanban tools; configured taskless orchestrators
+    see only the routing subset.
   - Each handler's happy path.
   - Error paths (missing required args, bad metadata type, etc).
 """
@@ -118,7 +119,7 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
 
 
 def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
-    """Orchestrator profiles with toolsets: [kanban] see all kanban tools."""
+    """Taskless orchestrators see routing tools, not worker lifecycle tools."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -134,10 +135,8 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_list",
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
-        "kanban_comment", "kanban_create", "kanban_link",
-        "kanban_unblock",
+        "kanban_list", "kanban_show", "kanban_comment", "kanban_create",
+        "kanban_link", "kanban_unblock",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -1509,6 +1508,42 @@ def test_kanban_guidance_not_in_normal_prompt(monkeypatch, tmp_path):
     assert "kanban_show()" not in prompt
 
 
+def test_taskless_gateway_orchestrator_has_no_worker_guidance(monkeypatch, tmp_path):
+    """A normal gateway orchestrator session must not become a worker."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_PROFILE", "sterling")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("toolsets:\n  - kanban\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from tools.registry import invalidate_check_fn_cache
+    from model_tools import _clear_tool_defs_cache
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+
+    from run_agent import AIAgent
+    a = AIAgent(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    prompt = a._build_system_prompt()
+    tool_names = {tool["function"]["name"] for tool in getattr(a, "tools")}
+    assert "Kanban task execution protocol" not in prompt
+    assert "kanban_show()" not in prompt
+    assert "kanban_list" in tool_names
+    assert "kanban_show" in tool_names
+    assert "kanban_complete" not in tool_names
+    assert "kanban_block" not in tool_names
+    assert "kanban_heartbeat" not in tool_names
+
+
 def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     """A worker session (HERMES_KANBAN_TASK set) MUST have the full
     lifecycle guidance in its system prompt."""
@@ -1551,9 +1586,10 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     The ceiling guards against unbounded growth, not against any growth.
     The block absorbed the load-bearing worker/orchestrator reference
     details (workspace kinds, deliverable artifacts, created-card claims,
-    profile discovery) when the standalone kanban-worker / kanban-orchestrator
-    skills were removed and folded into this always-injected guidance, so the
-    ceiling is sized to fit that content with a little headroom.
+    profile discovery, review handoff, and stale-worker heartbeats) when the
+    standalone kanban-worker / kanban-orchestrator skills were removed and
+    folded into this worker-only guidance, so the ceiling is sized to fit that
+    content with a little headroom.
     """
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
@@ -1563,7 +1599,7 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from agent.prompt_builder import KANBAN_GUIDANCE
-    assert 1_500 < len(KANBAN_GUIDANCE) < 5_500, (
+    assert 1_500 < len(KANBAN_GUIDANCE) < 6_500, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
 

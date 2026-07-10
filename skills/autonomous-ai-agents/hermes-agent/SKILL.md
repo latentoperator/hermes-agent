@@ -780,11 +780,12 @@ sessions still have zero `kanban_*` schema footprint unless configured.
   `show`, `assign`, `link`, `unlink`, `comment`, `complete`, `block`,
   `unblock`, `archive`, `tail`. Less common: `watch`, `stats`, `runs`,
   `log`, `dispatch`, `daemon`, `gc`.
-- **Worker/orchestrator toolset:** `kanban_show`, `kanban_complete`,
-  `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_create`,
-  `kanban_link`; profiles that explicitly enable the `kanban` toolset
-  outside a dispatcher-spawned task also get `kanban_list` and
-  `kanban_unblock` for board routing.
+- **Worker toolset:** dispatcher-spawned tasks get `kanban_show`,
+  `kanban_complete`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`,
+  `kanban_create`, and `kanban_link`, plus the worker execution protocol.
+  Taskless profiles that explicitly enable `kanban` get only the routing
+  surface: `kanban_list`, `kanban_show`, `kanban_comment`, `kanban_create`,
+  `kanban_link`, and `kanban_unblock`.
 - **Dispatcher** runs inside the gateway by default
   (`kanban.dispatch_in_gateway: true`) — reclaims stale claims,
   promotes ready tasks, atomically claims, spawns assigned profiles.
