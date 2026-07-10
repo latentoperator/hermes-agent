@@ -6004,6 +6004,14 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     review_required = _is_review_required_reason(reason)
+    # ``review-required:`` is a control-plane handoff, not an ordinary parent
+    # dependency. Workers commonly describe review as a dependency even though
+    # the review task does not exist yet. If that kind reached the dependency
+    # branch below, the source would move to ``todo`` without a parent, be
+    # promoted immediately, and race the reviewer as a moving target. Normalize
+    # it to a sticky human-input block so the closed-loop review creator runs.
+    if review_required and kind == "dependency":
+        kind = "needs_input"
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -6024,8 +6032,26 @@ def block_task(
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
+        # a dependency-wait as something to "unblock". Refuse a dependency with
+        # no unfinished parent: ``all([])`` would otherwise promote it on the
+        # next dispatcher tick and create an immediate respawn loop.
         if kind == "dependency":
+            unfinished_parent = conn.execute(
+                """
+                SELECT 1
+                  FROM task_links l
+                  JOIN tasks p ON p.id = l.parent_id
+                 WHERE l.child_id = ?
+                   AND p.status NOT IN ('done', 'archived')
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if unfinished_parent is None:
+                raise ValueError(
+                    "dependency block requires at least one unfinished parent; "
+                    "link the parent first or use kind='needs_input'"
+                )
             cur = conn.execute(
                 """
                 UPDATE tasks

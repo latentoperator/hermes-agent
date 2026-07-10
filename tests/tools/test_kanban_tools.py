@@ -875,6 +875,13 @@ def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(conn, title="unfinished parent", assignee="a")
+        kb.link_tasks(conn, parent_id, tid)
+    finally:
+        conn.close()
+
     out = kt._handle_block({"reason": "waiting on another task", "kind": "dependency"})
     d = json.loads(out)
     assert d.get("ok") is True
@@ -882,6 +889,25 @@ def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         assert kb.get_task(conn, tid).status == "todo"
+    finally:
+        conn.close()
+
+
+def test_block_goal_mode_rejects_parentless_dependency(monkeypatch, tmp_path):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block({"reason": "waiting on an unlinked task", "kind": "dependency"})
+    result = json.loads(out)
+
+    assert "error" in result
+    assert "requires at least one unfinished parent" in result["error"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
     finally:
         conn.close()
 

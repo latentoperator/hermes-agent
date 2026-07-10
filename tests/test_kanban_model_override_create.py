@@ -443,6 +443,53 @@ def test_review_required_block_creates_ready_closed_loop_review_card(tmp_path, m
     assert f"Source task: {source_id}" in (review.body or "")
 
 
+def test_review_required_dependency_block_stays_blocked_and_routes_review(tmp_path, monkeypatch):
+    """The explicit review prefix must win over a mistaken dependency kind."""
+    db_path = tmp_path / "kanban.db"
+    repo = tmp_path / "shared-runtime"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="build safety-critical shared runtime consumer",
+            assignee="wren",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            auto_review_gate=False,
+        )
+        assert kb.block_task(
+            conn,
+            source_id,
+            reason="review-required: implementation frozen for review",
+            kind="dependency",
+        )
+        source = kb.get_task(conn, source_id)
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+        promoted = kb.recompute_ready(conn)
+        source_after_recompute = kb.get_task(conn, source_id)
+        events = kb.list_events(conn, source_id)
+
+    assert source is not None
+    assert source.status == "blocked"
+    assert source.block_kind == "needs_input"
+    assert len(reviews) == 1
+    assert reviews[0].status == "ready"
+    assert promoted == 0
+    assert source_after_recompute is not None
+    assert source_after_recompute.status == "blocked"
+    event_kinds = [event.kind for event in events]
+    assert "review_loop_requested" in event_kinds
+    assert "dependency_wait" not in event_kinds
+
+
 def test_review_loop_card_gets_goal_mode_when_repo_has_review_contract(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     root = tmp_path / "hopewell-dev"

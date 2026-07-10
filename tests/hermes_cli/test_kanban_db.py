@@ -1257,6 +1257,59 @@ def test_block_then_unblock(kanban_home):
         assert kb.get_task(conn, t).status == "ready"
 
 
+def test_dependency_block_requires_unfinished_parent(kanban_home):
+    """A parentless dependency must not enter an immediate retry loop."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="parentless dependency", assignee="a")
+        initial_task = kb.get_task(conn, task_id)
+        assert initial_task is not None
+        initial_status = initial_task.status
+
+        with pytest.raises(
+            ValueError,
+            match="dependency block requires at least one unfinished parent",
+        ):
+            kb.block_task(
+                conn,
+                task_id,
+                reason="waiting on work that was never linked",
+                kind="dependency",
+            )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == initial_status
+
+
+def test_dependency_block_waits_when_unfinished_parent_is_linked(kanban_home):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent", assignee="a")
+        child_id = kb.create_task(
+            conn,
+            title="child",
+            assignee="a",
+            parents=[parent_id],
+        )
+        assert kb.promote_task(
+            conn,
+            child_id,
+            actor="test",
+            force=True,
+        ) == (True, None)
+        assert kb.block_task(
+            conn,
+            child_id,
+            reason="waiting on linked parent",
+            kind="dependency",
+        )
+
+        task = kb.get_task(conn, child_id)
+        assert task is not None
+        assert task.status == "todo"
+        event_kinds = [event.kind for event in kb.list_events(conn, child_id)]
+        assert event_kinds.count("dependency_wait") == 1
+
+
 def test_unblock_resets_failure_counters(kanban_home):
     """unblock_task must reset consecutive_failures and last_failure_error."""
     with kb.connect() as conn:
