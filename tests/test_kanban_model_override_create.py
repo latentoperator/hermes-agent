@@ -347,6 +347,65 @@ def test_non_review_gate_card_does_not_create_fallback(
         assert kb.child_ids(conn, task_id) == []
 
 
+def test_review_loop_uses_dispatcher_profile_policy_for_any_source_profile(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / ".hermes"
+    dante_home = root / "profiles" / "dante"
+    wren_home = root / "profiles" / "wren"
+    repo = tmp_path / "client-repos" / "demo"
+    dante_home.mkdir(parents=True)
+    wren_home.mkdir(parents=True)
+    repo.mkdir(parents=True)
+    (root / "config.yaml").write_text(
+        "kanban:\n"
+        "  dispatcher_profile: wren\n"
+        "  review_gate:\n"
+        "    enabled: false\n"
+        "    assignee: dante\n"
+    )
+    (dante_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  review_gate:\n"
+        "    enabled: false\n"
+        "    closed_loop_enabled: false\n"
+        "    assignee: dante\n"
+    )
+    (wren_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  review_gate:\n"
+        "    enabled: false\n"
+        "    closed_loop_enabled: true\n"
+        "    assignee: code-reviewer\n"
+        "    skills: [github-code-review]\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(dante_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.delenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", raising=False)
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="Dante implementation using dispatcher review policy",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: branch ready")
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+
+    assert len(reviews) == 1
+    assert reviews[0].assignee == "code-reviewer"
+    assert reviews[0].skills == ["github-code-review"]
+
+
 def test_review_required_block_creates_ready_closed_loop_review_card(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     root = tmp_path / "hopewell-dev"

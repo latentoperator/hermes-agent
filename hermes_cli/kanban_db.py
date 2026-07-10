@@ -2501,9 +2501,12 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 
 
 def _review_gate_config() -> dict[str, Any]:
-    """Return Hopewell dev review-gate settings from config/env."""
+    """Return board-wide review-gate settings from config/env."""
     try:
+        import yaml
         from hermes_cli.config import load_config_readonly
+        from hermes_cli.profiles import normalize_profile_name
+        from hermes_constants import get_default_hermes_root, get_hermes_home
 
         cfg = load_config_readonly()
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
@@ -2511,18 +2514,10 @@ def _review_gate_config() -> dict[str, Any]:
         if not isinstance(gate, dict):
             gate = {}
 
-        # Dispatcher-spawned profile workers run with a profile-scoped
-        # HERMES_HOME.  Hopewell's review gate is a machine/fleet policy, and
-        # operators normally configure it in the root home.  If the active
-        # profile has no explicit review_gate stanza, inherit the root config
-        # instead of silently falling back to the hard-coded defaults.  Without
-        # this, a profile worker can re-enable a root-disabled review gate and
-        # create child cards with stale forced skills.
-        try:
-            import yaml
-            from hermes_constants import get_hermes_home
+        home = get_hermes_home().resolve(strict=False)
+        root = get_default_hermes_root().resolve(strict=False)
 
-            home = get_hermes_home().resolve(strict=False)
+        try:
             raw_cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
             raw_kanban = raw_cfg.get("kanban", {}) if isinstance(raw_cfg, dict) else {}
             current_has_explicit_gate = (
@@ -2531,22 +2526,54 @@ def _review_gate_config() -> dict[str, Any]:
         except Exception:
             current_has_explicit_gate = bool(gate)
 
-        if not current_has_explicit_gate:
-            try:
-                import yaml
-                from hermes_constants import get_default_hermes_root, get_hermes_home
+        root_cfg: dict[str, Any] = {}
+        root_kanban: dict[str, Any] = {}
+        root_gate: dict[str, Any] = {}
+        try:
+            root_cfg = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8")) or {}
+            root_kanban = root_cfg.get("kanban", {}) if isinstance(root_cfg, dict) else {}
+            candidate = root_kanban.get("review_gate", {}) if isinstance(root_kanban, dict) else {}
+            if isinstance(candidate, dict):
+                root_gate = candidate
+        except Exception:
+            pass
 
-                home = get_hermes_home().resolve(strict=False)
-                root = get_default_hermes_root().resolve(strict=False)
-                root_config = root / "config.yaml"
-                if home != root and root_config.exists():
-                    root_cfg = yaml.safe_load(root_config.read_text(encoding="utf-8")) or {}
-                    root_kanban = root_cfg.get("kanban", {}) if isinstance(root_cfg, dict) else {}
-                    root_gate = root_kanban.get("review_gate", {}) if isinstance(root_kanban, dict) else {}
-                    if isinstance(root_gate, dict) and root_gate:
-                        gate = root_gate
+        # Closed-loop review is board/dispatcher policy, not source-assignee
+        # policy. A stale profile-local review_gate on Dante/Sterling/etc. must
+        # not disable review-required routing or send review cards back to that
+        # profile. Prefer the configured dispatcher profile's explicit loop
+        # contract for every worker on the board. The root profile is itself the
+        # config source when dispatcher_profile is empty/default.
+        dispatcher_gate: dict[str, Any] = {}
+        dispatcher = ""
+        if isinstance(root_kanban, dict):
+            dispatcher = str(root_kanban.get("dispatcher_profile") or "").strip()
+        if dispatcher and normalize_profile_name(dispatcher) != "default":
+            try:
+                dispatcher_name = normalize_profile_name(dispatcher)
+                dispatcher_cfg_path = root / "profiles" / dispatcher_name / "config.yaml"
+                dispatcher_cfg = yaml.safe_load(
+                    dispatcher_cfg_path.read_text(encoding="utf-8")
+                ) or {}
+                dispatcher_kanban = (
+                    dispatcher_cfg.get("kanban", {}) if isinstance(dispatcher_cfg, dict) else {}
+                )
+                candidate = (
+                    dispatcher_kanban.get("review_gate", {})
+                    if isinstance(dispatcher_kanban, dict)
+                    else {}
+                )
+                if isinstance(candidate, dict):
+                    dispatcher_gate = candidate
             except Exception:
                 pass
+        elif root_gate:
+            dispatcher_gate = root_gate
+
+        if "closed_loop_enabled" in dispatcher_gate:
+            gate = dispatcher_gate
+        elif not current_has_explicit_gate and root_gate:
+            gate = root_gate
     except Exception:
         gate = {}
 
