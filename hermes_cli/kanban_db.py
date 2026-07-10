@@ -149,6 +149,7 @@ DEFAULT_REVIEW_GATE_SKILLS = ("github-code-review",)
 REVIEW_GATE_CREATED_BY = "hopewell-dev-review-gate"
 REVIEW_LOOP_CREATED_BY = "kanban-review-loop"
 REVIEW_LOOP_IDEMPOTENCY_PREFIX = "review-loop"
+REVIEW_LOOP_CANNOT_REVIEW = "cannot_review"
 DEFAULT_REVIEW_LOOP_MAX_ROUNDS = 2
 DEFAULT_REVIEW_GOAL_MAX_TURNS = 3
 DEFAULT_REVIEW_GOAL_CONTRACT_FILES = (
@@ -2681,6 +2682,7 @@ class ReviewSource:
     branch: Optional[str] = None
     head_sha: Optional[str] = None
     pr_url: Optional[str] = None
+    diff_path: Optional[str] = None
     changed_files: tuple[str, ...] = ()
     tests_run: tuple[str, ...] = ()
 
@@ -2689,21 +2691,37 @@ def _string_list(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
         stripped = value.strip()
         return (stripped,) if stripped else ()
+    if isinstance(value, dict):
+        return tuple(
+            f"{str(key).strip()}: {str(item).strip()}"
+            for key, item in value.items()
+            if str(key).strip() and str(item).strip()
+        )
     if isinstance(value, (list, tuple)):
         return tuple(str(v).strip() for v in value if str(v).strip())
     return ()
 
 
 def _review_source_from_mapping(raw: Any, gate: dict[str, Any]) -> Optional[ReviewSource]:
+    """Resolve a review target from a trusted structured handoff.
+
+    Closed-loop review is intentionally independent of the create-time review
+    gate's configured roots.  A worker can already name arbitrary local source
+    in its handoff; the safety boundary here is positive, structured evidence:
+    an existing repo/worktree plus a worktree locator, branch/commit/PR, or
+    changed-file/diff evidence.  A bare prose path or empty JSON object is not
+    enough to dispatch another agent.
+    """
     if not isinstance(raw, dict):
         return None
     source = raw.get("review_source") or raw.get("review_required_source") or raw.get("source")
     if isinstance(source, dict):
         raw = source
+
     repo_raw = (
-        raw.get("repo_path")
-        or raw.get("workspace_path")
+        raw.get("workspace_path")
         or raw.get("worktree")
+        or raw.get("repo_path")
         or raw.get("path")
         or raw.get("repo")
     )
@@ -2713,17 +2731,39 @@ def _review_source_from_mapping(raw: Any, gate: dict[str, Any]) -> Optional[Revi
         repo_path = Path(str(repo_raw).strip()).expanduser().resolve(strict=False)
     except OSError:
         return None
-    if not repo_path.exists():
+    if not repo_path.exists() or not repo_path.is_dir():
         return None
-    if not any(_path_is_under(repo_path, root) for root in gate.get("roots", [])):
+
+    branch = str(raw.get("branch") or "").strip() or None
+    head_sha = str(raw.get("head_sha") or raw.get("commit") or "").strip() or None
+    pr_url = str(raw.get("pr_url") or raw.get("pr") or "").strip() or None
+    changed_files = _string_list(raw.get("changed_files") or raw.get("files"))
+    tests_run = _string_list(
+        raw.get("tests_run") or raw.get("verification") or raw.get("tests")
+    )
+    diff_raw = raw.get("diff_path") or raw.get("patch_path")
+    diff_path: Optional[str] = None
+    if diff_raw:
+        try:
+            candidate = Path(str(diff_raw).strip()).expanduser().resolve(strict=False)
+            if candidate.exists() and candidate.is_file():
+                diff_path = str(candidate)
+        except OSError:
+            pass
+
+    has_structured_locator = bool(raw.get("workspace_path") or raw.get("worktree"))
+    has_change_evidence = bool(branch or head_sha or pr_url or diff_path or changed_files)
+    if not (has_structured_locator or has_change_evidence):
         return None
+
     return ReviewSource(
         repo_path=str(repo_path),
-        branch=str(raw.get("branch") or "").strip() or None,
-        head_sha=str(raw.get("head_sha") or raw.get("commit") or "").strip() or None,
-        pr_url=str(raw.get("pr_url") or raw.get("pr") or "").strip() or None,
-        changed_files=_string_list(raw.get("changed_files")),
-        tests_run=_string_list(raw.get("tests_run") or raw.get("verification")),
+        branch=branch,
+        head_sha=head_sha,
+        pr_url=pr_url,
+        diff_path=diff_path,
+        changed_files=changed_files,
+        tests_run=tests_run,
     )
 
 
@@ -2740,6 +2780,17 @@ def _json_candidates_from_text(text: str) -> list[Any]:
             candidates.append(json.loads(stripped))
         except Exception:
             pass
+    # Worker handoffs commonly prefix the JSON with a short label such as
+    # ``review-required handoff:`` without a Markdown fence. Decode embedded
+    # objects structurally rather than scraping loose paths from prose.
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text or ""):
+        try:
+            candidate, _end = decoder.raw_decode(text, match.start())
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if candidate not in candidates:
+            candidates.append(candidate)
     return candidates
 
 
@@ -2750,10 +2801,12 @@ def _structured_review_source_from_comments(
 ) -> Optional[ReviewSource]:
     """Return a trusted structured review source from recent source comments.
 
-    Scratch workspaces are intentionally disposable.  To let a scratch source
+    Scratch workspaces are intentionally disposable. To let a scratch source
     task enter the closed-loop review path, the source owner must leave a JSON
-    handoff with a `review_source` object naming an allowed repo path.  We do
-    not infer from loose prose paths or PR URLs.
+    handoff naming an existing repo/worktree and concrete branch-or-diff
+    evidence. We do not infer from loose prose paths or PR URLs. Configured
+    roots apply only to the optional create-time Hopewell review gate; an
+    explicit ``review-required:`` handoff can target any local source path.
     """
     trusted_authors = {"worker"}
     if source.assignee:
@@ -2775,13 +2828,15 @@ def _review_source_for_review_loop(
     source: Task,
     gate: dict[str, Any],
 ) -> Optional[ReviewSource]:
+    # Prefer the source owner's trusted handoff when it points at a more precise
+    # worktree or branch than the task's generic persistent workspace.
+    structured = _structured_review_source_from_comments(conn, source, gate)
+    if structured is not None:
+        return structured
     if source.workspace_kind in {"dir", "worktree"} and source.workspace_path:
         path = Path(source.workspace_path).expanduser().resolve(strict=False)
-        if path.exists() and any(_path_is_under(path, root) for root in gate.get("roots", [])):
+        if path.exists() and path.is_dir():
             return ReviewSource(repo_path=str(path), branch=source.branch_name)
-        return None
-    if source.workspace_kind == "scratch":
-        return _structured_review_source_from_comments(conn, source, gate)
     return None
 
 
@@ -2989,6 +3044,8 @@ def _review_loop_body(source: Task, round_no: int, max_rounds: int, review_sourc
         body += f"\nPR: {review_source.pr_url}"
     if review_source.head_sha:
         body += f"\nHead SHA: {review_source.head_sha}"
+    if review_source.diff_path:
+        body += f"\nDiff/patch: {review_source.diff_path}"
     if review_source.changed_files:
         body += "\nChanged files: " + ", ".join(review_source.changed_files)
     if review_source.tests_run:
@@ -2996,20 +3053,103 @@ def _review_loop_body(source: Task, round_no: int, max_rounds: int, review_sourc
     return body
 
 
+def _latest_review_required_block_event_id(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+) -> Optional[int]:
+    for event in reversed(list_events(conn, source_task_id)):
+        if event.kind != "blocked" or not isinstance(event.payload, dict):
+            continue
+        if _is_review_required_reason(event.payload.get("reason")):
+            return event.id
+    return None
+
+
+def _review_loop_result_for_block(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    block_event_id: Optional[int],
+) -> Optional[str]:
+    """Return the already-recorded review result for one source block event."""
+    if block_event_id is None:
+        return None
+    for event in reversed(list_events(conn, source_task_id)):
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if payload.get("block_event_id") != block_event_id:
+            continue
+        if event.kind == "review_loop_requested":
+            review_task_id = str(payload.get("review_task_id") or "").strip()
+            if get_task(conn, review_task_id) is not None:
+                return review_task_id
+        if event.kind == "review_escalation" and payload.get("verdict") == REVIEW_LOOP_CANNOT_REVIEW:
+            return REVIEW_LOOP_CANNOT_REVIEW
+    return None
+
+
+def _record_review_loop_cannot_review(
+    conn: sqlite3.Connection,
+    source: Task,
+    *,
+    block_event_id: Optional[int],
+    block_reason: Optional[str],
+    reason: str,
+) -> str:
+    if block_event_id is None:
+        return REVIEW_LOOP_CANNOT_REVIEW
+    existing = _review_loop_result_for_block(conn, source.id, block_event_id)
+    if existing is not None:
+        return existing
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (
+                source.id,
+                REVIEW_LOOP_CREATED_BY,
+                "CANNOT_REVIEW: explicit review-required block did not include resolvable "
+                "structured repo/worktree plus branch-or-diff evidence; source remains blocked.",
+                int(time.time()),
+            ),
+        )
+        _append_event(
+            conn,
+            source.id,
+            "review_escalation",
+            {
+                "verdict": REVIEW_LOOP_CANNOT_REVIEW,
+                "reason": reason,
+                "block_event_id": block_event_id,
+                "block_reason": block_reason,
+            },
+        )
+    return REVIEW_LOOP_CANNOT_REVIEW
+
+
 def _maybe_create_review_loop_task(
     conn: sqlite3.Connection,
     source_task_id: str,
     reason: Optional[str],
 ) -> Optional[str]:
+    if not _is_review_required_reason(reason):
+        return None
     gate = _review_gate_config()
     if not gate.get("closed_loop_enabled"):
         return None
     source = get_task(conn, source_task_id)
     if source is None:
-        return None
+        return REVIEW_LOOP_CANNOT_REVIEW
+    block_event_id = _latest_review_required_block_event_id(conn, source_task_id)
+    existing_result = _review_loop_result_for_block(conn, source_task_id, block_event_id)
+    if existing_result is not None:
+        return existing_result
     review_source = _review_source_for_review_loop(conn, source, gate)
     if review_source is None:
-        return None
+        return _record_review_loop_cannot_review(
+            conn,
+            source,
+            block_event_id=block_event_id,
+            block_reason=reason,
+            reason="insufficient_review_evidence",
+        )
     max_rounds = max(1, int(gate.get("closed_loop_max_rounds") or DEFAULT_REVIEW_LOOP_MAX_ROUNDS))
     existing_rounds = _review_loop_rounds_created(conn, source_task_id)
     if existing_rounds >= max_rounds:
@@ -3020,12 +3160,14 @@ def _maybe_create_review_loop_task(
                 "review_escalation",
                 {
                     "reason": "max_review_rounds_reached",
+                    "verdict": REVIEW_LOOP_CANNOT_REVIEW,
                     "rounds": existing_rounds,
                     "max_rounds": max_rounds,
+                    "block_event_id": block_event_id,
                     "block_reason": reason,
                 },
             )
-        return None
+        return REVIEW_LOOP_CANNOT_REVIEW
     round_no = existing_rounds + 1
     idem = f"{REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_task_id}:{round_no}"
     review_id = create_task(
@@ -3068,7 +3210,13 @@ def _maybe_create_review_loop_task(
                 conn,
                 source_task_id,
                 "review_loop_requested",
-                {"review_task_id": review_id, "round": round_no, "max_rounds": max_rounds},
+                {
+                    "review_task_id": review_id,
+                    "round": round_no,
+                    "max_rounds": max_rounds,
+                    "block_event_id": block_event_id,
+                    "block_reason": reason,
+                },
             )
     return review_id
 

@@ -623,37 +623,197 @@ def test_review_loop_uses_structured_review_source_for_scratch_card(tmp_path, mo
     assert "dante/gathings-deploy-runner" in (review.body or "")
 
 
-def test_review_loop_ignores_scratch_review_source_outside_allowed_roots(tmp_path, monkeypatch):
+def test_review_loop_routes_out_of_root_m365_scratch_handoff(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
-    root = tmp_path / "hopewell-dev"
-    external_repo = tmp_path / "other" / "repo"
-    external_repo.mkdir(parents=True)
+    allowed_root = tmp_path / "hopewell-dev"
+    repo = tmp_path / ".hermes" / "openclaw-universe" / "mcp" / "m365" / "ms-365-mcp-server"
+    worktree = tmp_path / ".hermes" / "kanban" / "workspaces" / "source-task" / "ms-365-mcp-server"
+    repo.mkdir(parents=True)
+    worktree.mkdir(parents=True)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
     monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
-    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(allowed_root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
 
     with kb.connect_closing() as conn:
         source_id = kb.create_task(
             conn,
-            title="scratch card with untrusted repo",
-            assignee="dante",
+            title="Correct misleading M365 mailbox tool descriptions",
+            assignee="wren",
             workspace_kind="scratch",
             auto_review_gate=False,
         )
         kb.add_comment(
             conn,
             source_id,
-            "dante",
-            json.dumps({"review_source": {"repo_path": str(external_repo)}}),
+            "wren",
+            "review-required handoff:\n"
+            + json.dumps(
+                {
+                    "repo": str(repo),
+                    "worktree": str(worktree),
+                    "branch": "wren/source-task-m365-tool-descriptions",
+                    "base_sha": "a" * 40,
+                    "head_sha": "b" * 40,
+                    "changed_files": ["src/graph-tools.ts", "test/tool-schema.test.ts"],
+                    "tests": {"full": "193/193 passed", "build": "passed"},
+                }
+            ),
         )
-        assert kb.block_task(conn, source_id, reason="review-required: PR ready")
+        assert kb.block_task(conn, source_id, reason="review-required: mailbox schema fix ready")
         reviews = [
             task for task in kb.list_tasks(conn, include_archived=True)
             if task.created_by == kb.REVIEW_LOOP_CREATED_BY
         ]
 
+    assert len(reviews) == 1
+    review = reviews[0]
+    assert review.assignee == "code-reviewer"
+    assert review.workspace_kind == "dir"
+    assert review.workspace_path == str(worktree)
+    assert review.idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
+    assert f"Source task: {source_id}" in (review.body or "")
+    assert "wren/source-task-m365-tool-descriptions" in (review.body or "")
+    assert "193/193 passed" in (review.body or "")
+
+
+def test_review_loop_records_cannot_review_for_insufficient_scratch_evidence(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    repo = tmp_path / "other" / "repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="scratch card without a branch or diff",
+            assignee="sterling",
+            workspace_kind="scratch",
+            auto_review_gate=False,
+        )
+        kb.add_comment(
+            conn,
+            source_id,
+            "sterling",
+            json.dumps({"review_source": {"repo_path": str(repo)}}),
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: please review")
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+        source = kb.get_task(conn, source_id)
+        events = kb.list_events(conn, source_id)
+        comments = kb.list_comments(conn, source_id)
+
+    assert source is not None and source.status == "blocked"
     assert reviews == []
+    unavailable = [event for event in events if event.kind == "review_escalation"]
+    assert len(unavailable) == 1
+    assert unavailable[0].payload is not None
+    assert unavailable[0].payload["verdict"] == "cannot_review"
+    assert unavailable[0].payload["reason"] == "insufficient_review_evidence"
+    assert any("CANNOT_REVIEW" in comment.body for comment in comments)
+
+
+def test_review_loop_routes_out_of_root_dir_and_worktree_tasks_for_any_assignee(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    allowed_root = tmp_path / "configured-root"
+    dir_repo = tmp_path / "client-repos" / "dir-repo"
+    worktree = tmp_path / "vendor-repos" / "worktree"
+    dir_repo.mkdir(parents=True)
+    worktree.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(allowed_root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+    with kb.connect_closing() as conn:
+        dir_source = kb.create_task(
+            conn,
+            title="Virgil implementation in a persistent repo",
+            assignee="virgil",
+            workspace_kind="dir",
+            workspace_path=str(dir_repo),
+            auto_review_gate=False,
+        )
+        worktree_source = kb.create_task(
+            conn,
+            title="Zelda implementation in a worktree",
+            assignee="zelda",
+            workspace_kind="worktree",
+            workspace_path=str(worktree),
+            branch_name="zelda/worktree-copy-fix",
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, dir_source, reason="review-required: dir diff ready")
+        assert kb.block_task(conn, worktree_source, reason="review-required: worktree branch ready")
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+
+    assert len(reviews) == 2
+    assert {review.workspace_path for review in reviews} == {str(dir_repo), str(worktree)}
+    assert all(review.assignee == "code-reviewer" for review in reviews)
+    source_links = [kb._review_loop_source_from_task(review) for review in reviews]
+    assert all(source_link is not None for source_link in source_links)
+    assert {source_link[0] for source_link in source_links if source_link is not None} == {
+        dir_source,
+        worktree_source,
+    }
+
+
+def test_review_loop_trigger_is_explicit_and_idempotent_per_block(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    repo = tmp_path / "outside-root" / "repo"
+    repo.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
+
+    with kb.connect_closing() as conn:
+        ordinary_id = kb.create_task(
+            conn,
+            title="ordinary blocked task",
+            assignee="dante",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, ordinary_id, reason="waiting for an operator")
+
+        source_id = kb.create_task(
+            conn,
+            title="explicit review handoff",
+            assignee="portia",
+            workspace_kind="dir",
+            workspace_path=str(repo),
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: diff ready")
+        first = kb._maybe_create_review_loop_task(conn, source_id, "review-required: diff ready")
+        second = kb._maybe_create_review_loop_task(conn, source_id, "review-required: diff ready")
+        reviews = [
+            task for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        ]
+        ordinary_events = kb.list_events(conn, ordinary_id)
+        phantom = kb._maybe_create_review_loop_task(
+            conn,
+            "t_deadbeef",
+            "review-required: phantom source",
+        )
+
+    assert first == second
+    assert phantom == kb.REVIEW_LOOP_CANNOT_REVIEW
+    assert len(reviews) == 1
+    assert reviews[0].idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
+    assert all(event.kind != "review_loop_requested" for event in ordinary_events)
 
 
 def _configure_explicit_review_test(tmp_path, monkeypatch):
