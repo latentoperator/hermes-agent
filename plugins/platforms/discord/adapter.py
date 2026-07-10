@@ -119,6 +119,7 @@ from gateway.platforms.base import (
     cache_audio_from_url,
     cache_audio_from_bytes,
     cache_document_from_bytes,
+    classify_send_error,
     SUPPORTED_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit,
@@ -1693,6 +1694,32 @@ class DiscordAdapter(BasePlatformAdapter):
         message = str(exc).lower()
         return code == 10062 or (status == 404 and "unknown interaction" in message)
 
+    @staticmethod
+    def _discord_unavailable_target_kind(exc: BaseException) -> Optional[str]:
+        """Classify errors proving a captured Discord route is no longer usable.
+
+        Keep this narrower than generic ``Forbidden``: error 50013 (Missing
+        Permissions) can indicate a real configuration problem and should stay
+        operator-visible. 50001 means the bot lost access to this target, while
+        10003 means the channel itself is gone.
+        """
+        code = getattr(exc, "code", None)
+        if code is None:
+            data = getattr(exc, "data", None)
+            if isinstance(data, dict):
+                code = data.get("code")
+        try:
+            code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code = None
+
+        text = str(exc).lower()
+        if code == 50001 or "error code: 50001" in text or "missing access" in text:
+            return "forbidden"
+        if code == 10003 or "error code: 10003" in text or "unknown channel" in text:
+            return "not_found"
+        return None
+
     def _command_sync_mutation_interval_seconds(self) -> float:
         return _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS
 
@@ -2036,12 +2063,12 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        nonconversational = _metadata_marks_nonconversational(metadata)
         try:
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
             if metadata and metadata.get("thread_id"):
                 thread_id = metadata["thread_id"]
-            nonconversational = _metadata_marks_nonconversational(metadata)
 
             channel = None
             parent_channel_id = None
@@ -2161,8 +2188,22 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
-            return SendResult(success=False, error=str(e))
+            unavailable_target_kind = self._discord_unavailable_target_kind(e)
+            error_kind = unavailable_target_kind or classify_send_error(e)
+            if nonconversational and unavailable_target_kind is not None:
+                # Lifecycle/status routes can become inaccessible between the
+                # inbound event and this best-effort send. Discord is the only
+                # authoritative reachability check, so keep the failed result
+                # but avoid an operator-facing ERROR traceback for this expected
+                # terminal-target condition.
+                logger.debug(
+                    "[%s] Skipping non-conversational Discord send to unavailable target: %s",
+                    self.name,
+                    e,
+                )
+            else:
+                logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
+            return SendResult(success=False, error=str(e), error_kind=error_kind)
 
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
