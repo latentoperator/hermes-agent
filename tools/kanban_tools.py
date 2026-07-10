@@ -188,18 +188,16 @@ def _goal_judge_available() -> bool:
     ``judge_goal`` is fail-open at the source: when no auxiliary model can
     be reached it returns a ``"continue"`` verdict that is indistinguishable
     from a real "not done yet" judgment. The completion gate must not treat
-    that as a rejection, or an unconfigured/degraded auxiliary model would
-    wedge every ``goal_mode`` worker (it could never close its own task).
+    explicit unavailability (no client or model configured) as a rejection,
+    or such a worker could never close its own task.
 
-    So we probe availability first and only enforce the gate when a judge is
-    actually reachable. This mirrors the same client lookup ``judge_goal``
-    performs internally.
+    Lookup/import exceptions intentionally propagate. They indicate a broken
+    judge integration rather than explicit unavailability, so the completion
+    gate must fail closed instead of mistaking the failure for approval.
     """
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        return False
+    from agent.auxiliary_client import get_text_auxiliary_client
+
+    client, model = get_text_auxiliary_client("goal_judge")
     return client is not None and bool(model)
 
 
@@ -600,23 +598,34 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode and _goal_judge_available():
-                verdict = "done"
+            if task and task.goal_mode:
+                judge_available = False
+                verdict = None
                 reason = ""
                 try:
-                    verdict, reason, _ = judge_goal(
-                        goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                        last_response=(summary or result or "").strip(),
-                    )
+                    judge_available = _goal_judge_available()
+                    if judge_available:
+                        judge_result = judge_goal(
+                            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                            last_response=(summary or result or "").strip(),
+                        )
+                        verdict, reason = judge_result[:2]
                 except Exception as judge_exc:
-                    # Defensive: judge_goal swallows its own errors, but if
-                    # it ever raises, fail open rather than wedge the worker.
-                    logger.warning(
-                        "goal judge check failed, allowing completion: %s",
-                        judge_exc,
+                    # Explicit unavailability is represented by False above.
+                    # Exceptions mean the judge integration is broken and
+                    # must not be mistaken for approval.
+                    logger.error(
+                        "goal-mode completion verification failed for %s",
+                        tid,
                         exc_info=True,
                     )
-                if verdict != "done":
+                    return tool_error(
+                        "Goal completion could not be verified because the "
+                        f"judge integration failed ({type(judge_exc).__name__}). "
+                        "The task remains running; retry completion after the "
+                        "judge path is repaired or explicitly disable goal mode."
+                    )
+                if judge_available and verdict != "done":
                     return tool_error(
                         f"Goal completion rejected by judge: {reason}. "
                         f"To proceed, either: (1) provide explicit acceptance "

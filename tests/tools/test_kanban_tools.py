@@ -621,7 +621,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
     def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
-        return "continue", "missing verification evidence", False
+        return "continue", "missing verification evidence", False, None
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
     monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
@@ -680,7 +680,10 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
         raise AssertionError("judge_goal must not run when no judge is available")
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", fail_if_called)
-    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: False)
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda task_name: (None, None),
+    )
 
     out = kt._handle_complete({"summary": "done enough"})
     d = json.loads(out)
@@ -739,6 +742,87 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
     return goal_task_id
+
+
+def test_complete_goal_mode_allows_additive_judge_result(monkeypatch, tmp_path):
+    """Additive judge fields must not break a valid completion verdict."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "tools.kanban_tools.judge_goal",
+        lambda *args, **kwargs: ("done", "verified", False, None, {"future": True}),
+    )
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    result = json.loads(kt._handle_complete({"summary": "verified evidence"}))
+    assert result.get("ok") is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+    finally:
+        conn.close()
+
+
+def test_complete_goal_mode_judge_exception_leaves_task_running(monkeypatch, tmp_path):
+    """A reachable-but-broken judge must never be mistaken for approval."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+
+    def broken_judge(*args, **kwargs):
+        raise RuntimeError("judge contract drift")
+
+    monkeypatch.setattr("tools.kanban_tools.judge_goal", broken_judge)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    result = json.loads(kt._handle_complete({"summary": "unverified"}))
+    assert "error" in result
+    assert "could not be verified" in result["error"]
+    assert "RuntimeError" in result["error"]
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_goal_mode_availability_lookup_exception_leaves_task_running(
+    monkeypatch, tmp_path
+):
+    """A broken availability lookup is not the same as no configured judge."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+
+    def broken_lookup(task_name):
+        raise RuntimeError("auxiliary configuration is invalid")
+
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client", broken_lookup
+    )
+
+    result = json.loads(kt._handle_complete({"summary": "unverified"}))
+    assert "error" in result
+    assert "could not be verified" in result["error"]
+    assert "RuntimeError" in result["error"]
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+    finally:
+        conn.close()
 
 
 def test_block_goal_mode_rejects_missing_kind(monkeypatch, tmp_path):
