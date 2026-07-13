@@ -2732,10 +2732,12 @@ def _string_list(value: Any) -> tuple[str, ...]:
 def _review_source_from_mapping(raw: Any, gate: dict[str, Any]) -> Optional[ReviewSource]:
     """Resolve a review target from a trusted structured handoff.
 
-    Structured handoffs must name an existing repo/worktree under a configured
-    review root plus a worktree locator, branch/commit/PR, or changed-file/diff
-    evidence. A bare prose path or empty JSON object is not enough to dispatch
-    another agent.
+    Closed-loop review is intentionally independent of the create-time review
+    gate's configured roots.  A worker can already name arbitrary local source
+    in its handoff; the safety boundary here is positive, structured evidence:
+    an existing repo/worktree plus a worktree locator, branch/commit/PR, or
+    changed-file/diff evidence.  A bare prose path or empty JSON object is not
+    enough to dispatch another agent.
     """
     if not isinstance(raw, dict):
         return None
@@ -2757,8 +2759,6 @@ def _review_source_from_mapping(raw: Any, gate: dict[str, Any]) -> Optional[Revi
     except OSError:
         return None
     if not repo_path.exists() or not repo_path.is_dir():
-        return None
-    if not any(_path_is_under(repo_path, root) for root in gate.get("roots", [])):
         return None
 
     branch = str(raw.get("branch") or "").strip() or None
@@ -2831,8 +2831,9 @@ def _structured_review_source_from_comments(
     Scratch workspaces are intentionally disposable. To let a scratch source
     task enter the closed-loop review path, the source owner must leave a JSON
     handoff naming an existing repo/worktree and concrete branch-or-diff
-    evidence under a configured review root. We do not infer from loose prose
-    paths or PR URLs.
+    evidence. We do not infer from loose prose paths or PR URLs. Configured
+    roots apply only to the optional create-time Hopewell review gate; an
+    explicit ``review-required:`` handoff can target any local source path.
     """
     trusted_authors = {"worker"}
     if source.assignee:

@@ -491,28 +491,6 @@ def test_review_loop_reuses_existing_source_worktree_as_dir(tmp_path, monkeypatc
     assert f"Branch: {branch}" in body
 
 
-def test_structured_review_source_stays_within_configured_roots(tmp_path):
-    allowed_root = tmp_path / "hopewell-dev"
-    allowed_worktree = allowed_root / "demo" / ".worktrees" / "source"
-    outside_worktree = tmp_path / "other" / "source"
-    allowed_worktree.mkdir(parents=True)
-    outside_worktree.mkdir(parents=True)
-    gate = {"roots": [str(allowed_root)]}
-
-    allowed = kb._review_source_from_mapping(
-        {"worktree": str(allowed_worktree), "branch": "dante/allowed"},
-        gate,
-    )
-    rejected = kb._review_source_from_mapping(
-        {"worktree": str(outside_worktree), "branch": "dante/outside"},
-        gate,
-    )
-
-    assert allowed is not None
-    assert allowed.repo_path == str(allowed_worktree)
-    assert rejected is None
-
-
 def test_review_required_dependency_block_stays_blocked_and_routes_review(tmp_path, monkeypatch):
     """The explicit review prefix must win over a mistaken dependency kind."""
     db_path = tmp_path / "kanban.db"
@@ -800,7 +778,7 @@ def test_review_loop_uses_structured_review_source_for_scratch_card(tmp_path, mo
     assert "Head SHA: abc123" in (review.body or "")
 
 
-def test_review_loop_rejects_out_of_root_m365_scratch_handoff(tmp_path, monkeypatch):
+def test_review_loop_routes_out_of_root_m365_scratch_handoff(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     allowed_root = tmp_path / "hopewell-dev"
     repo = tmp_path / ".hermes" / "openclaw-universe" / "mcp" / "m365" / "ms-365-mcp-server"
@@ -843,16 +821,22 @@ def test_review_loop_rejects_out_of_root_m365_scratch_handoff(tmp_path, monkeypa
             task for task in kb.list_tasks(conn, include_archived=True)
             if task.created_by == kb.REVIEW_LOOP_CREATED_BY
         ]
-        source = kb.get_task(conn, source_id)
-        events = kb.list_events(conn, source_id)
 
-    assert source is not None and source.status == "blocked"
-    assert reviews == []
-    unavailable = [event for event in events if event.kind == "review_escalation"]
-    assert len(unavailable) == 1
-    assert unavailable[0].payload is not None
-    assert unavailable[0].payload["verdict"] == "cannot_review"
-    assert unavailable[0].payload["reason"] == "insufficient_review_evidence"
+    assert len(reviews) == 1
+    review = reviews[0]
+    assert review.assignee == "code-reviewer"
+    assert review.workspace_kind == "dir"
+    assert review.workspace_path == str(worktree)
+    assert review.branch_name is None
+    assert review.idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
+    body = review.body or ""
+    assert f"Source task: {source_id}" in body
+    assert f"Workspace: {worktree}" not in body
+    assert f"Review source: {worktree}" in body
+    assert "wren/source-task-m365-tool-descriptions" in body
+    assert f"Head SHA: {'b' * 40}" in body
+    assert "src/graph-tools.ts" in body
+    assert "193/193 passed" in body
 
 
 def test_review_loop_records_cannot_review_for_insufficient_scratch_evidence(tmp_path, monkeypatch):
