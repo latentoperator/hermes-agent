@@ -438,9 +438,79 @@ def test_review_required_block_creates_ready_closed_loop_review_card(tmp_path, m
     review = reviews[0]
     assert review.status == "ready"
     assert review.assignee == "code-reviewer"
+    assert review.workspace_kind == "dir"
     assert review.workspace_path == str(repo)
+    assert review.branch_name is None
     assert review.idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
-    assert f"Source task: {source_id}" in (review.body or "")
+    body = review.body or ""
+    assert f"Source task: {source_id}" in body
+    assert f"Workspace: {repo}" in body
+    assert f"Review source: {repo}" in body
+
+
+def test_review_loop_reuses_existing_source_worktree_as_dir(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    worktree = root / "demo-repo" / ".worktrees" / "source-task"
+    worktree.mkdir(parents=True)
+    branch = "dante/source-task-security-fix"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="repair security-sensitive refund behavior",
+            assignee="dante",
+            workspace_kind="worktree",
+            workspace_path=str(worktree),
+            branch_name=branch,
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: branch ready")
+        review = next(
+            task
+            for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        )
+
+    # The source branch is already checked out here. A reviewer must inspect
+    # that checkout directly instead of asking the dispatcher for a second
+    # worktree on the same branch.
+    assert review.workspace_kind == "dir"
+    assert review.workspace_path == str(worktree)
+    assert review.branch_name is None
+    assert kb.resolve_workspace(review) == worktree
+    body = review.body or ""
+    assert f"Source task: {source_id}" in body
+    assert f"Workspace: {worktree}" in body
+    assert f"Review source: {worktree}" in body
+    assert f"Branch: {branch}" in body
+
+
+def test_structured_review_source_stays_within_configured_roots(tmp_path):
+    allowed_root = tmp_path / "hopewell-dev"
+    allowed_worktree = allowed_root / "demo" / ".worktrees" / "source"
+    outside_worktree = tmp_path / "other" / "source"
+    allowed_worktree.mkdir(parents=True)
+    outside_worktree.mkdir(parents=True)
+    gate = {"roots": [str(allowed_root)]}
+
+    allowed = kb._review_source_from_mapping(
+        {"worktree": str(allowed_worktree), "branch": "dante/allowed"},
+        gate,
+    )
+    rejected = kb._review_source_from_mapping(
+        {"worktree": str(outside_worktree), "branch": "dante/outside"},
+        gate,
+    )
+
+    assert allowed is not None
+    assert allowed.repo_path == str(allowed_worktree)
+    assert rejected is None
 
 
 def test_review_required_dependency_block_stays_blocked_and_routes_review(tmp_path, monkeypatch):
@@ -727,9 +797,10 @@ def test_review_loop_uses_structured_review_source_for_scratch_card(tmp_path, mo
     assert f"Source task: {source_id}" in (review.body or "")
     assert f"Review source: {repo}" in (review.body or "")
     assert "dante/gathings-deploy-runner" in (review.body or "")
+    assert "Head SHA: abc123" in (review.body or "")
 
 
-def test_review_loop_routes_out_of_root_m365_scratch_handoff(tmp_path, monkeypatch):
+def test_review_loop_rejects_out_of_root_m365_scratch_handoff(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     allowed_root = tmp_path / "hopewell-dev"
     repo = tmp_path / ".hermes" / "openclaw-universe" / "mcp" / "m365" / "ms-365-mcp-server"
@@ -772,16 +843,16 @@ def test_review_loop_routes_out_of_root_m365_scratch_handoff(tmp_path, monkeypat
             task for task in kb.list_tasks(conn, include_archived=True)
             if task.created_by == kb.REVIEW_LOOP_CREATED_BY
         ]
+        source = kb.get_task(conn, source_id)
+        events = kb.list_events(conn, source_id)
 
-    assert len(reviews) == 1
-    review = reviews[0]
-    assert review.assignee == "code-reviewer"
-    assert review.workspace_kind == "dir"
-    assert review.workspace_path == str(worktree)
-    assert review.idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
-    assert f"Source task: {source_id}" in (review.body or "")
-    assert "wren/source-task-m365-tool-descriptions" in (review.body or "")
-    assert "193/193 passed" in (review.body or "")
+    assert source is not None and source.status == "blocked"
+    assert reviews == []
+    unavailable = [event for event in events if event.kind == "review_escalation"]
+    assert len(unavailable) == 1
+    assert unavailable[0].payload is not None
+    assert unavailable[0].payload["verdict"] == "cannot_review"
+    assert unavailable[0].payload["reason"] == "insufficient_review_evidence"
 
 
 def test_review_loop_records_cannot_review_for_insufficient_scratch_evidence(tmp_path, monkeypatch):
@@ -865,6 +936,8 @@ def test_review_loop_routes_out_of_root_dir_and_worktree_tasks_for_any_assignee(
 
     assert len(reviews) == 2
     assert {review.workspace_path for review in reviews} == {str(dir_repo), str(worktree)}
+    assert all(review.workspace_kind == "dir" for review in reviews)
+    assert all(review.branch_name is None for review in reviews)
     assert all(review.assignee == "code-reviewer" for review in reviews)
     source_links = [kb._review_loop_source_from_task(review) for review in reviews]
     assert all(source_link is not None for source_link in source_links)
