@@ -1384,6 +1384,11 @@ CREATE INDEX IF NOT EXISTS idx_dispatch_group_tasks_task
 
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
+_QUARANTINE_LOCK = threading.RLock()
+# Resolved DB path -> (device, inode, backup path, reason). The inode identity
+# deliberately survives mtime/size changes from cached writers; only atomic DB
+# replacement clears the quarantine.
+_QUARANTINED_PATHS: dict[str, tuple[int, int, Optional[Path], str]] = {}
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
@@ -1668,6 +1673,20 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+def is_corrupt_db_error(exc: BaseException) -> bool:
+    """Return whether SQLite reported structural corruption, not contention."""
+    if isinstance(exc, KanbanDbCorruptError):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    message = str(exc).lower()
+    return (
+        "file is not a database" in message
+        or "database disk image is malformed" in message
+        or "malformed database schema" in message
+    )
+
+
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
     """Copy a corrupt DB (and its WAL/SHM sidecars) to a content-addressed backup.
 
@@ -1720,6 +1739,164 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
         except OSError:
             pass
     return candidate
+
+
+def _quarantine_marker_path(path: Path) -> Path:
+    """Return the sidecar that quarantines one physical Kanban DB inode."""
+    resolved = path.expanduser().resolve()
+    return resolved.with_name(resolved.name + ".quarantine.json")
+
+
+@contextlib.contextmanager
+def _cross_process_quarantine_lock(path: Path):
+    """Serialize corrupt-inode preservation across independent processes.
+
+    Unlike the bounded first-init lock, this lock may block: copying one small
+    corrupt board is finite, and the OS releases the lock automatically if the
+    owner dies. Serializing here is what makes the one-backup-per-inode
+    guarantee hold across gateway, dashboard, CLI, and worker processes.
+    """
+    marker = _quarantine_marker_path(path)
+    lock_path = marker.with_name(marker.name + ".lock")
+    handle = lock_path.open("a+b")
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            locking = getattr(msvcrt, "locking")
+            lock_mode = getattr(msvcrt, "LK_LOCK")
+            locking(handle.fileno(), lock_mode, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if _IS_WINDOWS:
+                import msvcrt
+
+                handle.seek(0)
+                locking = getattr(msvcrt, "locking")
+                unlock_mode = getattr(msvcrt, "LK_UNLCK")
+                locking(handle.fileno(), unlock_mode, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _db_file_identity(path: Path) -> Optional[tuple[int, int]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return int(stat.st_dev), int(stat.st_ino)
+
+
+def _active_quarantine(
+    path: Path,
+) -> Optional[tuple[Optional[Path], str]]:
+    """Return active quarantine metadata, clearing stale replaced-inode state."""
+    resolved = path.expanduser().resolve()
+    key = str(resolved)
+    identity = _db_file_identity(resolved)
+    cached = _QUARANTINED_PATHS.get(key)
+    if cached is not None:
+        dev, ino, backup, reason = cached
+        if identity == (dev, ino):
+            return backup, reason
+        _QUARANTINED_PATHS.pop(key, None)
+
+    marker = _quarantine_marker_path(resolved)
+    try:
+        payload = json.loads(marker.read_text())
+        marker_identity = (int(payload["device"]), int(payload["inode"]))
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+    if identity != marker_identity:
+        # Recovery installs a verified DB with os.replace(), changing the
+        # inode. Its stale marker must not keep the replacement offline.
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        return None
+    backup_raw = payload.get("backup_path")
+    backup = Path(backup_raw) if backup_raw else None
+    reason = str(payload.get("reason") or "database quarantined after corruption")
+    _QUARANTINED_PATHS[key] = (
+        marker_identity[0], marker_identity[1], backup, reason,
+    )
+    return backup, reason
+
+
+def _raise_if_quarantined(path: Path) -> None:
+    active = _active_quarantine(path)
+    if active is None:
+        return
+    backup, reason = active
+    raise KanbanDbCorruptError(path.expanduser().resolve(), backup, reason)
+
+
+def quarantine_corrupt_db(path: Path, reason: str) -> Optional[Path]:
+    """Fail-close one physical corrupt DB and preserve at most one backup.
+
+    The marker is bound to ``(st_dev, st_ino)`` rather than content or mtime.
+    Cached gateway connections can therefore keep changing otherwise-readable
+    pages without causing one multi-megabyte backup per retry. A verified
+    recovery installed with :func:`os.replace` receives a new inode and clears
+    the quarantine automatically on the next :func:`connect`.
+    """
+    resolved = path.expanduser().resolve()
+    with _QUARANTINE_LOCK, _cross_process_quarantine_lock(resolved):
+        # Re-check under both locks: another process may have preserved and
+        # marked this inode while we were waiting.
+        active = _active_quarantine(resolved)
+        if active is not None:
+            return active[0]
+        identity = _db_file_identity(resolved)
+        if identity is None:
+            return None
+        backup = _backup_corrupt_db(resolved)
+        payload = {
+            "version": 1,
+            "database": str(resolved),
+            "device": identity[0],
+            "inode": identity[1],
+            "backup_path": str(backup) if backup is not None else None,
+            "reason": reason,
+            "detected_at": int(time.time()),
+        }
+        marker = _quarantine_marker_path(resolved)
+        tmp = marker.with_name(
+            f".{marker.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            with tmp.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(tmp, marker)
+            try:
+                dir_fd = os.open(str(marker.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        key = str(resolved)
+        _QUARANTINED_PATHS[key] = (identity[0], identity[1], backup, reason)
+        _INITIALIZED_PATHS.discard(key)
+        return backup
 
 
 def _guard_existing_db_is_healthy(path: Path) -> None:
@@ -1776,7 +1953,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
-    backup = _backup_corrupt_db(resolved)
+    backup = quarantine_corrupt_db(resolved, reason)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
@@ -1809,6 +1986,11 @@ def connect(
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Cross-process corruption markers are checked before the process-local
+    # initialization fast path. A gateway that previously validated this path
+    # must not keep opening fresh writers after another watcher quarantines the
+    # same physical DB inode.
+    _raise_if_quarantined(path)
 
     # Fast path: once THIS process has initialized this path, the expensive
     # first-open work (header validation, integrity probe, schema + additive
@@ -1836,6 +2018,9 @@ def connect(
         return conn
 
     with _cross_process_init_lock(path):
+        # Re-check after waiting: another process may have detected corruption
+        # while this process was blocked on first-open initialization.
+        _raise_if_quarantined(path)
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
         _validate_sqlite_header(path)

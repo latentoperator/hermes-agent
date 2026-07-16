@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import multiprocessing
 import os
 import sqlite3
 import subprocess
@@ -4339,6 +4340,32 @@ def _write_corrupt_db(path: Path) -> bytes:
     return blob
 
 
+def _quarantine_process_worker(
+    db_path: str,
+    counter_path: str,
+    barrier,
+) -> None:
+    """Process target that makes duplicate backup attempts observable."""
+    from hermes_cli import kanban_db as child_kb
+
+    real_backup = child_kb._backup_corrupt_db
+
+    def _counted_slow_backup(path: Path):
+        fd = os.open(counter_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+        finally:
+            os.close(fd)
+        time.sleep(0.2)
+        return real_backup(path)
+
+    child_kb._backup_corrupt_db = _counted_slow_backup
+    barrier.wait(timeout=5)
+    child_kb.quarantine_corrupt_db(
+        Path(db_path), "database disk image is malformed"
+    )
+
+
 def test_init_db_refuses_corrupt_existing_file(tmp_path):
     db_path = tmp_path / "kanban.db"
     original = _write_corrupt_db(db_path)
@@ -4368,42 +4395,98 @@ def test_connect_refuses_corrupt_existing_file(tmp_path):
         kb.connect(db_path=db_path)
 
 
-def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
-    """Repeated quarantines of the same corrupt bytes must not amplify disk usage.
+def test_corrupt_inode_quarantine_bounds_backups_across_in_place_changes(tmp_path):
+    """Once an inode is quarantined, later writes cannot amplify backups.
 
-    Regression for the gateway dispatcher's 5-min retry loop on shared kanban
-    DBs across multi-profile fleets: each retry on an unchanged corrupt file
-    used to create a fresh ``.corrupt.<timestamp>.bak`` until disk filled. The
-    content-addressed backup name is deterministic in the DB's sha256, so
-    N retries of the same bytes share one backup.
+    Cached gateway connections may keep changing otherwise-readable tables
+    after one b-tree becomes malformed. The quarantine is therefore bound to
+    the database inode, not its byte hash or mtime: one damaged inode gets one
+    preserved backup until an operator atomically replaces the DB.
     """
     db_path = tmp_path / "kanban.db"
     original = _write_corrupt_db(db_path)
 
-    backups: set[Path] = set()
-    for _ in range(10):
-        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-        with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
-            kb.connect(db_path=db_path)
-        assert excinfo.value.backup_path is not None
-        backups.add(excinfo.value.backup_path)
+    first_backup = kb.quarantine_corrupt_db(
+        db_path, "database disk image is malformed"
+    )
+    assert first_backup is not None
+    assert first_backup.read_bytes() == original
+    marker = kb._quarantine_marker_path(db_path)
+    assert marker.exists()
 
-    assert len(backups) == 1, f"expected 1 deterministic backup, got {len(backups)}"
-    (backup,) = backups
-    assert backup.exists()
-    assert backup.read_bytes() == original
-
-    # Mutate the corrupt bytes — fingerprint changes, separate backup preserved.
+    # Simulate a cached writer changing a healthy page on the same damaged
+    # database inode. That must not create a second multi-megabyte backup.
     with db_path.open("r+b") as f:
         f.seek(4096)
         f.write(b"\xAB" * 64)
-    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with pytest.raises(kb.KanbanDbCorruptError) as excinfo2:
+    second_backup = kb.quarantine_corrupt_db(
+        db_path, "database disk image is malformed"
+    )
+    assert second_backup == first_backup
+    assert list(tmp_path.glob("kanban.db.corrupt.*.bak")) == [first_backup]
+
+    # Simulate a different process whose initialization cache already contains
+    # the path: it must load the on-disk marker and fail closed before opening
+    # another writer connection.
+    kb._QUARANTINED_PATHS.clear()
+    kb._INITIALIZED_PATHS.add(str(db_path.resolve()))
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
         kb.connect(db_path=db_path)
-    second_backup = excinfo2.value.backup_path
-    assert second_backup is not None
-    assert second_backup != backup
-    assert second_backup.exists()
+    assert excinfo.value.backup_path == first_backup
+
+
+def test_corrupt_inode_quarantine_serializes_backup_across_processes(tmp_path):
+    """Concurrent detectors preserve one copy, not one copy per process."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("requires fork multiprocessing context")
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    counter = tmp_path / "backup-attempts.txt"
+    ctx = multiprocessing.get_context("fork")
+    process_count = 6
+    barrier = ctx.Barrier(process_count)
+    processes = [
+        ctx.Process(
+            target=_quarantine_process_worker,
+            args=(str(db_path), str(counter), barrier),
+        )
+        for _ in range(process_count)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    attempts = counter.read_text().splitlines()
+    assert len(attempts) == 1, attempts
+    assert len(list(tmp_path.glob("kanban.db.corrupt.*.bak"))) == 1
+
+
+def test_atomic_replacement_clears_inode_quarantine(tmp_path):
+    """A verified DB installed with os.replace is a new inode and may reopen."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    kb.quarantine_corrupt_db(db_path, "database disk image is malformed")
+    marker = kb._quarantine_marker_path(db_path)
+    assert marker.exists()
+
+    replacement = tmp_path / "replacement.db"
+    kb.init_db(db_path=replacement)
+    with kb.connect_closing(db_path=replacement) as conn:
+        kb.create_task(conn, title="preserved replacement")
+    for suffix in ("-wal", "-shm"):
+        sidecar = replacement.with_name(replacement.name + suffix)
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+    os.replace(replacement, db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with kb.connect(db_path=db_path) as conn:
+        assert [task.title for task in kb.list_tasks(conn)] == ["preserved replacement"]
+    assert not marker.exists()
 
 
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):

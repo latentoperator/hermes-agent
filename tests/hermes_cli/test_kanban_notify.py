@@ -657,3 +657,48 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Only the real file was uploaded.
     assert len(documents_uploaded) == 1
     assert "real.pdf" in documents_uploaded[0]
+
+
+@pytest.mark.asyncio
+async def test_notifier_quarantines_runtime_corruption_before_next_tick(kanban_home):
+    """Malformed pages discovered after process init must quarantine the DB.
+
+    The notifier is often the first reader to touch the high-churn
+    ``kanban_notify_subs`` b-tree. Merely logging and retrying lets cached
+    dispatcher connections continue writing the same corrupt inode.
+    """
+    import sqlite3
+
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner.adapters = {Platform.TELEGRAM: MagicMock()}
+
+    original_sleep = asyncio.sleep
+    sleep_calls = 0
+
+    async def _fast_sleep(_):
+        nonlocal sleep_calls
+        await original_sleep(0)
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            runner._running = False
+
+    quarantine = MagicMock(return_value=Path("/tmp/corrupt.bak"))
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch(
+             "hermes_cli.kanban_db.list_notify_subs",
+             side_effect=sqlite3.DatabaseError("database disk image is malformed"),
+         ), \
+         patch("hermes_cli.kanban_db.quarantine_corrupt_db", quarantine):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1), timeout=10.0,
+        )
+
+    assert quarantine.call_count == 1
+    quarantined_path, reason = quarantine.call_args.args
+    assert Path(quarantined_path).resolve() == kb.kanban_db_path().resolve()
+    assert "database disk image is malformed" in reason

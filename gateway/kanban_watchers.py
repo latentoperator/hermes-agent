@@ -407,6 +407,21 @@ class GatewayKanbanWatchersMixin:
                                     "board": slug,
                                     "delivery_profile": owner_profile or "",
                                 })
+                        except sqlite3.DatabaseError as exc:
+                            if not _kb.is_corrupt_db_error(exc):
+                                raise
+                            backup = _kb.quarantine_corrupt_db(
+                                Path(resolved_db_path),
+                                f"runtime SQLite corruption detected by notifier: {exc}",
+                            )
+                            logger.error(
+                                "kanban notifier: quarantined corrupt board %s database %s; "
+                                "all fresh Kanban connections will fail closed until the DB "
+                                "is atomically replaced (backup=%s)",
+                                slug,
+                                resolved_db_path,
+                                backup or "<backup failed>",
+                            )
                         finally:
                             conn.close()
                     return deliveries
@@ -1172,16 +1187,25 @@ class GatewayKanbanWatchersMixin:
             return (resolved, stat.st_mtime_ns, stat.st_size)
 
         def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
-            if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
-                return True
-            if not isinstance(exc, sqlite3.DatabaseError):
-                return False
-            msg = str(exc).lower()
-            return (
-                "file is not a database" in msg
-                or "database disk image is malformed" in msg
-            )
+            return _kb.is_corrupt_db_error(exc)
+
+        def _quarantine_corrupt_board(
+            fingerprint: tuple[str, int | None, int | None],
+            exc: Exception,
+        ) -> None:
+            try:
+                _kb.quarantine_corrupt_db(
+                    Path(fingerprint[0]),
+                    f"runtime SQLite corruption detected by dispatcher: {exc}",
+                )
+            except Exception as quarantine_exc:
+                # Keep the original corruption signal primary. A failed backup
+                # or marker write must not turn dispatch back on.
+                logger.error(
+                    "kanban dispatcher: failed to persist corruption quarantine for %s: %s",
+                    fingerprint[0],
+                    quarantine_exc,
+                )
 
         def _tick_once_for_board(slug: str) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
@@ -1236,6 +1260,7 @@ class GatewayKanbanWatchersMixin:
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
+                    _quarantine_corrupt_board(fingerprint, exc)
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
                     logger.error(
                         "kanban dispatcher: board %s database %s is not a valid "
@@ -1251,6 +1276,7 @@ class GatewayKanbanWatchersMixin:
                 return None
             except Exception as exc:
                 if _is_corrupt_board_db_error(exc):
+                    _quarantine_corrupt_board(fingerprint, exc)
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
                     logger.error(
                         "kanban dispatcher: board %s database %s is not a valid "

@@ -3750,6 +3750,13 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     )
     monkeypatch.setattr(_kb, "kanban_db_path", lambda board=None: corrupt_db)
 
+    quarantines: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        _kb,
+        "quarantine_corrupt_db",
+        lambda path, reason: quarantines.append((Path(path), reason))
+        or corrupt_db.with_suffix(".db.corrupt.test.bak"),
+    )
     calls = {"connect": 0, "to_thread": 0}
 
     def _connect(*args, **kwargs):
@@ -3802,6 +3809,9 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     # added the review-column probe alongside the existing ready-column
     # probe, bumping this from 3 → 5.
     assert calls["connect"] == 5
+    assert len(quarantines) == 1
+    assert quarantines[0][0].resolve() == corrupt_db.resolve()
+    assert "database" in quarantines[0][1].lower()
 
 
 def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
