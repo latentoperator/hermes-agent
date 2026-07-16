@@ -632,6 +632,63 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         conn2.close()
 
 
+def test_notify_success_cursor_cannot_regress_newer_claim(kanban_home):
+    """A slow notifier's stale success must not replay a newer event."""
+    conn1 = kb.connect()
+    conn2 = kb.connect()
+    try:
+        tid = kb.create_task(conn1, title="x", assignee="w")
+        kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
+        kb.complete_task(conn1, tid, result="ok")
+
+        _, first_cursor, first_events = kb.claim_unseen_events_for_sub(
+            conn1,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["completed", "commented"],
+        )
+        assert [event.kind for event in first_events] == ["completed"]
+
+        kb.add_comment(conn2, tid, "reviewer", "later event")
+        _, second_cursor, second_events = kb.claim_unseen_events_for_sub(
+            conn2,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["completed", "commented"],
+        )
+        assert [event.kind for event in second_events] == ["commented"]
+        assert second_cursor > first_cursor
+
+        # The first delivery completes late. This used to assign its stale
+        # cursor unconditionally, causing the second event to be reclaimed.
+        kb.advance_notify_cursor(
+            conn1,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            new_cursor=first_cursor,
+        )
+        row = conn1.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = 'telegram' AND chat_id = '123'",
+            (tid,),
+        ).fetchone()
+        assert int(row["last_event_id"]) == second_cursor
+        _, _, replayed = kb.claim_unseen_events_for_sub(
+            conn2,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            kinds=["completed", "commented"],
+        )
+        assert replayed == []
+    finally:
+        conn1.close()
+        conn2.close()
+
+
 # ---------------------------------------------------------------------------
 # GC + retention
 # ---------------------------------------------------------------------------

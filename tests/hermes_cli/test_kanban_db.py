@@ -4366,6 +4366,35 @@ def _quarantine_process_worker(
     )
 
 
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ((3, 44, 5), False),
+        ((3, 44, 6), True),
+        ((3, 45, 0), False),
+        ((3, 50, 6), False),
+        ((3, 50, 7), True),
+        ((3, 51, 2), False),
+        ((3, 51, 3), True),
+        ((3, 52, 0), True),
+    ],
+)
+def test_sqlite_wal_reset_fix_version_gate(version, expected):
+    assert kb._sqlite_has_wal_reset_fix(version) is expected
+
+
+def test_vulnerable_sqlite_defaults_kanban_to_delete_journal(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_JOURNAL_MODE", raising=False)
+    monkeypatch.setattr(kb.sqlite3, "sqlite_version_info", (3, 50, 4))
+    db_path = tmp_path / "kanban.db"
+    conn = kb.connect(db_path=db_path)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+    finally:
+        conn.close()
+
+
 def test_init_db_refuses_corrupt_existing_file(tmp_path):
     db_path = tmp_path / "kanban.db"
     original = _write_corrupt_db(db_path)
@@ -4433,6 +4462,43 @@ def test_corrupt_inode_quarantine_bounds_backups_across_in_place_changes(tmp_pat
     with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
         kb.connect(db_path=db_path)
     assert excinfo.value.backup_path == first_backup
+
+
+def test_quarantine_blocks_already_open_connection_writes(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    try:
+        task_id = kb.create_task(conn, title="preserved")
+        kb.quarantine_corrupt_db(db_path, "simulated runtime detection")
+
+        # Reads remain available for recovery, but a held connection must not
+        # start another write after another process quarantines the inode.
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.title == "preserved"
+        with pytest.raises(kb.KanbanDbCorruptError):
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET title = 'lost' WHERE id = ?", (task_id,))
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.title == "preserved"
+    finally:
+        conn.close()
+
+
+def test_quarantine_appearing_mid_transaction_rolls_back(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    try:
+        task_id = kb.create_task(conn, title="before")
+        with pytest.raises(kb.KanbanDbCorruptError):
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET title = 'uncommitted' WHERE id = ?", (task_id,))
+                kb.quarantine_corrupt_db(db_path, "detected while transaction open")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.title == "before"
+    finally:
+        conn.close()
 
 
 def test_corrupt_inode_quarantine_serializes_backup_across_processes(tmp_path):

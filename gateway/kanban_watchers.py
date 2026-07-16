@@ -435,11 +435,8 @@ class GatewayKanbanWatchersMixin:
                     try:
                         plat = _Platform(platform_str)
                     except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
+                        # The claim already advanced the cursor atomically, so
+                        # skipping an unknown platform cannot replay forever.
                         continue
                     sub_profile = d.get("delivery_profile") or sub.get("notifier_profile") or ""
                     # Route via the SAME chokepoint the authorization path uses
@@ -631,12 +628,9 @@ class GatewayKanbanWatchersMixin:
                             # dropping the subscription is the terminal action.
                             break
                     else:
-                        # All events delivered; advance cursor. The cursor
-                        # is the dedup mechanism — it prevents re-delivery
-                        # of the same event on subsequent ticks.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
+                        # The claim already advanced the cursor atomically.
+                        # Do not write it again here: a slow delivery can finish
+                        # after a newer watcher claim and regress that progress.
                         # Unsubscribe only when the task has reached a truly
                         # final status (done / archived). For blocked /
                         # gave_up / crashed / timed_out the subscription is

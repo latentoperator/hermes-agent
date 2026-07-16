@@ -1389,6 +1389,7 @@ _QUARANTINE_LOCK = threading.RLock()
 # deliberately survives mtime/size changes from cached writers; only atomic DB
 # replacement clears the quarantine.
 _QUARANTINED_PATHS: dict[str, tuple[int, int, Optional[Path], str]] = {}
+_DELETE_JOURNAL_WARNED_PATHS: set[str] = set()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
@@ -1432,6 +1433,74 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     return conn
+
+
+def _sqlite_has_wal_reset_fix(
+    version: tuple[int, ...] = sqlite3.sqlite_version_info,
+) -> bool:
+    """Return whether SQLite includes the WAL-reset corruption fix.
+
+    SQLite documents the fix in 3.51.3+, with maintained-branch backports in
+    3.50.7 and 3.44.6. Versions between those branches are not assumed patched.
+    """
+    normalized = tuple(version[:3])
+    if normalized >= (3, 51, 3):
+        return True
+    if (3, 50, 7) <= normalized < (3, 51, 0):
+        return True
+    return (3, 44, 6) <= normalized < (3, 45, 0)
+
+
+def _configure_kanban_journal_mode(conn: sqlite3.Connection, path: Path) -> str:
+    """Use WAL only on a runtime with SQLite's WAL-reset fix.
+
+    ``HERMES_KANBAN_JOURNAL_MODE`` may explicitly request ``delete`` or
+    ``wal``. The default ``auto`` fails safe to rollback-journal mode on known
+    vulnerable SQLite builds. An explicit WAL override is retained for
+    controlled A/B tests, but logs a warning when the runtime is vulnerable.
+    """
+    requested = os.environ.get("HERMES_KANBAN_JOURNAL_MODE", "auto").strip().lower()
+    if requested not in {"auto", "delete", "wal"}:
+        raise ValueError(
+            "HERMES_KANBAN_JOURNAL_MODE must be one of: auto, delete, wal"
+        )
+    wal_safe = _sqlite_has_wal_reset_fix(tuple(sqlite3.sqlite_version_info))
+    desired = requested if requested != "auto" else ("wal" if wal_safe else "delete")
+    resolved = str(path.expanduser().resolve())
+
+    if desired == "wal":
+        if not wal_safe and resolved not in _DELETE_JOURNAL_WARNED_PATHS:
+            _log.warning(
+                "kanban.db (%s): explicit WAL override on SQLite %s, which is "
+                "vulnerable to the WAL-reset corruption bug",
+                path.name,
+                sqlite3.sqlite_version,
+            )
+            _DELETE_JOURNAL_WARNED_PATHS.add(resolved)
+        from hermes_state import apply_wal_with_fallback
+
+        mode = str(
+            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+            or "wal"
+        ).lower()
+    else:
+        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+        mode = str(row[0] if row else "").lower()
+        if mode != "delete":
+            raise sqlite3.OperationalError(
+                f"failed to activate DELETE journal mode for {path}: got {mode!r}"
+            )
+        if resolved not in _DELETE_JOURNAL_WARNED_PATHS:
+            _log.warning(
+                "kanban.db (%s): SQLite %s lacks the WAL-reset fix; using "
+                "journal_mode=DELETE until SQLite is upgraded to 3.50.7 or 3.51.3+",
+                path.name,
+                sqlite3.sqlite_version,
+            )
+            _DELETE_JOURNAL_WARNED_PATHS.add(resolved)
+
+    conn.execute("PRAGMA synchronous=FULL")
+    return mode
 
 
 @contextlib.contextmanager
@@ -2008,6 +2077,7 @@ def connect(
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
+                conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
                 conn.execute("PRAGMA secure_delete=ON")
@@ -2047,13 +2117,11 @@ def connect(
                 # is healthy. Once this process has initialized the DB path,
                 # subsequent connects only need per-connection pragmas below.
                 if needs_init:
-                    # WAL doesn't work on network filesystems (NFS/SMB/FUSE).
-                    # Shared helper falls back to DELETE with one WARNING so kanban
-                    # stays usable there. See hermes_state._WAL_INCOMPAT_MARKERS.
-                    from hermes_state import apply_wal_with_fallback
-                    apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-                    # FULL (was NORMAL): fsync before each checkpoint to narrow the
-                    # crash window that can leave a b-tree page header torn.
+                    # SQLite's WAL-reset race can corrupt multi-process WAL
+                    # databases on vulnerable releases. Use rollback-journal
+                    # mode until the linked runtime contains the official fix.
+                    _configure_kanban_journal_mode(conn, path)
+                else:
                     conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
@@ -2594,6 +2662,25 @@ def _is_busy_error(exc: BaseException) -> bool:
     )
 
 
+def _connection_main_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Resolve the main on-disk DB path for a possibly long-held connection."""
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    for row in rows:
+        # PRAGMA database_list columns are seq, name, file.
+        if str(row[1]) == "main" and str(row[2]):
+            return Path(str(row[2])).expanduser().resolve()
+    return None
+
+
+def _raise_if_connection_quarantined(conn: sqlite3.Connection) -> None:
+    path = _connection_main_db_path(conn)
+    if path is not None:
+        _raise_if_quarantined(path)
+
+
 def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
     for attempt in range(_BUSY_MAX_RETRIES + 1):
         try:
@@ -2617,9 +2704,14 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    _raise_if_connection_quarantined(conn)
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
+        # A different process may quarantine this inode while this transaction
+        # is open. Refuse COMMIT so already-held connections cannot extend a
+        # known-corrupt incident or mutate cards after preservation begins.
+        _raise_if_connection_quarantined(conn)
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -10396,9 +10488,16 @@ def advance_notify_cursor(
     thread_id: Optional[str] = None,
     new_cursor: int,
 ) -> None:
+    """Advance a notification cursor without regressing newer progress.
+
+    Claims already advance the cursor transactionally. This helper remains for
+    compatibility, but a late success from an older notifier must not overwrite
+    a newer claim.
+    """
     with write_txn(conn):
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs "
+            "SET last_event_id = MAX(last_event_id, ?) "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
         )
