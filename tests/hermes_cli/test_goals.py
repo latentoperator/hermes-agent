@@ -204,6 +204,7 @@ class TestJudgeGoal:
             verdict, reason, _, _wd = goals.judge_goal("goal", "agent response")
         assert verdict == "done"
         assert reason == "achieved"
+        assert fake_client.chat.completions.create.call_args.kwargs["temperature"] == 1
 
     def test_judge_says_continue(self):
         from hermes_cli import goals
