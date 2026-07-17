@@ -204,7 +204,7 @@ class TestJudgeGoal:
             verdict, reason, _, _wd = goals.judge_goal("goal", "agent response")
         assert verdict == "done"
         assert reason == "achieved"
-        assert fake_client.chat.completions.create.call_args.kwargs["temperature"] == 1
+        assert "temperature" not in fake_client.chat.completions.create.call_args.kwargs
 
     def test_judge_says_continue(self):
         from hermes_cli import goals
@@ -1429,6 +1429,8 @@ class TestDraftContract:
         from unittest.mock import patch
         from hermes_cli import goals
 
+        captured = {}
+
         class _FakeMsg:
             content = (
                 '{"outcome": "auth on JWT", "verification": "auth suite green", '
@@ -1444,6 +1446,7 @@ class TestDraftContract:
                 class completions:
                     @staticmethod
                     def create(**kwargs):
+                        captured.update(kwargs)
                         return _FakeResp()
 
         with patch("agent.auxiliary_client.get_text_auxiliary_client",
@@ -1454,6 +1457,7 @@ class TestDraftContract:
         assert contract.outcome == "auth on JWT"
         assert contract.verification == "auth suite green"
         assert not contract.is_empty()
+        assert "temperature" not in captured
 
     def test_draft_returns_none_on_bad_json(self, hermes_home):
         from unittest.mock import patch
