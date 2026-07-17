@@ -39,6 +39,7 @@ def _urlopen_model_catalog_request(req: urllib.request.Request, *, timeout: floa
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
     # Chris quick picks
+    ("moonshotai/kimi-k3",                     ""),
     ("moonshotai/kimi-k2.7-code",              ""),
     ("z-ai/glm-5.2",                           ""),
     # Anthropic
