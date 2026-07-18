@@ -183,47 +183,6 @@ class TestApplyWalWithFallback:
         finally:
             check.close()
 
-    def test_treats_disk_io_error_as_success_when_db_already_wal(self, tmp_path):
-        """Gateway races can make setting WAL fail even though DB is already WAL.
-
-        ``apply_wal_with_fallback`` is called on every short-lived Kanban DB
-        connection. Under dispatcher/notifier concurrency, SQLite can raise a
-        transient ``disk I/O error`` while re-applying ``journal_mode=WAL``.
-        If the DB is already in WAL mode, the connection is usable and we must
-        not try to flip it back to DELETE (which needs an exclusive lock and can
-        fail repeatedly, disabling Kanban notifications).
-        """
-
-        target = tmp_path / "already-wal.db"
-        real_conn = sqlite3.connect(str(target), isolation_level=None)
-        real_conn.execute("PRAGMA journal_mode=WAL")
-        real_conn.close()
-
-        attempts = [0]
-        probe_failures = [0]
-
-        class _AlreadyWalButSetFails(sqlite3.Connection):
-            def execute(self, sql, *args, **kwargs):  # type: ignore[override]
-                normalized = sql.lower().replace(" ", "")
-                if "journal_mode=wal" in normalized:
-                    attempts[0] += 1
-                    raise sqlite3.OperationalError("disk I/O error")
-                if normalized == "pragmajournal_mode" and probe_failures[0] == 0:
-                    probe_failures[0] += 1
-                    raise sqlite3.OperationalError("database is locked")
-                return super().execute(sql, *args, **kwargs)
-
-        conn = sqlite3.connect(
-            str(target), factory=_AlreadyWalButSetFails, isolation_level=None
-        )
-        try:
-            mode = apply_wal_with_fallback(conn, db_label="already-wal.db")
-            assert mode == "wal"
-            assert attempts[0] == 1
-            assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
-        finally:
-            conn.close()
-
     def test_reraises_unrelated_operational_error(self, tmp_path):
         """Non-WAL-compat errors must NOT be silently swallowed by the fallback."""
         conn, _ = _open_blocking(

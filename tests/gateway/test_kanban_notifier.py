@@ -43,7 +43,9 @@ def _make_runner(adapter, profile="worker"):
     runner = GatewayRunner.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
-    runner._profile_adapters = {}
+    runner._profile_adapters = {
+        profile: {Platform.TELEGRAM: adapter},
+    }
     runner._kanban_sub_fail_counts = {}
     runner._kanban_notifier_profile = profile
     return runner

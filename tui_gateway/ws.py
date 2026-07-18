@@ -284,7 +284,7 @@ async def handle_ws(
     ws: Any,
     *,
     close_sessions_on_disconnect: bool = False,
-    transport_factory: Callable[[Any, asyncio.AbstractEventLoop], Any] = WSTransport,
+    transport_factory: Callable[[Any, asyncio.AbstractEventLoop], Any] | None = None,
 ) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
 
@@ -309,7 +309,7 @@ async def handle_ws(
         _log.info("ws accepted peer=%s", peer)
 
         loop = asyncio.get_running_loop()
-        if transport_factory is WSTransport:
+        if transport_factory is None:
             transport = WSTransport(ws, loop, peer=peer)
         else:
             transport = transport_factory(ws, loop)

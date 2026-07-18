@@ -195,13 +195,13 @@ def test_connect_skips_journal_mode_negotiation_after_process_init(tmp_path, mon
 
     calls = {"count": 0}
 
-    def fake_apply(conn, *, db_label="state.db"):
+    def fake_configure(conn, path):
         calls["count"] += 1
         if calls["count"] > 1:
             raise sqlite3.OperationalError("disk I/O error")
-        return "wal"
+        return "delete"
 
-    monkeypatch.setattr("hermes_state.apply_wal_with_fallback", fake_apply)
+    monkeypatch.setattr(kb, "_configure_kanban_journal_mode", fake_configure)
 
     first = kb.connect(board="default")
     first.close()
@@ -215,8 +215,10 @@ def test_connect_skips_journal_mode_negotiation_after_process_init(tmp_path, mon
     assert calls["count"] == 1
 
 
-def test_connect_skips_synchronous_pragma_after_process_init(tmp_path, monkeypatch):
-    """PRAGMA synchronous is DB-level WAL configuration, not per-connection setup."""
+def test_connect_reapplies_per_connection_pragmas_after_process_init(
+    tmp_path, monkeypatch
+):
+    """Fast-path connections retain durability and integrity pragmas."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -245,8 +247,6 @@ def test_connect_skips_synchronous_pragma_after_process_init(tmp_path, monkeypat
             normalized = " ".join(str(sql).upper().split())
             if normalized == "PRAGMA SYNCHRONOUS=FULL":
                 calls["synchronous"] += 1
-                if calls["synchronous"] > 1:
-                    raise sqlite3.OperationalError("disk I/O error")
             elif normalized == "PRAGMA FOREIGN_KEYS=ON":
                 calls["foreign_keys"] += 1
             return self._conn.execute(sql, *args, **kwargs)
@@ -269,4 +269,4 @@ def test_connect_skips_synchronous_pragma_after_process_init(tmp_path, monkeypat
     finally:
         second.close()
 
-    assert calls == {"synchronous": 1, "foreign_keys": 2}
+    assert calls == {"synchronous": 2, "foreign_keys": 2}
