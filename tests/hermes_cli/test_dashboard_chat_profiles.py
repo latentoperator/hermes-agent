@@ -66,5 +66,8 @@ def test_resolve_chat_argv_rejects_missing_profile(monkeypatch):
     )
     monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda value: False)
 
-    with pytest.raises(web_server.PtyUnavailableError, match="Profile 'missing' does not exist"):
+    with pytest.raises(web_server.HTTPException) as exc_info:
         web_server._resolve_chat_argv(profile="missing")
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "Profile 'missing' does not exist."

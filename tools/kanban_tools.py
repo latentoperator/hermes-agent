@@ -609,11 +609,16 @@ def _handle_complete(args: dict, **kw) -> str:
                 try:
                     judge_available = _goal_judge_available()
                     if judge_available:
-                        judge_result = judge_goal(
+                        verdict, reason, _, _, transport_failed = judge_goal(
                             goal=f"{task.title}\n\n{task.body or ''}".strip(),
                             last_response=(summary or result or "").strip(),
                         )
-                        verdict, reason = judge_result[:2]
+                        if transport_failed:
+                            return tool_error(
+                                "Goal completion could not be verified because "
+                                "the judge transport failed. The task remains "
+                                "running; retry completion after the judge is reachable."
+                            )
                 except Exception as judge_exc:
                     # Explicit unavailability is represented by False above.
                     # Exceptions mean the judge integration is broken and
