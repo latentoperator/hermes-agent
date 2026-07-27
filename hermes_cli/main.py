@@ -460,6 +460,7 @@ from hermes_cli.subcommands.dashboard import build_dashboard_parser
 from hermes_cli.subcommands.gui import build_gui_parser
 from hermes_cli.subcommands.logs import build_logs_parser
 from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
+from hermes_cli.subcommands.harness_health import build_harness_health_parser
 from hermes_cli.subcommands.memory import build_memory_parser
 from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
@@ -727,23 +728,50 @@ try:
 except Exception:
     pass  # best-effort — redaction stays at default (enabled) on config errors
 
-# Initialize centralized file logging early — all `hermes` subcommands
-# (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
+# Initialize centralized file logging early — ordinary `hermes` subcommands
+# write to agent.log + errors.log. Harness Health is a strict read-only audit,
+# so it deliberately skips target-profile file logging for this invocation.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
 # during GUI testing, including pre-dispatch startup failures.
-try:
-    from hermes_logging import setup_logging as _setup_logging
+_EARLY_VALUE_FLAGS = {
+    "-z", "--oneshot", "-m", "--model", "--provider", "-t", "--toolsets",
+    "-r", "--resume", "-s", "--skills", "--usage-file", "-c", "--continue",
+    "--reasoning",
+}
 
-    _setup_logging(
-        mode=(
-            "gui"
-            if next((arg for arg in sys.argv[1:] if not arg.startswith("-")), "")
-            in {"dashboard", "serve", "gui", "desktop"}
-            else "cli"
+
+def _early_subcommand_name() -> str:
+    """Find the subcommand without mistaking a global flag value for it."""
+    argv = sys.argv[1:]
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return argv[index + 1] if index + 1 < len(argv) else ""
+        if token.startswith("-"):
+            if "=" not in token and token in _EARLY_VALUE_FLAGS:
+                index += 2
+            else:
+                index += 1
+            continue
+        return token
+    return ""
+
+
+_EARLY_SUBCOMMAND = _early_subcommand_name()
+if _EARLY_SUBCOMMAND != "harness-health":
+    try:
+        from hermes_logging import setup_logging as _setup_logging
+
+        _setup_logging(
+            mode=(
+                "gui"
+                if _EARLY_SUBCOMMAND in {"dashboard", "serve", "gui", "desktop"}
+                else "cli"
+            )
         )
-    )
-except Exception:
-    pass  # best-effort — don't crash the CLI if logging setup fails
+    except Exception:
+        pass  # best-effort — don't crash the CLI if logging setup fails
 
 # Apply IPv4 preference early, before any HTTP clients are created.
 # We already determined whether to force IPv4 from the raw yaml read above —
@@ -15093,6 +15121,13 @@ def cmd_prompt_size(args):
     _impl(args)
 
 
+def cmd_harness_health(args):
+    """Audit configured harness inputs and persisted run evidence."""
+    from hermes_cli.harness_health import cmd_harness_health as _impl
+
+    _impl(args)
+
+
 def cmd_logs(args):
     """View and filter Hermes log files."""
     from hermes_cli.logs import tail_log, list_logs
@@ -15156,7 +15191,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "journey", "memory-graph", "learning",
         "model", "pairing", "pets", "plugins", "portal", "profile",
         "project", "proxy",
-        "prompt-size",
+        "prompt-size", "harness-health",
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
@@ -15176,22 +15211,10 @@ _BUILTIN_SUBCOMMANDS = frozenset(
 # Correctness-safe either way: missing an entry here only makes the
 # fast-path bail out too eagerly (we run plugin discovery when we didn't
 # need to); extra entries would make us skip a real positional.
-_TOP_LEVEL_VALUE_FLAGS = frozenset(
-    {
-        "-z", "--oneshot",
-        "-m", "--model",
-        "--provider",
-        "-t", "--toolsets",
-        "-r", "--resume",
-        "-s", "--skills",
-        "--usage-file",
-        # ``-c / --continue`` is nargs='?' (optional value). Treat it as
-        # value-taking: if the next token is a subcommand-looking word
-        # the user almost certainly meant it as the session name, and
-        # either interpretation keeps us on the safe side.
-        "-c", "--continue",
-    }
-)
+# ``-c / --continue`` is nargs='?' (optional value). Treat it as value-taking:
+# if the next token is subcommand-shaped the user almost certainly meant it as
+# the session name, and either interpretation keeps the discovery gate safe.
+_TOP_LEVEL_VALUE_FLAGS = frozenset(_EARLY_VALUE_FLAGS)
 
 
 def _first_positional_argv() -> str | None:
@@ -17977,6 +18000,11 @@ def main():
     # prompt-size command  (parser built in hermes_cli/subcommands/prompt_size.py)
     # =========================================================================
     build_prompt_size_parser(subparsers, cmd_prompt_size=cmd_prompt_size)
+
+    # harness-health command (read-only offline diagnostic)
+    build_harness_health_parser(
+        subparsers, cmd_harness_health=cmd_harness_health
+    )
 
     # =========================================================================
     # Parse and execute

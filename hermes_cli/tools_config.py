@@ -242,11 +242,12 @@ def _get_effective_configurable_toolsets():
     return result
 
 
-def _get_plugin_toolset_keys() -> set:
-    """Return the set of toolset keys provided by plugins."""
+def _get_plugin_toolset_keys(*, discover: bool = True) -> set:
+    """Return plugin toolset keys, optionally without triggering discovery."""
     try:
         from hermes_cli.plugins import discover_plugins, get_plugin_toolsets
-        discover_plugins()  # idempotent — ensures plugins are loaded
+        if discover:
+            discover_plugins()  # idempotent — ensures plugins are loaded
         return {ts_key for ts_key, _, _ in get_plugin_toolsets()}
     except Exception:
         return set()
@@ -1890,8 +1891,16 @@ def _get_platform_tools(
     platform: str,
     *,
     include_default_mcp_servers: bool = True,
+    discover_plugins: bool = True,
+    probe_credentials: bool = True,
 ) -> Set[str]:
-    """Resolve which individual toolset names are enabled for a platform."""
+    """Resolve enabled toolset names for a platform.
+
+    ``discover_plugins=False`` is for read-only diagnostics that may inspect an
+    arbitrary profile and must not execute plugin startup code. Already-loaded
+    plugin registrations remain visible. ``probe_credentials=False`` also
+    suppresses credential-store probes that may take an interprocess lock.
+    """
     from toolsets import resolve_toolset, TOOLSETS
 
     platform_toolsets = config.get("platform_toolsets") or {}
@@ -1916,7 +1925,7 @@ def _get_platform_tools(
     toolset_names = [str(ts) for ts in toolset_names]
 
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
-    plugin_ts_keys = _get_plugin_toolset_keys()
+    plugin_ts_keys = _get_plugin_toolset_keys(discover=discover_plugins)
     platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}
 
     # If the saved list contains any configurable keys directly, the user
@@ -2002,6 +2011,7 @@ def _get_platform_tools(
         # do, the saved list is authoritative.
         x_search_auto_enabled = (
             _toolset_allowed_for_platform("x_search", platform)
+            and probe_credentials
             and _xai_credentials_present()
         )
         if x_search_auto_enabled:

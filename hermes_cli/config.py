@@ -7420,13 +7420,21 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
 
 
 
-def read_raw_config() -> Dict[str, Any]:
+def read_raw_config(
+    *,
+    backup_corrupt: bool = True,
+    raise_on_error: bool = False,
+) -> Dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
 
     Returns the raw YAML dict, or ``{}`` if the file doesn't exist or can't
     be parsed.  Use this for lightweight config reads where you just need a
     single value and don't want the overhead of ``load_config()``'s deep-merge
     + migration pipeline.
+
+    ``backup_corrupt=False`` suppresses the normal recovery copy for strictly
+    read-only diagnostics. ``raise_on_error=True`` lets those callers report
+    parse failure as inaccessible evidence instead of silently using ``{}``.
 
     Cached on the config file's (mtime_ns, size) — same strategy as
     ``load_config()``. Returns a deepcopy on every call since some callers
@@ -7437,22 +7445,36 @@ def read_raw_config() -> Dict[str, Any]:
             config_path = get_config_path()
             st = config_path.stat()
             cache_key = (st.st_mtime_ns, st.st_size)
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError:
+            return {}
+        except OSError:
+            if raise_on_error:
+                raise
             return {}
 
         path_key = str(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
+        # Permissive reads normalize a non-mapping document to ``{}`` before
+        # caching it. Strict diagnostics must reparse so that normalization can
+        # never turn malformed evidence into a verified empty config.
+        if not raise_on_error and cached is not None and cached[:2] == cache_key:
             return copy.deepcopy(cached[2])
 
         try:
             with open(config_path, encoding="utf-8") as f:
-                data = fast_safe_load(f) or {}
+                data = fast_safe_load(f)
         except Exception as e:
-            _warn_config_parse_failure(config_path, e)
+            if backup_corrupt:
+                _warn_config_parse_failure(config_path, e)
+            if raise_on_error:
+                raise
             return {}
 
+        if data is None:
+            data = {}
         if not isinstance(data, dict):
+            if raise_on_error:
+                raise ValueError("config.yaml root must be a mapping")
             data = {}
         _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
         return data
