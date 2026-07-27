@@ -114,6 +114,7 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
 
         lei = {r["name"]: r for r in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
         assert lei["last_event_id"]["type"].upper() == "INTEGER"
+        assert "delivery_metadata" in lei
 
         # Data preserved across the rebuild.
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
@@ -250,6 +251,9 @@ def test_connect_reapplies_per_connection_pragmas_after_process_init(
             elif normalized == "PRAGMA FOREIGN_KEYS=ON":
                 calls["foreign_keys"] += 1
             return self._conn.execute(sql, *args, **kwargs)
+
+        def close(self):
+            self._conn.close()
 
         def __getattr__(self, name):
             return getattr(self._conn, name)
