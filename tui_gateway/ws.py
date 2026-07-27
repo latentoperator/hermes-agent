@@ -283,18 +283,8 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
-async def handle_ws(
-    ws: Any,
-    *,
-    close_sessions_on_disconnect: bool = False,
-    transport_factory: Callable[[Any, asyncio.AbstractEventLoop], Any] | None = None,
-) -> None:
-    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``.
-
-    Dashboard sidecar WebSockets run inside the long-lived dashboard server
-    process. When requested, sessions owned by this socket are explicitly
-    closed on disconnect through the unified server teardown path.
-    """
+async def handle_ws(ws: Any) -> None:
+    """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``."""
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
     messages = 0
@@ -311,11 +301,7 @@ async def handle_ws(
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
 
-        loop = asyncio.get_running_loop()
-        if transport_factory is None:
-            transport = WSTransport(ws, loop, peer=peer)
-        else:
-            transport = transport_factory(ws, loop)
+        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer)
 
         ready_ok = await transport.write_async(
             {
@@ -435,11 +421,6 @@ async def handle_ws(
         if transport is not None:
             server.unregister_live_transport(transport)
             transport.close()
-            if close_sessions_on_disconnect:
-                with server._sessions_lock:
-                    for sess in server._sessions.values():
-                        if sess.get("transport") is transport:
-                            sess["close_on_disconnect"] = True
 
             # Reap sessions this transport owned (close_on_disconnect sidecar
             # sessions) or detach the rest to the drop sentinel so later emits

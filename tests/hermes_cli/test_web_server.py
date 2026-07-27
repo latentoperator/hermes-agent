@@ -9847,6 +9847,35 @@ def test_resolve_chat_argv_injects_gateway_ws_url(monkeypatch):
     assert "token=" in gateway_url
 
 
+@pytest.mark.asyncio
+async def test_gateway_ws_preserves_sessions_for_desktop_reconnect(monkeypatch):
+    """A renderer reload must detach, not finalize, its live backend session.
+
+    ``hermes serve`` and the browser dashboard share this endpoint. Forcing
+    every socket-owned session into ``close_on_disconnect`` made Desktop cold
+    resume mistake a still-running turn for a crashed one and auto-continue
+    the same prompt a second time. The upstream WebSocket teardown already
+    parks sessions behind a reconnect grace window.
+    """
+    from hermes_cli import web_server as ws
+    from tui_gateway import ws as gateway_ws_module
+
+    socket = object()
+    handled: list[object] = []
+
+    async def fake_handle_ws(candidate):
+        handled.append(candidate)
+
+    monkeypatch.setattr(ws, "_ws_host_origin_reason", lambda _socket: None)
+    monkeypatch.setattr(ws, "_ws_auth_ok", lambda _socket: True)
+    monkeypatch.setattr(ws, "_ws_request_is_allowed", lambda _socket: True)
+    monkeypatch.setattr(gateway_ws_module, "handle_ws", fake_handle_ws)
+
+    await ws.gateway_ws(socket)
+
+    assert handled == [socket]
+
+
 class TestDashboardPluginStaticAssetAllowlist:
     """``/dashboard-plugins/<name>/<path>`` is unauthenticated by design —
     the SPA loads plugin JS via ``<script src>`` and CSS via

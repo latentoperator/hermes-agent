@@ -17594,6 +17594,7 @@ def _resolve_chat_argv(
     so a profile-scoped chat must spawn its own gateway subprocess.
     """
     from hermes_cli.main import PROJECT_ROOT, _apply_tui_python_env, _make_tui_argv
+
     profile_dir: Optional[Path] = None
     requested = (profile or "").strip()
     if requested and requested.lower() != "current":
@@ -18634,7 +18635,7 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws, close_sessions_on_disconnect=True)
+    await handle_ws(ws)
 
 
 # ---------------------------------------------------------------------------
