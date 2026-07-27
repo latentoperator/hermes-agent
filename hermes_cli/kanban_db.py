@@ -2050,7 +2050,7 @@ def _active_quarantine(
 
     marker = _quarantine_marker_path(resolved)
     try:
-        payload = json.loads(marker.read_text())
+        payload = json.loads(marker.read_text(encoding="utf-8"))
         marker_identity = (int(payload["device"]), int(payload["inode"]))
     except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         return None
@@ -2113,7 +2113,10 @@ def quarantine_corrupt_db(path: Path, reason: str) -> Optional[Path]:
             f".{marker.name}.{os.getpid()}.{threading.get_ident()}.tmp"
         )
         try:
-            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            tmp.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
             with tmp.open("rb") as handle:
                 os.fsync(handle.fileno())
             os.replace(tmp, marker)
@@ -10932,10 +10935,10 @@ def _default_spawn(
     # Keeping worker overrides after `chat` exercises the same parser path as
     # humans use (`hermes chat --provider ... -m ...`) and makes the override
     # observable in agent logs.
-    if task.provider_override:
-        cmd.extend(["--provider", task.provider_override])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
+    if task.provider_override:
+        cmd.extend(["--provider", task.provider_override])
     if task.reasoning_override:
         cmd.extend(["--reasoning", task.reasoning_override])
     if worker_toolsets:

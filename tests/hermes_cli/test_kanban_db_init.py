@@ -252,6 +252,9 @@ def test_connect_reapplies_per_connection_pragmas_after_process_init(
                 calls["foreign_keys"] += 1
             return self._conn.execute(sql, *args, **kwargs)
 
+        def close(self):
+            self._conn.close()
+
         def __getattr__(self, name):
             return getattr(self._conn, name)
 

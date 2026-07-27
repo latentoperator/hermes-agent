@@ -460,7 +460,7 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner._kanban_sub_fail_counts = {}
-    runner._kanban_notifier_profile = "business-partner"
+    runner._active_profile_name = MagicMock(return_value="business-partner")
 
     fake_adapter = MagicMock()
     fake_adapter.send = AsyncMock()
@@ -807,6 +807,7 @@ async def test_notifier_quarantines_runtime_corruption_before_next_tick(kanban_h
 
     quarantine = MagicMock(return_value=Path("/tmp/corrupt.bak"))
     with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep), \
+         patch("hermes_cli.kanban_db.count_notify_subs", return_value=1), \
          patch(
              "hermes_cli.kanban_db.list_notify_subs",
              side_effect=sqlite3.DatabaseError("database disk image is malformed"),
