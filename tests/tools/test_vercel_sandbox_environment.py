@@ -221,7 +221,12 @@ def vercel_module(vercel_sdk, monkeypatch):
     monkeypatch.setattr("tools.credential_files.iter_cache_files", lambda **kwargs: [])
 
     module = importlib.import_module("tools.environments.vercel_sandbox")
-    return importlib.reload(module)
+    module = importlib.reload(module)
+    # These unit tests provide a complete fake SDK through ``vercel_sdk``.
+    # Do not make a clean CI runner install the optional real dependency
+    # before exercising that fake.
+    monkeypatch.setattr(module, "_ensure_vercel_sdk", lambda: None)
+    return module
 
 
 @pytest.fixture()
