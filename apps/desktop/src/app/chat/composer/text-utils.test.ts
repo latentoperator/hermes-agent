@@ -51,6 +51,51 @@ describe('detectTrigger', () => {
     expect(detectTrigger('and/or')).toBeNull()
   })
 
+  it('keeps the at-mention live while walking into subfolders', () => {
+    // A `/` inside the query is path navigation, not the end of the token —
+    // the popover has to stay open so the next directory level can load.
+    expect(detectTrigger('@./')).toEqual({ kind: '@', query: './', tokenLength: 3 })
+    expect(detectTrigger('@./src')).toEqual({ kind: '@', query: './src', tokenLength: 6 })
+    expect(detectTrigger('@~/Desktop/')).toEqual({ kind: '@', query: '~/Desktop/', tokenLength: 11 })
+    expect(detectTrigger('@/usr/local')).toEqual({ kind: '@', query: '/usr/local', tokenLength: 11 })
+    expect(detectTrigger('@apps/desktop/src')).toEqual({
+      kind: '@',
+      query: 'apps/desktop/src',
+      tokenLength: 17
+    })
+  })
+
+  it('treats a chip edge as a token boundary, like whitespace', () => {
+    // U+FFFC is textBeforeCaret's placeholder for a committed pill. Upstream
+    // assistant-ui's Lexical DirectivePlugin gets the same semantics from node
+    // boundaries: typing a trigger right after a chip (no space) still opens
+    // the popover, and a chip inside a token ends it.
+    expect(detectTrigger('\uFFFC@Desk')).toEqual({ kind: '@', query: 'Desk', tokenLength: 5 })
+    // Not position 0, so it's an inline reference — not a command invocation.
+    expect(detectTrigger('\uFFFC/cle')).toEqual({ inline: true, kind: '/', query: 'cle', tokenLength: 4 })
+    // The placeholder itself never leaks into a query.
+    expect(detectTrigger('@a\uFFFCb')).toBeNull()
+  })
+
+  it('keeps the at-mention live for a typed ref kind with a path', () => {
+    expect(detectTrigger('@file:src/main.tsx')).toEqual({
+      kind: '@',
+      query: 'file:src/main.tsx',
+      tokenLength: 18
+    })
+    expect(detectTrigger('@folder:apps/')).toEqual({ kind: '@', query: 'folder:apps/', tokenLength: 13 })
+  })
+
+  it('still ends the at-mention token at whitespace', () => {
+    // The token is whitespace-delimited; a path doesn't change that.
+    expect(detectTrigger('@./src and more')).toBeNull()
+    expect(detectTrigger('look at @apps/desktop')).toEqual({
+      kind: '@',
+      query: 'apps/desktop',
+      tokenLength: 13
+    })
+  })
+
   it('treats a mid-message slash as an inline reference', () => {
     // Skills have to be reachable anywhere in a prompt, not just at position 0.
     expect(detectTrigger('hello /')).toEqual({ kind: '/', inline: true, query: '', tokenLength: 1 })

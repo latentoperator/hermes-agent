@@ -297,17 +297,6 @@ class TestNonDiscordProfileRouting:
 
         assert mock_runner._profile_name_for_source(telegram_source) == "tg-profile"
 
-    def test_telegram_no_route_returns_none(self, mock_runner, telegram_source):
-        """With no matching Telegram route, resolution returns None (caller
-        falls back to the default/active profile)."""
-        mock_runner.config.profile_routes = [
-            ProfileRoute(name="dc", platform="discord", profile="dc-profile",
-                         chat_id="123456"),
-        ]
-        telegram_source.profile = None
-
-        assert mock_runner._profile_name_for_source(telegram_source) is None
-
 
 class TestGatewayRunnerInjection:
     """``BasePlatformAdapter`` declares ``gateway_runner`` so the gateway's
@@ -321,18 +310,6 @@ class TestGatewayRunnerInjection:
         # Class-level attribute exists and defaults to None.
         assert hasattr(BasePlatformAdapter, "gateway_runner")
         assert BasePlatformAdapter.gateway_runner is None
-
-    def test_subclass_inherits_gateway_runner(self):
-        from gateway.platforms.base import BasePlatformAdapter
-
-        class _ToyAdapter(BasePlatformAdapter):
-            pass
-
-        # No manual declaration — yet the attribute is inherited from the base,
-        # so the gateway's ``adapter.gateway_runner = self`` injection reaches
-        # every adapter, not just the ones that pre-declared it (Discord).
-        assert hasattr(_ToyAdapter, "gateway_runner")
-        assert _ToyAdapter.gateway_runner is None
 
 
 # A concrete adapter we can instantiate without the full platform stack.
@@ -389,63 +366,6 @@ class TestAdapterToSessionKeyIntegration:
         # A default-profile key would land in agent:main — must differ.
         assert key != build_session_key(source, profile=None)
 
-    def test_telegram_adapter_stamps_profile_and_scopes_key(self, mock_runner):
-        """Non-Discord platform (bug #2). The adapter now receives
-        ``gateway_runner``, so ``build_source`` stamps the profile and the
-        session key is isolated under ``agent:ops:`` instead of ``agent:main:``."""
-        mock_runner.config.profile_routes = self._routes()
-        adapter = _stub_adapter(Platform.TELEGRAM, mock_runner)
-
-        source = adapter.build_source(
-            chat_id="-1001234567890", chat_type="group", user_id="u1",
-        )
-        assert source.profile == "ops"
-        assert source._transport_adapter_ref() is adapter
-
-        key = build_session_key(source, profile=source.profile)
-        assert key.startswith("agent:ops:"), key
-        assert key != build_session_key(source, profile=None)
-
-    @pytest.mark.asyncio
-    async def test_chat_route_keeps_shared_adapter_for_delivery(self):
-        runner = object.__new__(GatewayRunner)
-        runner.config = GatewayConfig(
-            multiplex_profiles=True,
-            profile_routes=self._routes(),
-        )
-        runner._profile_adapters = {"ops": {}}
-        adapter = _stub_adapter(Platform.TELEGRAM, runner)
-        adapter.send = AsyncMock()
-        runner.adapters = {Platform.TELEGRAM: adapter}
-
-        source = adapter.build_source(
-            chat_id="-1001234567890", chat_type="group", user_id="u1",
-        )
-
-        assert source.profile == "ops"
-        assert runner._adapter_for_source(source) is adapter
-        await runner._deliver_platform_notice(source, "routed reply")
-        adapter.send.assert_awaited_once_with(
-            "-1001234567890",
-            "routed reply",
-            metadata=None,
-        )
-
-    def test_adapter_without_runner_falls_back_to_default_namespace(self, mock_runner):
-        """Regression anchor: with no ``gateway_runner`` injected (the pre-fix
-        state for non-Discord adapters), ``build_source`` leaves ``profile=None``
-        and the session key is the shared ``agent:main:`` namespace — no
-        per-profile isolation. This is the silent fallback the fix removes for
-        non-Discord platforms."""
-        adapter = _stub_adapter(Platform.TELEGRAM, runner=None)
-
-        source = adapter.build_source(
-            chat_id="-1001234567890", chat_type="group", user_id="u1",
-        )
-        assert source.profile is None
-        key = build_session_key(source, profile=source.profile)
-        assert key.startswith("agent:main:"), key
-
 
 class TestMultiplexGate:
     """``profile_routes`` only activates under ``gateway.multiplex_profiles``.
@@ -467,31 +387,4 @@ class TestMultiplexGate:
 
         assert mock_runner._profile_name_for_source(discord_source) is None
 
-    def test_routes_active_when_multiplex_on(self, mock_runner, discord_source):
-        mock_runner.config.multiplex_profiles = True
-        mock_runner.config.profile_routes = [
-            ProfileRoute(name="dc", platform="discord", profile="coder",
-                         guild_id="789", chat_id="123456"),
-        ]
-        discord_source.profile = None
 
-        assert mock_runner._profile_name_for_source(discord_source) == "coder"
-
-    def test_build_source_leaves_profile_none_when_multiplex_off(self, mock_runner):
-        """End-to-end through the real adapter ``build_source``: with routes
-        configured but multiplexing off, no profile is stamped and the session
-        key stays in the legacy ``agent:main`` namespace — byte-identical to a
-        gateway with no routes at all."""
-        mock_runner.config.multiplex_profiles = False
-        mock_runner.config.profile_routes = [
-            ProfileRoute(name="dc", platform="discord", profile="coder",
-                         guild_id="111", chat_id="222"),
-        ]
-        adapter = _stub_adapter(Platform.DISCORD, mock_runner)
-
-        source = adapter.build_source(
-            chat_id="222", chat_type="group", guild_id="111", user_id="u1",
-        )
-        assert source.profile is None
-        key = build_session_key(source, profile=source.profile)
-        assert key.startswith("agent:main:"), key

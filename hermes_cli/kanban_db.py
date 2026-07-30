@@ -207,7 +207,7 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
     it through.
     """
     try:
-        from hermes_cli.plugins import invoke_hook
+        from hermes_cli.lifecycle import invoke_hook
         from hermes_cli.profiles import get_active_profile_name
         try:
             profile_name = get_active_profile_name()
@@ -1419,7 +1419,6 @@ _QUARANTINE_LOCK = threading.RLock()
 # deliberately survives mtime/size changes from cached writers; only atomic DB
 # replacement clears the quarantine.
 _QUARANTINED_PATHS: dict[str, tuple[int, int, Optional[Path], str]] = {}
-_DELETE_JOURNAL_WARNED_PATHS: set[str] = set()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
@@ -1481,74 +1480,6 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
     return conn
-
-
-def _sqlite_has_wal_reset_fix(
-    version: tuple[int, ...] = sqlite3.sqlite_version_info,
-) -> bool:
-    """Return whether SQLite includes the WAL-reset corruption fix.
-
-    SQLite documents the fix in 3.51.3+, with maintained-branch backports in
-    3.50.7 and 3.44.6. Versions between those branches are not assumed patched.
-    """
-    normalized = tuple(version[:3])
-    if normalized >= (3, 51, 3):
-        return True
-    if (3, 50, 7) <= normalized < (3, 51, 0):
-        return True
-    return (3, 44, 6) <= normalized < (3, 45, 0)
-
-
-def _configure_kanban_journal_mode(conn: sqlite3.Connection, path: Path) -> str:
-    """Use WAL only on a runtime with SQLite's WAL-reset fix.
-
-    ``HERMES_KANBAN_JOURNAL_MODE`` may explicitly request ``delete`` or
-    ``wal``. The default ``auto`` fails safe to rollback-journal mode on known
-    vulnerable SQLite builds. An explicit WAL override is retained for
-    controlled A/B tests, but logs a warning when the runtime is vulnerable.
-    """
-    requested = os.environ.get("HERMES_KANBAN_JOURNAL_MODE", "auto").strip().lower()
-    if requested not in {"auto", "delete", "wal"}:
-        raise ValueError(
-            "HERMES_KANBAN_JOURNAL_MODE must be one of: auto, delete, wal"
-        )
-    wal_safe = _sqlite_has_wal_reset_fix(tuple(sqlite3.sqlite_version_info))
-    desired = requested if requested != "auto" else ("wal" if wal_safe else "delete")
-    resolved = str(path.expanduser().resolve())
-
-    if desired == "wal":
-        if not wal_safe and resolved not in _DELETE_JOURNAL_WARNED_PATHS:
-            _log.warning(
-                "kanban.db (%s): explicit WAL override on SQLite %s, which is "
-                "vulnerable to the WAL-reset corruption bug",
-                path.name,
-                sqlite3.sqlite_version,
-            )
-            _DELETE_JOURNAL_WARNED_PATHS.add(resolved)
-        from hermes_state import apply_wal_with_fallback
-
-        mode = str(
-            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-            or "wal"
-        ).lower()
-    else:
-        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
-        mode = str(row[0] if row else "").lower()
-        if mode != "delete":
-            raise sqlite3.OperationalError(
-                f"failed to activate DELETE journal mode for {path}: got {mode!r}"
-            )
-        if resolved not in _DELETE_JOURNAL_WARNED_PATHS:
-            _log.warning(
-                "kanban.db (%s): SQLite %s lacks the WAL-reset fix; using "
-                "journal_mode=DELETE until SQLite is upgraded to 3.50.7 or 3.51.3+",
-                path.name,
-                sqlite3.sqlite_version,
-            )
-            _DELETE_JOURNAL_WARNED_PATHS.add(resolved)
-
-    conn.execute("PRAGMA synchronous=FULL")
-    return mode
 
 
 @contextlib.contextmanager
@@ -2494,6 +2425,12 @@ def connect(
         # Re-check after waiting: another process may have detected corruption
         # while this process was blocked on first-open initialization.
         _raise_if_quarantined(path)
+        # Read-only file/sidecar preflight (port of kilocode#12508) —
+        # repair-or-refuse before the header/integrity probes so a stray
+        # read-only kanban.db fails with an actionable message instead of
+        # "attempt to write a readonly database" mid-init.
+        from hermes_state import preflight_db_writability
+        preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
         _validate_sqlite_header(path)
@@ -2511,21 +2448,14 @@ def connect(
                 # sidecar files for a fresh database. Keep it in the same process-local
                 # critical section as schema initialization so concurrent gateway
                 # startup threads do not race before _INITIALIZED_PATHS is populated.
-                #
-                # Do NOT re-run journal_mode/synchronous negotiation on every
-                # short-lived dispatcher/notifier connection. In production,
-                # concurrent Kanban workers can make otherwise idempotent PRAGMAs
-                # raise repeated sqlite3.OperationalError("disk I/O error") inside
-                # the gateway, leaving triage cards stuck even though the DB itself
-                # is healthy. Once this process has initialized the DB path,
-                # subsequent connects only need per-connection pragmas below.
-                if needs_init:
-                    # SQLite's WAL-reset race can corrupt multi-process WAL
-                    # databases on vulnerable releases. Use rollback-journal
-                    # mode until the linked runtime contains the official fix.
-                    _configure_kanban_journal_mode(conn, path)
-                else:
-                    conn.execute("PRAGMA synchronous=FULL")
+                # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
+                # falls back to DELETE with one ERROR log so kanban stays usable there.
+                # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
+                from hermes_state import apply_wal_with_fallback
+                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                # FULL (was NORMAL): fsync before each checkpoint to narrow the
+                # crash window that can leave a b-tree page header torn.
+                conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
                 # Zero freed pages so a later torn write cannot expose stale
@@ -3197,8 +3127,7 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 def _review_gate_config() -> dict[str, Any]:
     """Return board-wide review-gate settings from config/env."""
     try:
-        import yaml
-        from hermes_cli.config import load_config_readonly
+        from hermes_cli.config import load_config_readonly, read_user_config_raw
         from hermes_cli.profiles import normalize_profile_name
         from hermes_constants import get_default_hermes_root, get_hermes_home
 
@@ -3212,7 +3141,7 @@ def _review_gate_config() -> dict[str, Any]:
         root = get_default_hermes_root().resolve(strict=False)
 
         try:
-            raw_cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+            raw_cfg = read_user_config_raw(home / "config.yaml")
             raw_kanban = raw_cfg.get("kanban", {}) if isinstance(raw_cfg, dict) else {}
             current_has_explicit_gate = (
                 isinstance(raw_kanban, dict) and "review_gate" in raw_kanban
@@ -3224,7 +3153,7 @@ def _review_gate_config() -> dict[str, Any]:
         root_kanban: dict[str, Any] = {}
         root_gate: dict[str, Any] = {}
         try:
-            root_cfg = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8")) or {}
+            root_cfg = read_user_config_raw(root / "config.yaml")
             root_kanban = root_cfg.get("kanban", {}) if isinstance(root_cfg, dict) else {}
             candidate = root_kanban.get("review_gate", {}) if isinstance(root_kanban, dict) else {}
             if isinstance(candidate, dict):
@@ -3246,9 +3175,7 @@ def _review_gate_config() -> dict[str, Any]:
             try:
                 dispatcher_name = normalize_profile_name(dispatcher)
                 dispatcher_cfg_path = root / "profiles" / dispatcher_name / "config.yaml"
-                dispatcher_cfg = yaml.safe_load(
-                    dispatcher_cfg_path.read_text(encoding="utf-8")
-                ) or {}
+                dispatcher_cfg = read_user_config_raw(dispatcher_cfg_path)
                 dispatcher_kanban = (
                     dispatcher_cfg.get("kanban", {}) if isinstance(dispatcher_cfg, dict) else {}
                 )
@@ -7253,7 +7180,6 @@ def block_task(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
-            routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -8943,7 +8869,6 @@ def detect_stale_running(
 
 
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     reclaimed: list[str] = []
 
     rows = conn.execute(
@@ -9543,7 +9468,6 @@ def _record_task_failure(
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
-        cur_status = row["status"]
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.

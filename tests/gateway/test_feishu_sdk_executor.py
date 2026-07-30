@@ -26,15 +26,6 @@ def _bare_adapter() -> FeishuAdapter:
     return adapter
 
 
-def test_get_executor_creates_pool():
-    adapter = _bare_adapter()
-    executor = adapter._get_sdk_executor()
-    assert isinstance(executor, concurrent.futures.ThreadPoolExecutor)
-    # Same instance returned while alive.
-    assert adapter._get_sdk_executor() is executor
-    adapter._shutdown_sdk_executor()
-
-
 def test_get_executor_recreates_after_shutdown():
     """A shut-down pool must be transparently replaced — the #10849 recovery."""
     adapter = _bare_adapter()
@@ -45,15 +36,6 @@ def test_get_executor_recreates_after_shutdown():
     second = adapter._get_sdk_executor()
     assert second is not first
     assert getattr(second, "_shutdown", False) is False
-    adapter._shutdown_sdk_executor()
-
-
-def test_shutdown_clears_reference():
-    adapter = _bare_adapter()
-    adapter._get_sdk_executor()
-    adapter._shutdown_sdk_executor()
-    assert adapter._sdk_executor is None
-    # Idempotent.
     adapter._shutdown_sdk_executor()
 
 

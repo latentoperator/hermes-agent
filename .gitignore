@@ -151,6 +151,7 @@ docs/superpowers/*
 # — ignore so `git status` stays clean and update's autostash skips them.
 .update-incomplete
 .update-incomplete.lock
+.lazy-refresh-incomplete
 
 # Checkout fingerprint the __pycache__ tree was last validated against
 # (launch-time stale-bytecode sweep). Runtime state, never a code change.
@@ -190,3 +191,7 @@ infographics/
 infograficos/
 infografico/
 native/fts5_cjk/*.so
+# Runtime marker written by hermes update when a lazy dependency refresh is
+# interrupted; consumed by launch-time recovery. Never commit it (was tracked
+# by accident via 3a69e34702, removed in the #72002 salvage).
+.lazy-refresh-incomplete
