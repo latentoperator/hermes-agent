@@ -222,9 +222,14 @@ def vercel_module(vercel_sdk, monkeypatch):
 
     module = importlib.import_module("tools.environments.vercel_sandbox")
     module = importlib.reload(module)
-    # These unit tests provide a complete fake SDK through ``vercel_sdk``.
-    # Do not make a clean CI runner install the optional real dependency
-    # before exercising that fake.
+    # These tests fully fake the vercel SDK via sys.modules (vercel_sdk
+    # fixture) — the real package is never exercised, so the lazy-install
+    # probe must not run: _ensure_vercel_sdk checks installed DISTRIBUTION
+    # metadata (not sys.modules), and on a host without the vercel dist +
+    # with lazy installs disabled (any hermetic env) it raises ImportError
+    # before the fake SDK is ever reached. 16 tests failed exactly this way
+    # in CI while passing on dev boxes that happened to have vercel==0.7.2
+    # installed.
     monkeypatch.setattr(module, "_ensure_vercel_sdk", lambda: None)
     return module
 
