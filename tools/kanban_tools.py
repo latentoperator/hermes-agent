@@ -90,22 +90,26 @@ def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
 
 
 def _check_kanban_mode() -> bool:
-    """Task-lifecycle tools are available when:
+    """Shared Kanban routing tools are available when:
 
     1. ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), OR
     2. The current profile has ``kanban`` in its toolsets config
        (orchestrator profiles like techlead that route work via Kanban).
 
-    Humans running ``hermes chat`` without the kanban toolset see zero
-    kanban tools. Workers spawned by the kanban dispatcher (gateway-
-    embedded by default) and orchestrator profiles with the kanban
-    toolset enabled see the Kanban lifecycle tool surface.
+    This gate is only for tools useful in both contexts (show, comment,
+    create, and link). Worker lifecycle mutations use the stricter
+    :func:`_check_kanban_worker_mode` gate below.
     """
     if _is_delegated_child_context():
         return False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
     return _profile_has_kanban_toolset()
+
+
+def _check_kanban_worker_mode() -> bool:
+    """Worker lifecycle tools require positive dispatcher task scope."""
+    return bool(os.environ.get("HERMES_KANBAN_TASK"))
 
 
 def _check_kanban_orchestrator_mode() -> bool:
@@ -221,18 +225,16 @@ def _goal_judge_available() -> bool:
     ``judge_goal`` is fail-open at the source: when no auxiliary model can
     be reached it returns a ``"continue"`` verdict that is indistinguishable
     from a real "not done yet" judgment. The completion gate must not treat
-    that as a rejection, or an unconfigured/degraded auxiliary model would
-    wedge every ``goal_mode`` worker (it could never close its own task).
+    explicit unavailability (no client or model configured) as a rejection,
+    or such a worker could never close its own task.
 
-    So we probe availability first and only enforce the gate when a judge is
-    actually reachable. This mirrors the same client lookup ``judge_goal``
-    performs internally.
+    Lookup/import exceptions intentionally propagate. They indicate a broken
+    judge integration rather than explicit unavailability, so the completion
+    gate must fail closed instead of mistaking the failure for approval.
     """
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        return False
+    from agent.auxiliary_client import get_text_auxiliary_client
+
+    client, model = get_text_auxiliary_client("goal_judge")
     return client is not None and bool(model)
 
 
@@ -464,8 +466,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
-        "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "model_override": task.model_override,
+        "reasoning_effort": task.reasoning_effort,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -510,8 +513,9 @@ def _handle_show(args: dict, **kw) -> str:
                     "completed_at": t.completed_at,
                     "result": t.result,
                     "current_run_id": t.current_run_id,
-                    "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "model_override": t.model_override,
+                    "reasoning_effort": t.reasoning_effort,
                 }
 
             def _run_dict(r):
@@ -715,28 +719,39 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode and _goal_judge_available():
-                verdict = "done"
+            if task and task.goal_mode:
+                judge_available = False
+                verdict = None
                 reason = ""
                 try:
-                    # judge_goal returns (verdict, reason, parse_failed,
-                    # wait_directive, transport_failed) — see
-                    # hermes_cli/goals.py. Unpacking fewer raises ValueError,
-                    # which the defensive handler below swallows, leaving
-                    # verdict="done" and silently disabling the gate.
-                    verdict, reason, _, _, _ = judge_goal(
-                        goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                        last_response=(summary or result or "").strip(),
-                    )
+                    judge_available = _goal_judge_available()
+                    if judge_available:
+                        verdict, reason, _, _, transport_failed = judge_goal(
+                            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+                            last_response=(summary or result or "").strip(),
+                        )
+                        if transport_failed:
+                            return tool_error(
+                                "Goal completion could not be verified because "
+                                "the judge transport failed. The task remains "
+                                "running; retry completion after the judge is reachable."
+                            )
                 except Exception as judge_exc:
-                    # Defensive: judge_goal swallows its own errors, but if
-                    # it ever raises, fail open rather than wedge the worker.
-                    logger.warning(
-                        "goal judge check failed, allowing completion: %s",
-                        judge_exc,
+                    # Explicit unavailability is represented by False above.
+                    # Exceptions mean the judge integration is broken and
+                    # must not be mistaken for approval.
+                    logger.error(
+                        "goal-mode completion verification failed for %s",
+                        tid,
                         exc_info=True,
                     )
-                if verdict != "done":
+                    return tool_error(
+                        "Goal completion could not be verified because the "
+                        f"judge integration failed ({type(judge_exc).__name__}). "
+                        "The task remains running; retry completion after the "
+                        "judge path is repaired or explicitly disable goal mode."
+                    )
+                if judge_available and verdict != "done":
                     return tool_error(
                         f"Goal completion rejected by judge: {reason}. "
                         f"To proceed, either: (1) provide explicit acceptance "
@@ -1263,8 +1278,17 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
-    model_override = args.get("model")
-    provider_override = args.get("provider")
+    supersedes = args.get("supersedes") or args.get("supersedes_task_id")
+    if isinstance(supersedes, str):
+        supersedes = [supersedes]
+    if supersedes is not None and not isinstance(supersedes, (list, tuple)):
+        return tool_error(
+            f"supersedes must be a list of task ids, got {type(supersedes).__name__}"
+        )
+    # The concise upstream names are canonical; retain Hopebox's older names
+    # as compatibility aliases for existing automation and task templates.
+    model_override = args.get("model") or args.get("model_override")
+    provider_override = args.get("provider") or args.get("provider_override")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1306,17 +1330,42 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
-                model_override=model_override,
-                provider_override=provider_override,
+                reasoning_effort=args.get("reasoning_effort"),
+                provider_override=(
+                    str(provider_override).strip() if provider_override else None
+                ),
+                model_override=str(model_override).strip() if model_override else None,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
                 ),
                 initial_status=str(initial_status),
+                supersedes=supersedes,
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
             )
             new_task = kb.get_task(conn, new_tid)
+            # ── Dispatch-group tracking ──
+            # When an interactive agent session creates Kanban tasks, auto-enroll
+            # them in a dispatch group so the origin profile gets notified when
+            # the dispatched work drains.  Do NOT enroll tasks created by a
+            # dispatcher-spawned Kanban worker: that worker is itself a scoped
+            # child run, and a follow-up drain notice would later wake/pollute the
+            # parent worker's profile/session with the child card's lane content.
+            origin_profile = os.environ.get("HERMES_PROFILE")
+            if origin_profile and not os.environ.get("HERMES_KANBAN_TASK"):
+                try:
+                    dg_id = kb.get_or_create_dispatch_group(
+                        conn,
+                        profile=origin_profile,
+                        session_id=session_id,
+                        board=board,
+                    )
+                    kb.add_task_to_dispatch_group(conn, dg_id, new_tid)
+                except Exception:
+                    # Dispatch-group tracking is best-effort; never fail a
+                    # task creation for a group enrollment error.
+                    pass
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
                 task_id=new_tid,
@@ -1480,6 +1529,15 @@ def _handle_unblock(args: dict, **kw) -> str:
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
+            # ── Dispatch-group reactivation ──
+            # After unblocking, recompute dispatch group state so the
+            # group transitions back to 'active'.  This ensures a
+            # subsequent complete-triggered recompute sees active→drained
+            # and emits a second drain notice.
+            try:
+                kb.recompute_dispatch_groups_for_task(conn, str(tid))
+            except Exception:
+                pass
             task = kb.get_task(conn, str(tid))
             return _ok(task_id=str(tid), status=task.status if task else None)
         finally:
@@ -1947,6 +2005,18 @@ KANBAN_CREATE_SCHEMA = {
                     "synthesizer task."
                 ),
             },
+            "supersedes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Original task ids this card explicitly replaces as a "
+                    "continuation. Each id must also be listed in parents. "
+                    "Hermes marks those originals done/superseded with an "
+                    "audit event so they do not linger blocked. Do not use "
+                    "for ordinary fan-out or follow-up work where the parent "
+                    "still has independent unresolved scope."
+                ),
+            },
             "tenant": {
                 "type": "string",
                 "description": (
@@ -1967,7 +2037,9 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Workspace flavor: 'scratch' (fresh tmp dir, "
                     "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
+                    "absolute workspace_path), 'worktree' (git worktree; "
+                    "with a board default_workdir and no explicit path, "
+                    "Hermes resolves to <repo>/.worktrees/<task_id>)."
                 ),
             },
             "workspace_path": {
@@ -2031,6 +2103,32 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["none", "minimal", "low", "medium", "high", "xhigh"],
+                "description": (
+                    "Optional per-task reasoning effort override passed to "
+                    "the dispatched worker. Omit to use the assignee "
+                    "profile's configured agent.reasoning_effort."
+                ),
+            },
+            "provider_override": {
+                "type": "string",
+                "description": (
+                    "Optional per-task provider override for the dispatched "
+                    "worker. The dispatcher passes this as --provider "
+                    "<provider>; omit it to use the assignee profile's "
+                    "default provider."
+                ),
+            },
+            "model_override": {
+                "type": "string",
+                "description": (
+                    "Optional per-task model override for the dispatched "
+                    "worker. The dispatcher passes this as -m <model>; "
+                    "omit it to use the assignee profile's default model."
                 ),
             },
             "goal_mode": {
@@ -2149,7 +2247,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
     handler=_handle_complete,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_worker_mode,
     emoji="✔",
 )
 
@@ -2158,7 +2256,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_BLOCK_SCHEMA,
     handler=_handle_block,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_worker_mode,
     emoji="⏸",
 )
 
@@ -2167,7 +2265,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_HEARTBEAT_SCHEMA,
     handler=_handle_heartbeat,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_worker_mode,
     emoji="💓",
 )
 

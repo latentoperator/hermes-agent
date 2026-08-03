@@ -75,6 +75,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "completed_at": t.completed_at,
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
+        "provider_override": t.provider_override,
+        "model_override": t.model_override,
+        "reasoning_effort": t.reasoning_effort,
         "max_retries": t.max_retries,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
@@ -333,6 +336,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
+    p_create.add_argument("--supersedes", action="append", default=[],
+                          help="Original task id this continuation card replaces "
+                               "(repeatable). Each id must also be passed as --parent; "
+                               "the original is marked done/superseded with an audit event.")
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
@@ -361,6 +368,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). The kanban lifecycle is already "
                                "injected automatically. Example: "
                                "--skill translation --skill github-code-review")
+    p_create.add_argument("--reasoning", default=None, dest="reasoning_effort",
+                          help="Per-task reasoning effort override: "
+                               "none, minimal, low, medium, high, or xhigh")
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
                           help="Per-task override for the consecutive-failure "
@@ -717,6 +727,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
+    p_disp.add_argument("--ignore-guards", action="append", default=[], metavar="TASK_ID",
+                        help="Operator escape hatch: ignore respawn guard for this task id (repeatable)")
     p_disp.add_argument("--json", action="store_true")
 
     # --- daemon (deprecated) ---
@@ -1509,13 +1521,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
+            supersedes=tuple(getattr(args, "supersedes", None) or ()),
             triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            model_override=getattr(args, "model_override", None),
             provider_override=getattr(args, "provider_override", None),
+            model_override=getattr(args, "model_override", None),
+            reasoning_effort=getattr(args, "reasoning_effort", None),
+            max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
@@ -1689,9 +1703,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  branch:    {task.branch_name}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
+    if task.provider_override:
+        print(f"  provider:  {task.provider_override}")
     if task.model_override:
-        _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
-        print(f"  model:     {task.model_override}{_prov}")
+        print(f"  model:     {task.model_override}")
+    if task.reasoning_effort:
+        print(f"  reasoning: {task.reasoning_effort}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
@@ -2480,6 +2497,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            ignore_respawn_guards=getattr(args, "ignore_guards", None) or None,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2498,6 +2516,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
+            ],
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
             ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
@@ -2532,6 +2554,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
+    if res.respawn_guarded:
+        for tid, reason in res.respawn_guarded:
+            print(f"Deferred (respawn guard: {reason}): {tid}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "

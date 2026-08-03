@@ -961,6 +961,15 @@ def test_config_default_dispatch_in_gateway_is_true():
     assert isinstance(interval, (int, float)) and interval >= 1, (
         f"dispatch_interval_seconds must be a positive number, got {interval!r}"
     )
+    assert kanban.get("dispatcher_profile") == ""
+    assert kanban.get("no_dispatcher_alarm_after_seconds") == 300
+    assert kanban.get("auto_decompose_excluded_boards") == []
+    assert kanban.get("dispatch_excluded_boards") == []
+    review_gate = kanban.get("review_gate")
+    assert isinstance(review_gate, dict)
+    assert review_gate.get("enabled") is True
+    assert review_gate.get("roots") == ["/home/hopewell/hopewell-dev"]
+    assert review_gate.get("assignee") == "wren"
 
 
 
@@ -1406,5 +1415,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

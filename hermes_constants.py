@@ -1273,14 +1273,19 @@ def is_container() -> bool:
     except OSError:
         pass
     # cgroup v2: /proc/1/cgroup is just "0::/" with no marker. The container
-    # runtime still shows up in the mount table (overlay rootfs, runtime mount
-    # paths), so scan mountinfo as a last resort.
+    # runtime still shows up in the root mount (overlay rootfs, runtime mount
+    # paths), so inspect that mount as a last resort. Do not scan unrelated
+    # mounts: a Docker/containerd *host* naturally exposes container mounts in
+    # its own mount table and must not be classified as a container itself.
     try:
         with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
-            mountinfo = f.read()
-            if any(marker in mountinfo for marker in ("kubepods", "containerd", "crio")):
-                _container_detected = True
-                return True
+            for line in f:
+                fields = line.split()
+                if len(fields) >= 6 and fields[4] == "/":
+                    if any(marker in line for marker in ("kubepods", "containerd", "crio")):
+                        _container_detected = True
+                        return True
+                    break
     except OSError:
         pass
     _container_detected = False

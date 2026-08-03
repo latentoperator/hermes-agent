@@ -2262,6 +2262,14 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Optional single-home pin for the embedded dispatcher/notifier. When
+        # set, only that profile's gateway attempts the singleton dispatcher
+        # lock; other profile gateways do not race for the board at all.
+        # Empty preserves the historical "any dispatch-enabled gateway" mode.
+        "dispatcher_profile": "",
+        # Loud alarm threshold for a pinned dispatcher that cannot take the
+        # singleton lock while spawnable ready/review work exists. 0 disables.
+        "no_dispatcher_alarm_after_seconds": 300,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
@@ -2298,6 +2306,14 @@ DEFAULT_CONFIG = {
         # decomposition is manual via `hermes kanban decompose <id>` or
         # the dashboard's Decompose button.
         "auto_decompose": True,
+        # Board slugs that should never be auto-decomposed by the embedded
+        # gateway dispatcher. Useful for portfolio/control boards where
+        # triage means "human intake/status" rather than executable work.
+        "auto_decompose_excluded_boards": [],
+        # Board slugs that the embedded gateway dispatcher should ignore
+        # entirely. Useful for read-only/portfolio boards that must never
+        # spawn workers even if a card is accidentally assigned/ready.
+        "dispatch_excluded_boards": [],
         # Max triage tasks to decompose per dispatcher tick. Prevents a
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
@@ -2308,6 +2324,21 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Visible code-review gate. When enabled, tasks created with a persistent
+        # workspace under any configured root automatically get a dependent review
+        # card. The default Hopewell path keeps review owned by Kanban workflow
+        # state rather than hidden git hooks.
+        "review_gate": {
+            "enabled": True,
+            "roots": ["/home/hopewell/hopewell-dev"],
+            "assignee": "wren",
+            "skills": ["github-code-review"],
+            "provider": None,
+            "model": None,
+            "fallback_provider": None,
+            "fallback_model": None,
+            "max_runtime_seconds": 1800,
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

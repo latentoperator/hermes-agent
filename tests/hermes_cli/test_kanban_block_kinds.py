@@ -83,6 +83,18 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
+    """A linked dependency wait never enters the human 'blocked' bucket."""
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="unfinished parent", assignee="worker")
+        tid = _running_task(conn)
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+        assert kb.block_task(conn, tid, reason="need X first", kind="dependency")
+        t = kb.get_task(conn, tid)
+        assert t.status == "todo"
+        assert t.block_kind == "dependency"
+
+
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     """A dependency-parked child becomes ready once its parent completes."""
     with kb.connect_closing() as conn:

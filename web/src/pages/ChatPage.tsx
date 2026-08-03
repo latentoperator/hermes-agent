@@ -109,11 +109,9 @@ function generateChannelId(scope?: string): string {
   )}`;
 }
 
-// Colors for the terminal body.  Matches the dashboard's dark teal canvas
-// with cream foreground — we intentionally don't pick monokai or a loud
-// theme, because the TUI's skin engine already paints the content; the
-// terminal chrome just needs to sit quietly inside the dashboard.
-const DEFAULT_TERMINAL_BACKGROUND = "#000000";
+// Colors for the terminal body. Themes may pin terminalBackground; otherwise
+// the embedded TUI inherits the dashboard canvas color so it does not read as a
+// separate black box inside blue/teal skins.
 const DEFAULT_TERMINAL_FOREGROUND = "#f0e6d2";
 
 function buildTerminalTheme(background: string, foreground: string) {
@@ -303,7 +301,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   );
 
   const { theme } = useTheme();
-  const terminalBg = theme.terminalBackground ?? DEFAULT_TERMINAL_BACKGROUND;
+  const terminalBg = theme.terminalBackground ?? theme.palette.background.hex;
   const terminalFg = theme.terminalForeground ?? DEFAULT_TERMINAL_FOREGROUND;
   const terminalTheme = useMemo(
     () => buildTerminalTheme(terminalBg, terminalFg),
@@ -313,9 +311,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // The dashboard keeps ChatPage mounted persistently so the PTY survives tab
   // switches. That is great for ordinary /chat navigation, but it means query
   // param changes do NOT remount the component. Resume-in-chat from the
-  // Sessions page relies on `/chat?resume=<id>` changing at runtime, so we must
-  // treat the current resume target as part of the PTY identity and rebuild the
-  // terminal session when it changes.
+  // Sessions page relies on `/chat?resume=<id>` changing at runtime, and the
+  // profile selector similarly needs a new PTY child when it changes.
   const resumeParam = searchParams.get("resume");
   // Profile-scoped chat: spawn the PTY under the globally selected
   // management profile. Changing it remounts the terminal (key below /
@@ -899,6 +896,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // ``return cleanup`` stays at the top level; handlers + disposables
     // are hoisted to ``let`` bindings the cleanup closes over.
     let unmounting = false;
+    let ws: WebSocket | null = null;
     let onDataDisposable: { dispose(): void } | null = null;
     let onResizeDisposable: { dispose(): void } | null = null;
     let eraseSuppressionTimer: ReturnType<typeof setTimeout> | null = null;
@@ -979,9 +977,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
       if (scopedProfile) params.profile = scopedProfile;
       const url = await api.buildWsUrl("/api/pty", params);
-      const ws = new WebSocket(url);
-      ws.binaryType = "arraybuffer";
-      wsRef.current = ws;
+      const socket = new WebSocket(url);
+      ws = socket;
+      socket.binaryType = "arraybuffer";
+      wsRef.current = socket;
       // W2 (NS-591): a mobile socket can wedge in CONNECTING after a radio
       // handoff and never fire onclose, so neither the resume predicate nor
       // scheduleReconnect can recover it. Force-close if it hasn't opened
@@ -989,16 +988,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       clearConnectingTimer();
       connectingTimerRef.current = setTimeout(() => {
         connectingTimerRef.current = null;
-        if (wsRef.current === ws && ws.readyState === WebSocket.CONNECTING) {
+        if (
+          wsRef.current === socket &&
+          socket.readyState === WebSocket.CONNECTING
+        ) {
           try {
-            ws.close();
+            socket.close();
           } catch {
             /* already tearing down */
           }
         }
       }, PTY_CONNECTING_TIMEOUT_MS);
 
-    ws.onopen = () => {
+    socket.onopen = () => {
       clearReconnectTimer();
       clearConnectingTimer();
       connectInFlightRef.current = false;
@@ -1016,7 +1018,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // out against on its first paint.  The double-rAF block above will
       // follow up with the authoritative measurement — at worst Ink
       // reflows once after the PTY boots, which is imperceptible.
-      ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+      socket.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
       // One-shot: a ?learn=<text> param (set by the Skills page "Learn a
       // skill" panel) is typed into the composer as a /learn command once the
       // PTY is up. /learn resolves via command.dispatch → a normal agent turn,
@@ -1188,7 +1190,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         }
 
         if (
-          ws.readyState !== WebSocket.OPEN ||
+          socket.readyState !== WebSocket.OPEN ||
           shouldBlockPtyInput(ptyStateRef.current)
         ) {
           if (!blockedInputNoticeRef.current) {
@@ -1209,12 +1211,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         if (normalized.normalized) {
           mobileReplacementInputUntilRef.current = 0;
         }
-        ws.send(normalized.data);
+        socket.send(normalized.data);
       });
 
       onResizeDisposable = term.onResize(({ cols, rows }) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(`\x1b[RESIZE:${cols};${rows}]`);
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(`\x1b[RESIZE:${cols};${rows}]`);
         }
       });
     })();
@@ -1247,13 +1249,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       clearReconnectTimer();
       clearConnectingTimer();
       connectInFlightRef.current = false;
-      // Phase 5.3: ``ws`` is local to the IIFE that opens it (the gated-mode
-      // ticket fetch makes the open async). The cleanup runs at the outer
-      // effect's top level so it can't reach into that scope — close via
-      // the ref instead. ``?.`` covers the race where unmount fires before
-      // the ticket fetch resolves and ``wsRef.current`` was never assigned.
-      wsRef.current?.close();
-      wsRef.current = null;
+      // Phase 5.3: ``ws`` is opened asynchronously after the gated-mode
+      // ticket fetch. Keep both the effect-local handle and the ref in sync:
+      // the local handle guarantees profile/resume changes close the exact
+      // socket this effect created, while the ref covers imperative callers.
+      ws?.close();
+      if (wsRef.current === ws) {
+        wsRef.current = null;
+      }
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -1475,6 +1478,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           >
             <div className="border-b border-current/10 px-1 py-2">
               <ChatSidebar
+                key={channel}
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
@@ -1608,6 +1612,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             {/* Model picker — keeps the rail thin. */}
             <div className="shrink-0">
               <ChatSidebar
+                key={channel}
                 channel={channel}
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}

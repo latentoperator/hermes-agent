@@ -216,6 +216,39 @@ def test_fetch_server_url_sets_env(monkeypatch, tmp_path):
 
 
 
+def test_fetch_retries_bws_rate_limit(monkeypatch, tmp_path):
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "K", "value": "v"}])
+    calls = {"n": 0}
+
+    def fake_run(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr='Error: [429 Too Many Requests] {"message":"Slow down! Too many requests. Try again in 1s."}',
+            )
+        return mock.Mock(returncode=0, stdout=payload, stderr="")
+
+    sleeps = []
+    monkeypatch.setattr(bw.subprocess, "run", fake_run)
+    monkeypatch.setattr(bw.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(bw.random, "uniform", lambda a, b: 0.0)
+
+    secrets, warnings = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        use_cache=False,
+    )
+    assert secrets == {"K": "v"}
+    assert warnings == []
+    assert calls["n"] == 2
+    assert sleeps == [1.0]
+
+
 # ---------------------------------------------------------------------------
 # apply_bitwarden_secrets — the public entry point used by env_loader
 # ---------------------------------------------------------------------------
@@ -229,6 +262,119 @@ def test_fetch_server_url_sets_env(monkeypatch, tmp_path):
 
 
 
+def test_apply_override_existing(monkeypatch, tmp_path):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
+    monkeypatch.setenv("OPENAI_API_KEY", "stale")
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "OPENAI_API_KEY", "value": "fresh"}])
+    monkeypatch.setattr(
+        bw.subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    monkeypatch.setattr(bw, "find_bws", lambda **kw: fake_binary)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True, project_id="p",
+        override_existing=True, auto_install=False,
+    )
+    assert result.ok
+    assert os.environ["OPENAI_API_KEY"] == "fresh"
+
+
+def test_apply_alias_maps_bsm_key_to_runtime_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([
+        {"key": "DANTE_TELEGRAM_BOT_TOKEN", "value": "dante-token"},
+    ])
+    monkeypatch.setattr(
+        bw.subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    monkeypatch.setattr(bw, "find_bws", lambda **kw: fake_binary)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True,
+        project_id="p",
+        aliases={"DANTE_TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN"},
+        auto_install=False,
+    )
+
+    assert result.ok
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "dante-token"
+    assert "TELEGRAM_BOT_TOKEN" in result.applied
+    assert "DANTE_TELEGRAM_BOT_TOKEN" not in os.environ
+
+
+def test_apply_include_keys_skips_unlisted_bsm_secrets(monkeypatch, tmp_path):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([
+        {"key": "DANTE_TELEGRAM_BOT_TOKEN", "value": "dante-token"},
+        {"key": "WREN_TELEGRAM_BOT_TOKEN", "value": "wren-token"},
+    ])
+    monkeypatch.setattr(
+        bw.subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    monkeypatch.setattr(bw, "find_bws", lambda **kw: fake_binary)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True,
+        project_id="p",
+        aliases={"DANTE_TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN"},
+        include_keys=["DANTE_TELEGRAM_BOT_TOKEN"],
+        auto_install=False,
+    )
+
+    assert result.ok
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "dante-token"
+    assert "WREN_TELEGRAM_BOT_TOKEN" not in os.environ
+
+
+def test_apply_alias_respects_existing_target_when_not_overriding(monkeypatch, tmp_path):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "existing-token")
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([
+        {"key": "DANTE_TELEGRAM_BOT_TOKEN", "value": "dante-token"},
+    ])
+    monkeypatch.setattr(
+        bw.subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    monkeypatch.setattr(bw, "find_bws", lambda **kw: fake_binary)
+
+    result = bw.apply_bitwarden_secrets(
+        enabled=True,
+        project_id="p",
+        aliases={"DANTE_TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN"},
+        override_existing=False,
+        auto_install=False,
+    )
+
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "existing-token"
+    assert "TELEGRAM_BOT_TOKEN" in result.skipped
+
+
+def test_apply_never_overrides_bootstrap_token(monkeypatch, tmp_path):
+    """Even with override_existing=True, the access-token var is preserved."""
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.original")
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([
+        {"key": "BWS_ACCESS_TOKEN", "value": "0.malicious-replacement"},
+    ])
+    monkeypatch.setattr(
+        bw.subprocess, "run",
+        lambda *a, **kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    monkeypatch.setattr(bw, "find_bws", lambda **kw: fake_binary)
 
 
 
@@ -254,17 +400,29 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
         "    cache_ttl_seconds: 0\n"
         "    override_existing: false\n"
         "    auto_install: false\n"
+        "    aliases:\n"
+        "      DANTE_TELEGRAM_BOT_TOKEN: TELEGRAM_BOT_TOKEN\n"
+        "    include_keys:\n"
+        "      - DANTE_TELEGRAM_BOT_TOKEN\n"
+        "      - MY_BSM_KEY\n"
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
     monkeypatch.delenv("MY_BSM_KEY", raising=False)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("DANTE_TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("UNUSED_KEY", raising=False)
 
     called = {"n": 0}
 
     def fake_fetch(**kwargs):
         called["n"] += 1
         assert kwargs["project_id"] == "proj-1"
-        return {"MY_BSM_KEY": "from-bsm"}, []
+        return {
+            "DANTE_TELEGRAM_BOT_TOKEN": "from-bsm",
+            "MY_BSM_KEY": "from-bsm",
+            "UNUSED_KEY": "skip-me",
+        }, []
 
     monkeypatch.setattr(
         "agent.secret_sources.bitwarden.find_bws",
@@ -283,6 +441,9 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
 
     assert called["n"] == 1
     assert os.environ.get("MY_BSM_KEY") == "from-bsm"
+    assert os.environ.get("TELEGRAM_BOT_TOKEN") == "from-bsm"
+    assert os.environ.get("DANTE_TELEGRAM_BOT_TOKEN") is None
+    assert os.environ.get("UNUSED_KEY") is None
 
 
 # ---------------------------------------------------------------------------

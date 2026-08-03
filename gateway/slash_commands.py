@@ -24,6 +24,7 @@ import os
 import re
 import shlex
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -1520,6 +1521,119 @@ class GatewaySlashCommandsMixin:
             "  /platform pause <name> — stop retrying a failing platform\n"
             "  /platform resume <name> — re-queue a paused platform"
         )
+
+    async def _handle_fleet_command(self, event: MessageEvent) -> Union[str, EphemeralReply, None]:
+        """Handle /fleet commands for explicit multi-profile operations."""
+        raw_args = (event.get_command_args() or "").strip()
+        parts = shlex.split(raw_args) if raw_args else []
+        usage = (
+            "Usage: `/fleet reset-session all`\n"
+            "       `/fleet reset-session default,dante,zelda`"
+        )
+        if len(parts) != 2 or parts[0] not in {"reset-session", "reset-sessions"}:
+            return usage
+
+        action = parts[0]
+        target = parts[1].strip()
+        if not target:
+            return usage
+
+        try:
+            from hermes_cli.fleet import resolve_fleet_profiles, reset_fleet_sessions
+
+            profiles = resolve_fleet_profiles(target)
+        except Exception as exc:
+            return f"⚠️ Fleet command failed before reset: {exc}"
+
+        profile_count = len(profiles)
+        running_profiles = [name for name, _path, running in profiles if running]
+        running_count = len(running_profiles)
+
+        async def _do_reset():
+            try:
+                results = reset_fleet_sessions(target)
+            except Exception as exc:
+                return f"❌ Fleet session reset failed: {exc}"
+
+            reset_total = sum(r.reset_count for r in results if not r.error)
+            skipped = [r.profile for r in results if r.skipped and not r.error]
+            errors = [r for r in results if r.error]
+
+            restarted = self._schedule_fleet_gateway_restarts(profiles)
+
+            lines = [
+                "✅ Fleet session reset staged.",
+                f"Profiles targeted: {profile_count}",
+                f"Session entries rotated: {reset_total}",
+            ]
+            if skipped:
+                lines.append(
+                    "No active session store: "
+                    + ", ".join(skipped[:12])
+                    + ("…" if len(skipped) > 12 else "")
+                )
+            if errors:
+                lines.append("Errors:")
+                for item in errors[:8]:
+                    lines.append(f"• {item.profile}: {item.error}")
+                if len(errors) > 8:
+                    lines.append(f"• …and {len(errors) - 8} more")
+            if restarted:
+                lines.append(
+                    "Running gateways will be restarted shortly so the fresh sessions take effect."
+                )
+                lines.append(
+                    "Restart requested: "
+                    + ", ".join(restarted[:12])
+                    + ("…" if len(restarted) > 12 else "")
+                )
+            else:
+                lines.append("No running gateways needed restart.")
+            lines.append("Existing transcripts remain in state.db under their old session IDs.")
+            return "\n".join(lines)
+
+        return await self._maybe_confirm_destructive_slash(
+            event=event,
+            command=f"fleet {action} {target}",
+            title=f"/fleet {action} {target}",
+            detail=(
+                f"This rotates active session IDs for {profile_count} profile(s) "
+                f"({target}) and restarts {running_count} running gateway(s) so "
+                "future Telegram/Discord messages start fresh. Existing transcripts "
+                "are retained for audit/history; this only changes the active session pointers."
+            ),
+            execute=_do_reset,
+        )
+
+    def _schedule_fleet_gateway_restarts(self, profiles: list[tuple[str, Path, bool]]) -> list[str]:
+        """Best-effort delayed restart of running gateways after a fleet reset."""
+        running = [(name, path) for name, path, is_running in profiles if is_running]
+        if not running:
+            return []
+
+        def _restart_later() -> None:
+            time.sleep(2.0)
+            import subprocess
+
+            for name, _path in running:
+                try:
+                    if name == "default":
+                        cmd = ["hermes", "gateway", "restart"]
+                    else:
+                        cmd = ["hermes", "-p", name, "gateway", "restart"]
+                    subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to request gateway restart for profile %s: %s", name, exc)
+
+        thread = threading.Thread(target=_restart_later, name="fleet-gateway-restart", daemon=True)
+        thread.start()
+        return [name for name, _path in running]
 
     async def _handle_restart_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /restart command - drain active work, then restart the gateway."""

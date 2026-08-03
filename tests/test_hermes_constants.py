@@ -305,6 +305,31 @@ class TestIsContainer:
 
 
 
+    def test_ignores_containerd_mounts_on_container_host(self, monkeypatch, tmp_path):
+        """A host running containers is not itself a container."""
+        self._reset_cache(monkeypatch)
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+        cgroup_file = tmp_path / "cgroup"
+        cgroup_file.write_text("0::/init.scope\n")
+        mountinfo_file = tmp_path / "mountinfo"
+        mountinfo_file.write_text(
+            "20 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+            "30 20 0:50 /containerd/rootfs /var/lib/docker/overlay rw - overlay overlay rw\n"
+        )
+        _real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            p = str(path)
+            if p == "/proc/1/cgroup":
+                return _real_open(cgroup_file, *args, **kwargs)
+            if p == "/proc/self/mountinfo":
+                return _real_open(mountinfo_file, *args, **kwargs)
+            return _real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        assert is_container() is False
+
     def test_caches_result(self, monkeypatch):
         """Second call uses cached value without re-probing."""
         monkeypatch.setattr(hermes_constants, "_container_detected", True)

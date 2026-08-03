@@ -161,6 +161,38 @@ KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
+# Hopewell's dev review gate is intentionally Kanban-owned, not Git-hook-owned:
+# cards created for persistent work under this root get a dependent review card.
+# Env/config can override every field so this stays operationally recoverable.
+# Review gates normally use the assignee profile's default model; set a non-empty
+# review_gate.model only when an operator explicitly wants a per-card model pin.
+DEFAULT_REVIEW_GATE_ROOTS = ("/home/hopewell/hopewell-dev",)
+DEFAULT_REVIEW_GATE_ASSIGNEE = "wren"
+DEFAULT_REVIEW_GATE_MODEL: Optional[str] = None
+DEFAULT_REVIEW_GATE_FALLBACK_MODEL: Optional[str] = None
+DEFAULT_REVIEW_GATE_SKILLS = ("github-code-review",)
+REVIEW_GATE_CREATED_BY = "hopewell-dev-review-gate"
+REVIEW_LOOP_CREATED_BY = "kanban-review-loop"
+REVIEW_LOOP_IDEMPOTENCY_PREFIX = "review-loop"
+REVIEW_LOOP_CANNOT_REVIEW = "cannot_review"
+DEFAULT_REVIEW_LOOP_MAX_ROUNDS = 2
+DEFAULT_REVIEW_GOAL_MAX_TURNS = 3
+DEFAULT_REVIEW_GOAL_CONTRACT_FILES = (
+    "REVIEW-RULES.md",
+    "RUNBOOK.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    ".cursorrules",
+    "docs/REVIEW-RULES.md",
+    "docs/RUNBOOK.md",
+    ".github/REVIEW-RULES.md",
+    ".github/RUNBOOK.md",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/pull_request_template.md",
+    ".github/copilot-instructions.md",
+    ".github/instructions/*.instructions.md",
+)
+
 
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
@@ -945,14 +977,8 @@ class Task:
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
-    model_override: Optional[str] = None
-    # Provider that ``model_override`` belongs to. When set, the dispatcher
-    # passes ``--provider <name>`` alongside ``-m <model>`` so the worker
-    # resolves the model against the right backend instead of the profile's
-    # configured provider. NULL = worker profile's provider resolves the
-    # model (pre-existing behaviour). Solves the "model from provider A,
-    # profile configured for provider B" mismatch class.
     provider_override: Optional[str] = None
+    model_override: Optional[str] = None
     # Per-task reasoning effort for the worker (one of
     # ``hermes_constants.VALID_REASONING_EFFORTS``, or ``"none"`` for thinking
     # off). When set, the dispatcher passes ``--reasoning <level>`` so the
@@ -1056,12 +1082,12 @@ class Task:
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
             skills=skills_value,
-            model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             provider_override=(
                 row["provider_override"]
                 if "provider_override" in keys and row["provider_override"]
                 else None
             ),
+            model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             reasoning_effort=(
                 row["reasoning_effort"]
                 if "reasoning_effort" in keys and row["reasoning_effort"]
@@ -1226,15 +1252,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
+    -- Per-task provider override. When set, the dispatcher passes
+    -- --provider <provider> to the worker, overriding the profile's
+    -- default provider. NULL = use the profile default.
+    provider_override    TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
     model_override       TEXT,
-    -- Provider the model override belongs to. When set (alongside
-    -- model_override), the dispatcher passes --provider <name> so the
-    -- worker resolves the model against the right backend instead of the
-    -- profile's configured provider. NULL = profile provider.
-    provider_override    TEXT,
     -- Per-task reasoning effort for the worker (minimal|low|medium|high|
     -- xhigh|max|ultra, or 'none' for thinking off). When set, the dispatcher
     -- passes --reasoning <level> so the worker runs at that depth regardless
@@ -1374,6 +1399,53 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Dispatch-group tracking for agent-to-agent feedback.
+-- When an agent profile creates Kanban tasks (via kanban_create tool),
+-- those tasks are enrolled in a dispatch group keyed by (profile, session).
+-- The dispatcher / notifier watches group state and emits drain notices
+-- when no tracked tasks remain active (all done/archived/blocked).
+CREATE TABLE IF NOT EXISTS dispatch_groups (
+    id              TEXT PRIMARY KEY,
+    origin_profile  TEXT NOT NULL,
+    origin_session  TEXT,
+    board           TEXT,
+    created_at      INTEGER NOT NULL,
+    -- Cached computed state: 'active' | 'drained'.
+    -- Recomputed on status transitions of tracked tasks.
+    state           TEXT NOT NULL DEFAULT 'active',
+    state_at        INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS dispatch_group_tasks (
+    group_id  TEXT NOT NULL,
+    task_id   TEXT NOT NULL,
+    PRIMARY KEY (group_id, task_id)
+);
+
+-- Durable notices for agent next-turn awareness.  A notice is created
+-- when a tracked task becomes blocked, or when the whole dispatch
+-- group reaches zero active tasks (drained).  The originating agent
+-- polls or is injected with pending (acked=0) notices at session start.
+CREATE TABLE IF NOT EXISTS dispatch_notices (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile      TEXT NOT NULL,
+    session_id   TEXT,
+    group_id     TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    -- 'blocked' — a single tracked task transitioned to blocked
+    -- 'drained' — the group has zero active tasks remaining
+    payload      TEXT,
+    created_at   INTEGER NOT NULL,
+    acked        INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_dispatch_notices_pending
+    ON dispatch_notices(profile, session_id, acked);
+CREATE INDEX IF NOT EXISTS idx_dispatch_group_tasks_group
+    ON dispatch_group_tasks(group_id);
+CREATE INDEX IF NOT EXISTS idx_dispatch_group_tasks_task
+    ON dispatch_group_tasks(task_id);
 """
 
 
@@ -1383,6 +1455,11 @@ CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_
 
 _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
+_QUARANTINE_LOCK = threading.RLock()
+# Resolved DB path -> (device, inode, backup path, reason). The inode identity
+# deliberately survives mtime/size changes from cached writers; only atomic DB
+# replacement clears the quarantine.
+_QUARANTINED_PATHS: dict[str, tuple[int, int, Optional[Path], str]] = {}
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
 
@@ -1735,6 +1812,20 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+def is_corrupt_db_error(exc: BaseException) -> bool:
+    """Return whether SQLite reported structural corruption, not contention."""
+    if isinstance(exc, KanbanDbCorruptError):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    message = str(exc).lower()
+    return (
+        "file is not a database" in message
+        or "database disk image is malformed" in message
+        or "malformed database schema" in message
+    )
+
+
 def _prune_corrupt_backups(
     parent: Path, base_name: str, keep: Optional[Path] = None,
 ) -> None:
@@ -1857,6 +1948,167 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
         except OSError:
             pass
     return candidate
+
+
+def _quarantine_marker_path(path: Path) -> Path:
+    """Return the sidecar that quarantines one physical Kanban DB inode."""
+    resolved = path.expanduser().resolve()
+    return resolved.with_name(resolved.name + ".quarantine.json")
+
+
+@contextlib.contextmanager
+def _cross_process_quarantine_lock(path: Path):
+    """Serialize corrupt-inode preservation across independent processes.
+
+    Unlike the bounded first-init lock, this lock may block: copying one small
+    corrupt board is finite, and the OS releases the lock automatically if the
+    owner dies. Serializing here is what makes the one-backup-per-inode
+    guarantee hold across gateway, dashboard, CLI, and worker processes.
+    """
+    marker = _quarantine_marker_path(path)
+    lock_path = marker.with_name(marker.name + ".lock")
+    handle = lock_path.open("a+b")
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            locking = getattr(msvcrt, "locking")
+            lock_mode = getattr(msvcrt, "LK_LOCK")
+            locking(handle.fileno(), lock_mode, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if _IS_WINDOWS:
+                import msvcrt
+
+                handle.seek(0)
+                locking = getattr(msvcrt, "locking")
+                unlock_mode = getattr(msvcrt, "LK_UNLCK")
+                locking(handle.fileno(), unlock_mode, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+def _db_file_identity(path: Path) -> Optional[tuple[int, int]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return int(stat.st_dev), int(stat.st_ino)
+
+
+def _active_quarantine(
+    path: Path,
+) -> Optional[tuple[Optional[Path], str]]:
+    """Return active quarantine metadata, clearing stale replaced-inode state."""
+    resolved = path.expanduser().resolve()
+    key = str(resolved)
+    identity = _db_file_identity(resolved)
+    cached = _QUARANTINED_PATHS.get(key)
+    if cached is not None:
+        dev, ino, backup, reason = cached
+        if identity == (dev, ino):
+            return backup, reason
+        _QUARANTINED_PATHS.pop(key, None)
+
+    marker = _quarantine_marker_path(resolved)
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        marker_identity = (int(payload["device"]), int(payload["inode"]))
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return None
+    if identity != marker_identity:
+        # Recovery installs a verified DB with os.replace(), changing the
+        # inode. Its stale marker must not keep the replacement offline.
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+        return None
+    backup_raw = payload.get("backup_path")
+    backup = Path(backup_raw) if backup_raw else None
+    reason = str(payload.get("reason") or "database quarantined after corruption")
+    _QUARANTINED_PATHS[key] = (
+        marker_identity[0], marker_identity[1], backup, reason,
+    )
+    return backup, reason
+
+
+def _raise_if_quarantined(path: Path) -> None:
+    active = _active_quarantine(path)
+    if active is None:
+        return
+    backup, reason = active
+    raise KanbanDbCorruptError(path.expanduser().resolve(), backup, reason)
+
+
+def quarantine_corrupt_db(path: Path, reason: str) -> Optional[Path]:
+    """Fail-close one physical corrupt DB and preserve at most one backup.
+
+    The marker is bound to ``(st_dev, st_ino)`` rather than content or mtime.
+    Cached gateway connections can therefore keep changing otherwise-readable
+    pages without causing one multi-megabyte backup per retry. A verified
+    recovery installed with :func:`os.replace` receives a new inode and clears
+    the quarantine automatically on the next :func:`connect`.
+    """
+    resolved = path.expanduser().resolve()
+    with _QUARANTINE_LOCK, _cross_process_quarantine_lock(resolved):
+        # Re-check under both locks: another process may have preserved and
+        # marked this inode while we were waiting.
+        active = _active_quarantine(resolved)
+        if active is not None:
+            return active[0]
+        identity = _db_file_identity(resolved)
+        if identity is None:
+            return None
+        backup = _backup_corrupt_db(resolved)
+        payload = {
+            "version": 1,
+            "database": str(resolved),
+            "device": identity[0],
+            "inode": identity[1],
+            "backup_path": str(backup) if backup is not None else None,
+            "reason": reason,
+            "detected_at": int(time.time()),
+        }
+        marker = _quarantine_marker_path(resolved)
+        tmp = marker.with_name(
+            f".{marker.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            tmp.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            with tmp.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(tmp, marker)
+            try:
+                dir_fd = os.open(str(marker.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        key = str(resolved)
+        _QUARANTINED_PATHS[key] = (identity[0], identity[1], backup, reason)
+        _INITIALIZED_PATHS.discard(key)
+        return backup
 
 
 # Repairable integrity_check error classes. Both shapes are *index-scoped*:
@@ -2013,11 +2265,13 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
-    # Quarantine FIRST — both the repair path and the fail-closed path
-    # preserve the pre-touch bytes before anything mutates the file.
-    backup = _backup_corrupt_db(resolved)
+
+    # Index-only failures can be rebuilt losslessly. Preserve the pre-touch
+    # bytes before attempting REINDEX; every other corruption class continues
+    # through Hopebox's cross-process, fail-closed quarantine path.
     index_names = _repairable_index_names(messages)
     if index_names:
+        backup = _backup_corrupt_db(resolved)
         _log.warning(
             "kanban DB %s failed integrity_check with index-only errors "
             "(%s); pre-repair backup at %s — attempting REINDEX auto-repair.",
@@ -2037,6 +2291,7 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
             f"{reason}; REINDEX auto-repair attempted but integrity_check "
             f"still returned {post[0] if post else '<no row>'!r}"
         )
+    backup = quarantine_corrupt_db(resolved, reason)
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
@@ -2153,8 +2408,9 @@ def connect(
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
-    time but keeps the code robust if the DB file is ever re-created.
+    WAL mode and other DB-level PRAGMAs are applied during process-local
+    initialization for a path; per-connection setup is intentionally limited
+    to cheap connection-local PRAGMAs.
 
     The first connection to a given path auto-runs :func:`init_db` so
     fresh installs and test harnesses that construct `connect()`
@@ -2174,6 +2430,11 @@ def connect(
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Cross-process corruption markers are checked before the process-local
+    # initialization fast path. A gateway that previously validated this path
+    # must not keep opening fresh writers after another watcher quarantines the
+    # same physical DB inode.
+    _raise_if_quarantined(path)
 
     # Fast path: once THIS process has initialized this path, the expensive
     # first-open work (header validation, integrity probe, schema + additive
@@ -2191,8 +2452,6 @@ def connect(
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
-                from hermes_state import apply_wal_with_fallback
-                apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
                 conn.execute("PRAGMA synchronous=FULL")
                 conn.execute("PRAGMA wal_autocheckpoint=100")
                 conn.execute("PRAGMA foreign_keys=ON")
@@ -2204,6 +2463,9 @@ def connect(
         return conn
 
     with _cross_process_init_lock(path):
+        # Re-check after waiting: another process may have detected corruption
+        # while this process was blocked on first-open initialization.
+        _raise_if_quarantined(path)
         # Read-only file/sidecar preflight (port of kilocode#12508) —
         # repair-or-refuse before the header/integrity probes so a stray
         # read-only kanban.db fails with an actionable message instead of
@@ -2222,6 +2484,7 @@ def connect(
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
+                needs_init = resolved not in _INITIALIZED_PATHS
                 # WAL activation can take an exclusive lock while SQLite creates the
                 # sidecar files for a fresh database. Keep it in the same process-local
                 # critical section as schema initialization so concurrent gateway
@@ -2242,7 +2505,6 @@ def connect(
                 # Surface corrupt cells as read errors instead of silent
                 # wrong-data returns.
                 conn.execute("PRAGMA cell_size_check=ON")
-                needs_init = resolved not in _INITIALIZED_PATHS
                 if needs_init:
                     # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
                     # migrations. Cached so subsequent connect() calls in the same
@@ -2418,8 +2680,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # they were getting before the column existed).
         _add_column_if_missing(conn, "tasks", "max_retries", "max_retries INTEGER")
 
+    if "provider_override" not in cols:
+        _add_column_if_missing(conn, "tasks", "provider_override", "provider_override TEXT")
+
     if "model_override" not in cols:
-        conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
+        _add_column_if_missing(conn, "tasks", "model_override", "model_override TEXT")
 
     if "provider_override" not in cols:
         # Provider the model_override belongs to. NULL = worker profile's
@@ -2431,9 +2696,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "reasoning_effort" not in cols:
         # Per-task thinking depth for the worker. NULL = the worker profile's
         # own agent.reasoning_effort, which is what existing rows were getting.
-        _add_column_if_missing(
+        added = _add_column_if_missing(
             conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
         )
+        # Hopewell's pre-v0.20 patch called this field reasoning_override.
+        # Preserve values from those live boards while converging on the
+        # upstream v0.20 schema and API name.
+        if added and "reasoning_override" in cols:
+            conn.execute(
+                "UPDATE tasks SET reasoning_effort = reasoning_override "
+                "WHERE reasoning_override IS NOT NULL"
+            )
 
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
@@ -2786,6 +3059,25 @@ def _is_busy_error(exc: BaseException) -> bool:
     )
 
 
+def _connection_main_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Resolve the main on-disk DB path for a possibly long-held connection."""
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    for row in rows:
+        # PRAGMA database_list columns are seq, name, file.
+        if str(row[1]) == "main" and str(row[2]):
+            return Path(str(row[2])).expanduser().resolve()
+    return None
+
+
+def _raise_if_connection_quarantined(conn: sqlite3.Connection) -> None:
+    path = _connection_main_db_path(conn)
+    if path is not None:
+        _raise_if_quarantined(path)
+
+
 def _execute_boundary_with_retry(conn: sqlite3.Connection, sql: str) -> None:
     for attempt in range(_BUSY_MAX_RETRIES + 1):
         try:
@@ -2810,9 +3102,14 @@ def write_txn(conn: sqlite3.Connection):
     shadow the original exception with a spurious rollback error.
     """
     _assert_not_delegated_child_mutation()
+    _raise_if_connection_quarantined(conn)
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
+        # A different process may quarantine this inode while this transaction
+        # is open. Refuse COMMIT so already-held connections cannot extend a
+        # known-corrupt incident or mutate cards after preservation begins.
+        _raise_if_connection_quarantined(conn)
     except Exception:
         try:
             conn.execute("ROLLBACK")
@@ -2878,6 +3175,1049 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _review_gate_config() -> dict[str, Any]:
+    """Return board-wide review-gate settings from config/env."""
+    try:
+        from hermes_cli.config import load_config_readonly, read_user_config_raw
+        from hermes_cli.profiles import normalize_profile_name
+        from hermes_constants import get_default_hermes_root, get_hermes_home
+
+        cfg = load_config_readonly()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        gate = kanban_cfg.get("review_gate", {}) if isinstance(kanban_cfg, dict) else {}
+        if not isinstance(gate, dict):
+            gate = {}
+
+        home = get_hermes_home().resolve(strict=False)
+        root = get_default_hermes_root().resolve(strict=False)
+
+        try:
+            raw_cfg = read_user_config_raw(home / "config.yaml")
+            raw_kanban = raw_cfg.get("kanban", {}) if isinstance(raw_cfg, dict) else {}
+            current_has_explicit_gate = (
+                isinstance(raw_kanban, dict) and "review_gate" in raw_kanban
+            )
+        except Exception:
+            current_has_explicit_gate = bool(gate)
+
+        root_cfg: dict[str, Any] = {}
+        root_kanban: dict[str, Any] = {}
+        root_gate: dict[str, Any] = {}
+        try:
+            root_cfg = read_user_config_raw(root / "config.yaml")
+            root_kanban = root_cfg.get("kanban", {}) if isinstance(root_cfg, dict) else {}
+            candidate = root_kanban.get("review_gate", {}) if isinstance(root_kanban, dict) else {}
+            if isinstance(candidate, dict):
+                root_gate = candidate
+        except Exception:
+            pass
+
+        # Closed-loop review is board/dispatcher policy, not source-assignee
+        # policy. A stale profile-local review_gate on Dante/Sterling/etc. must
+        # not disable review-required routing or send review cards back to that
+        # profile. Prefer the configured dispatcher profile's explicit loop
+        # contract for every worker on the board. The root profile is itself the
+        # config source when dispatcher_profile is empty/default.
+        dispatcher_gate: dict[str, Any] = {}
+        dispatcher = ""
+        if isinstance(root_kanban, dict):
+            dispatcher = str(root_kanban.get("dispatcher_profile") or "").strip()
+        if dispatcher and normalize_profile_name(dispatcher) != "default":
+            try:
+                dispatcher_name = normalize_profile_name(dispatcher)
+                dispatcher_cfg_path = root / "profiles" / dispatcher_name / "config.yaml"
+                dispatcher_cfg = read_user_config_raw(dispatcher_cfg_path)
+                dispatcher_kanban = (
+                    dispatcher_cfg.get("kanban", {}) if isinstance(dispatcher_cfg, dict) else {}
+                )
+                candidate = (
+                    dispatcher_kanban.get("review_gate", {})
+                    if isinstance(dispatcher_kanban, dict)
+                    else {}
+                )
+                if isinstance(candidate, dict):
+                    dispatcher_gate = candidate
+            except Exception:
+                pass
+        elif root_gate:
+            dispatcher_gate = root_gate
+
+        if "closed_loop_enabled" in dispatcher_gate:
+            gate = dispatcher_gate
+        elif not current_has_explicit_gate and root_gate:
+            gate = root_gate
+    except Exception:
+        gate = {}
+
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+    def _optional_model(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        model = str(value).strip()
+        return model or None
+
+    enabled = _env_bool(
+        "HERMES_KANBAN_REVIEW_GATE_ENABLED",
+        bool(gate.get("enabled", True)),
+    )
+
+    raw_roots = os.environ.get("HERMES_KANBAN_REVIEW_GATE_ROOTS")
+    if raw_roots is not None:
+        roots = [p.strip() for p in raw_roots.split(os.pathsep) if p.strip()]
+    else:
+        configured_roots = gate.get("roots")
+        if isinstance(configured_roots, (list, tuple)):
+            roots = [str(p).strip() for p in configured_roots if str(p).strip()]
+        else:
+            roots = list(DEFAULT_REVIEW_GATE_ROOTS)
+
+    raw_skills = os.environ.get("HERMES_KANBAN_REVIEW_GATE_SKILLS")
+    if raw_skills is not None:
+        skills = [s.strip() for s in raw_skills.split(",") if s.strip()]
+    else:
+        configured_skills = gate.get("skills")
+        if isinstance(configured_skills, (list, tuple)):
+            skills = [str(s).strip() for s in configured_skills if str(s).strip()]
+        else:
+            skills = list(DEFAULT_REVIEW_GATE_SKILLS)
+
+    raw_goal_contract_files = os.environ.get("HERMES_KANBAN_REVIEW_GOAL_CONTRACT_FILES")
+    if raw_goal_contract_files is not None:
+        goal_contract_files = [
+            p.strip() for p in raw_goal_contract_files.split(os.pathsep) if p.strip()
+        ]
+    else:
+        configured_goal_contract_files = gate.get("goal_contract_files")
+        if isinstance(configured_goal_contract_files, (list, tuple)):
+            goal_contract_files = [
+                str(p).strip() for p in configured_goal_contract_files if str(p).strip()
+            ]
+        else:
+            goal_contract_files = list(DEFAULT_REVIEW_GOAL_CONTRACT_FILES)
+
+    raw_provider = os.environ.get("HERMES_KANBAN_REVIEW_GATE_PROVIDER")
+    if raw_provider is None:
+        provider = _optional_model(gate.get("provider"))
+    else:
+        provider = _optional_model(raw_provider)
+
+    raw_fallback_provider = os.environ.get("HERMES_KANBAN_REVIEW_GATE_FALLBACK_PROVIDER")
+    if raw_fallback_provider is None:
+        fallback_provider = _optional_model(gate.get("fallback_provider"))
+    else:
+        fallback_provider = _optional_model(raw_fallback_provider)
+
+    raw_model = os.environ.get("HERMES_KANBAN_REVIEW_GATE_MODEL")
+    if raw_model is None:
+        model = _optional_model(gate.get("model", DEFAULT_REVIEW_GATE_MODEL))
+    else:
+        model = _optional_model(raw_model)
+
+    raw_fallback_model = os.environ.get("HERMES_KANBAN_REVIEW_GATE_FALLBACK_MODEL")
+    if raw_fallback_model is None:
+        fallback_model = _optional_model(
+            gate.get("fallback_model", DEFAULT_REVIEW_GATE_FALLBACK_MODEL)
+        )
+    else:
+        fallback_model = _optional_model(raw_fallback_model)
+
+    return {
+        "enabled": enabled,
+        "roots": roots,
+        "assignee": os.environ.get(
+            "HERMES_KANBAN_REVIEW_GATE_ASSIGNEE",
+            str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
+        ).strip() or DEFAULT_REVIEW_GATE_ASSIGNEE,
+        "provider": provider,
+        "model": model,
+        "fallback_provider": fallback_provider,
+        "fallback_model": fallback_model,
+        "skills": skills or list(DEFAULT_REVIEW_GATE_SKILLS),
+        "max_runtime_seconds": gate.get("max_runtime_seconds", 30 * 60),
+        "closed_loop_enabled": _env_bool(
+            "HERMES_KANBAN_REVIEW_LOOP_ENABLED",
+            bool(gate.get("closed_loop_enabled", gate.get("enabled", False))),
+        ),
+        "closed_loop_max_rounds": int(
+            os.environ.get(
+                "HERMES_KANBAN_REVIEW_LOOP_MAX_ROUNDS",
+                gate.get("closed_loop_max_rounds", DEFAULT_REVIEW_LOOP_MAX_ROUNDS),
+            )
+            or DEFAULT_REVIEW_LOOP_MAX_ROUNDS
+        ),
+        "goal_loop_enabled": _env_bool(
+            "HERMES_KANBAN_REVIEW_GOAL_LOOP_ENABLED",
+            bool(gate.get("goal_loop_enabled", True)),
+        ),
+        "goal_loop_max_turns": int(
+            os.environ.get(
+                "HERMES_KANBAN_REVIEW_GOAL_MAX_TURNS",
+                gate.get("goal_loop_max_turns", DEFAULT_REVIEW_GOAL_MAX_TURNS),
+            )
+            or DEFAULT_REVIEW_GOAL_MAX_TURNS
+        ),
+        "goal_contract_files": goal_contract_files,
+    }
+
+
+def _path_is_under(path: str | Path, root: str | Path) -> bool:
+    try:
+        Path(path).expanduser().resolve(strict=False).relative_to(
+            Path(root).expanduser().resolve(strict=False)
+        )
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+@dataclass(frozen=True)
+class ReviewSource:
+    repo_path: str
+    branch: Optional[str] = None
+    head_sha: Optional[str] = None
+    pr_url: Optional[str] = None
+    diff_path: Optional[str] = None
+    changed_files: tuple[str, ...] = ()
+    tests_run: tuple[str, ...] = ()
+
+
+def _string_list(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return (stripped,) if stripped else ()
+    if isinstance(value, dict):
+        return tuple(
+            f"{str(key).strip()}: {str(item).strip()}"
+            for key, item in value.items()
+            if str(key).strip() and str(item).strip()
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(str(v).strip() for v in value if str(v).strip())
+    return ()
+
+
+def _review_source_from_mapping(raw: Any, gate: dict[str, Any]) -> Optional[ReviewSource]:
+    """Resolve a review target from a trusted structured handoff.
+
+    Closed-loop review is intentionally independent of the create-time review
+    gate's configured roots.  A worker can already name arbitrary local source
+    in its handoff; the safety boundary here is positive, structured evidence:
+    an existing repo/worktree plus a worktree locator, branch/commit/PR, or
+    changed-file/diff evidence.  A bare prose path or empty JSON object is not
+    enough to dispatch another agent.
+    """
+    if not isinstance(raw, dict):
+        return None
+    source = raw.get("review_source") or raw.get("review_required_source") or raw.get("source")
+    if isinstance(source, dict):
+        raw = source
+
+    repo_raw = (
+        raw.get("workspace_path")
+        or raw.get("worktree")
+        or raw.get("repo_path")
+        or raw.get("path")
+        or raw.get("repo")
+    )
+    if not repo_raw:
+        return None
+    try:
+        repo_path = Path(str(repo_raw).strip()).expanduser().resolve(strict=False)
+    except OSError:
+        return None
+    if not repo_path.exists() or not repo_path.is_dir():
+        return None
+
+    branch = str(raw.get("branch") or "").strip() or None
+    head_sha = str(raw.get("head_sha") or raw.get("commit") or "").strip() or None
+    pr_url = str(raw.get("pr_url") or raw.get("pr") or "").strip() or None
+    changed_files = _string_list(raw.get("changed_files") or raw.get("files"))
+    tests_run = _string_list(
+        raw.get("tests_run") or raw.get("verification") or raw.get("tests")
+    )
+    diff_raw = raw.get("diff_path") or raw.get("patch_path")
+    diff_path: Optional[str] = None
+    if diff_raw:
+        try:
+            candidate = Path(str(diff_raw).strip()).expanduser().resolve(strict=False)
+            if candidate.exists() and candidate.is_file():
+                diff_path = str(candidate)
+        except OSError:
+            pass
+
+    has_structured_locator = bool(raw.get("workspace_path") or raw.get("worktree"))
+    has_change_evidence = bool(branch or head_sha or pr_url or diff_path or changed_files)
+    if not (has_structured_locator or has_change_evidence):
+        return None
+
+    return ReviewSource(
+        repo_path=str(repo_path),
+        branch=branch,
+        head_sha=head_sha,
+        pr_url=pr_url,
+        diff_path=diff_path,
+        changed_files=changed_files,
+        tests_run=tests_run,
+    )
+
+
+def _json_candidates_from_text(text: str) -> list[Any]:
+    candidates: list[Any] = []
+    for match in re.finditer(r"```(?:json)?\s*(.*?)```", text or "", re.IGNORECASE | re.DOTALL):
+        try:
+            candidates.append(json.loads(match.group(1).strip()))
+        except Exception:
+            pass
+    stripped = (text or "").strip()
+    if stripped.startswith("{"):
+        try:
+            candidates.append(json.loads(stripped))
+        except Exception:
+            pass
+    # Worker handoffs commonly prefix the JSON with a short label such as
+    # ``review-required handoff:`` without a Markdown fence. Decode embedded
+    # objects structurally rather than scraping loose paths from prose.
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text or ""):
+        try:
+            candidate, _end = decoder.raw_decode(text, match.start())
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _structured_review_source_from_comments(
+    conn: sqlite3.Connection,
+    source: Task,
+    gate: dict[str, Any],
+) -> Optional[ReviewSource]:
+    """Return a trusted structured review source from recent source comments.
+
+    Scratch workspaces are intentionally disposable. To let a scratch source
+    task enter the closed-loop review path, the source owner must leave a JSON
+    handoff naming an existing repo/worktree and concrete branch-or-diff
+    evidence. We do not infer from loose prose paths or PR URLs. Configured
+    roots apply only to the optional create-time Hopewell review gate; an
+    explicit ``review-required:`` handoff can target any local source path.
+    """
+    trusted_authors = {"worker"}
+    if source.assignee:
+        trusted_authors.add(str(source.assignee).strip())
+    if source.created_by:
+        trusted_authors.add(str(source.created_by).strip())
+    for comment in reversed(list_comments(conn, source.id)):
+        if comment.author not in trusted_authors:
+            continue
+        for candidate in reversed(_json_candidates_from_text(comment.body or "")):
+            review_source = _review_source_from_mapping(candidate, gate)
+            if review_source is not None:
+                return review_source
+    return None
+
+
+def _review_source_for_review_loop(
+    conn: sqlite3.Connection,
+    source: Task,
+    gate: dict[str, Any],
+) -> Optional[ReviewSource]:
+    # Prefer the source owner's trusted handoff when it points at a more precise
+    # worktree or branch than the task's generic persistent workspace.
+    structured = _structured_review_source_from_comments(conn, source, gate)
+    if structured is not None:
+        return structured
+    if source.workspace_kind in {"dir", "worktree"} and source.workspace_path:
+        path = Path(source.workspace_path).expanduser().resolve(strict=False)
+        if path.exists() and path.is_dir():
+            return ReviewSource(repo_path=str(path), branch=source.branch_name)
+    return None
+
+
+def _review_contract_exists(repo_path: Optional[str], gate: dict[str, Any]) -> bool:
+    """Return true when a repo/workspace exposes a review/runbook contract.
+
+    Goal-mode review cards should be reserved for code-review work with durable
+    project-specific acceptance criteria.  We intentionally check only local
+    checkout files under a small configurable candidate set rather than treating
+    every repository or every GitHub workflow as a runbook.
+    """
+    if not repo_path:
+        return False
+    try:
+        root = Path(repo_path).expanduser().resolve(strict=False)
+    except OSError:
+        return False
+    if not root.exists():
+        return False
+    for raw in gate.get("goal_contract_files") or DEFAULT_REVIEW_GOAL_CONTRACT_FILES:
+        rel = str(raw or "").strip().lstrip("/")
+        if not rel or rel.startswith(".."):
+            continue
+        try:
+            matches = list(root.glob(rel)) if any(ch in rel for ch in "*?[") else [root / rel]
+        except (OSError, ValueError):
+            continue
+        if any(path.is_file() for path in matches):
+            return True
+    return False
+
+
+def _looks_like_code_review_task(
+    *,
+    title: str,
+    created_by: Optional[str],
+    assignee: Optional[str],
+    skills: Optional[list[str]],
+    gate: dict[str, Any],
+) -> bool:
+    if created_by in {REVIEW_GATE_CREATED_BY, REVIEW_LOOP_CREATED_BY}:
+        return True
+    review_skills = {
+        str(s).strip()
+        for s in (gate.get("skills") or DEFAULT_REVIEW_GATE_SKILLS)
+        if str(s).strip()
+    }
+    skill_names = {str(s).strip() for s in (skills or []) if str(s).strip()}
+    if skill_names.intersection(review_skills):
+        return True
+    review_assignee = str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE).strip()
+    if review_assignee and (assignee or "").strip() == review_assignee:
+        return True
+    lower_title = (title or "").strip().lower()
+    return lower_title.startswith(("review:", "code review:", "review ", "review loop "))
+
+
+def _should_enable_review_goal_loop(
+    *,
+    title: str,
+    created_by: Optional[str],
+    assignee: Optional[str],
+    workspace_path: Optional[str],
+    skills: Optional[list[str]],
+) -> tuple[bool, Optional[int]]:
+    gate = _review_gate_config()
+    if not gate.get("goal_loop_enabled"):
+        return False, None
+    if not _looks_like_code_review_task(
+        title=title,
+        created_by=created_by,
+        assignee=assignee,
+        skills=skills,
+        gate=gate,
+    ):
+        return False, None
+    if not _review_contract_exists(workspace_path, gate):
+        return False, None
+    return True, max(1, int(gate.get("goal_loop_max_turns") or DEFAULT_REVIEW_GOAL_MAX_TURNS))
+
+
+def _should_create_review_gate(
+    *,
+    title: str,
+    created_by: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    skills: Optional[list[str]],
+    provider_override: Optional[str],
+    model_override: Optional[str],
+    triage: bool,
+) -> tuple[bool, dict[str, Any]]:
+    gate = _review_gate_config()
+    if not gate.get("enabled"):
+        return False, gate
+    if not workspace_path or workspace_kind not in {"dir", "worktree"}:
+        return False, gate
+    if created_by == REVIEW_GATE_CREATED_BY:
+        return False, gate
+    if triage:
+        return False, gate
+    lower_title = (title or "").strip().lower()
+    if lower_title.startswith(("review:", "code review:", "review ")):
+        return False, gate
+    skill_names = {str(s).strip() for s in (skills or []) if str(s).strip()}
+    if skill_names.intersection(set(gate.get("skills") or DEFAULT_REVIEW_GATE_SKILLS)):
+        return False, gate
+    if gate.get("model") and model_override and str(model_override).strip() == gate.get("model"):
+        gate_provider = str(gate.get("provider") or "").strip()
+        task_provider = str(provider_override or "").strip()
+        if not gate_provider or task_provider == gate_provider:
+            return False, gate
+    if not any(_path_is_under(workspace_path, root) for root in gate.get("roots", [])):
+        return False, gate
+    return True, gate
+
+
+def _review_gate_body(
+    parent_id: str,
+    parent_title: str,
+    fallback_model: Optional[str] = None,
+    fallback_provider: Optional[str] = None,
+) -> str:
+    body = (
+        "Run the Hopewell dev code-review gate for the parent implementation card.\n\n"
+        f"Parent task: {parent_id}\n"
+        f"Parent title: {parent_title.strip()}\n\n"
+        "Scope: inspect the implementation handoff, changed diff, test output, and "
+        "obvious operational risks for work under /home/hopewell/hopewell-dev. "
+        "Use the github-code-review skill. Produce a concise PASS / WARN / BLOCK "
+        "result and write durable review artifacts under .code-reviews/feedback/ "
+        "when there are findings worth preserving. Do not perform broad unrelated "
+        "refactors. The review should run on the reviewer profile's default model "
+        "unless the card explicitly sets a model override."
+    )
+    if fallback_model:
+        body += (
+            "\n\nIf the pinned review model fails due to model/provider/runtime failure, "
+            f"retry the same review via fallback model {fallback_model}"
+            + (f" on provider {fallback_provider}" if fallback_provider else "")
+            + "."
+        )
+    return body
+
+
+def _is_review_required_reason(reason: Optional[str]) -> bool:
+    return bool(str(reason or "").strip().lower().startswith("review-required:"))
+
+
+def _review_loop_rounds_created(conn: sqlite3.Connection, source_task_id: str) -> int:
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_loop_requested'",
+        (source_task_id,),
+    ).fetchall()
+    rounds: set[int] = set()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+            round_no = int(payload.get("round") or 0)
+        except Exception:
+            round_no = 0
+        if round_no > 0:
+            rounds.add(round_no)
+    return len(rounds)
+
+
+def _review_loop_source_from_task(task: Optional[Task]) -> Optional[tuple[str, int]]:
+    if task is None:
+        return None
+    idem = (task.idempotency_key or "").strip()
+    prefix = f"{REVIEW_LOOP_IDEMPOTENCY_PREFIX}:"
+    if idem.startswith(prefix):
+        parts = idem.split(":")
+        if len(parts) >= 3 and parts[1]:
+            try:
+                return parts[1], int(parts[2])
+            except (TypeError, ValueError):
+                return parts[1], 0
+    body = task.body or ""
+    m = re.search(r"^Source task:\s*(t_[a-f0-9]{8,})\s*$", body, re.MULTILINE)
+    if m:
+        return m.group(1), 0
+    return None
+
+
+def _review_loop_body(source: Task, round_no: int, max_rounds: int, review_source: ReviewSource) -> str:
+    body = (
+        "Run closed-loop code review for the blocked source task.\n\n"
+        f"Source task: {source.id}\n"
+        f"Source title: {source.title}\n"
+        f"Review round: {round_no}/{max_rounds}\n"
+        f"Workspace: {source.workspace_path or ''}\n"
+        f"Review source: {review_source.repo_path}\n"
+        f"Branch: {review_source.branch or source.branch_name or ''}\n\n"
+        "Read the source task comments and handoff evidence first. Review the changed diff, "
+        "test output, and operational risk for merge/deploy/production handoff. This path is "
+        "for genuine review-worthy dev work (PRs before merge, deployment-impacting changes, "
+        "customer-facing behavior, auth/security, data integrity, runtime/fleet plumbing, or "
+        "implementer uncertainty), not trivia. Add a concise comment to the source task when "
+        "findings matter. Complete this review card with metadata.verdict set to one of: "
+        "approved, changes_requested, cannot_review. If metadata is unavailable, start the "
+        "summary with PASS, BLOCK, WARN, or CANNOT_REVIEW. Do not edit the implementation."
+    )
+    if review_source.pr_url:
+        body += f"\nPR: {review_source.pr_url}"
+    if review_source.head_sha:
+        body += f"\nHead SHA: {review_source.head_sha}"
+    if review_source.diff_path:
+        body += f"\nDiff/patch: {review_source.diff_path}"
+    if review_source.changed_files:
+        body += "\nChanged files: " + ", ".join(review_source.changed_files)
+    if review_source.tests_run:
+        body += "\nTests/verification from handoff: " + "; ".join(review_source.tests_run)
+    return body
+
+
+def _latest_review_required_block_event_id(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+) -> Optional[int]:
+    for event in reversed(list_events(conn, source_task_id)):
+        if event.kind != "blocked" or not isinstance(event.payload, dict):
+            continue
+        if _is_review_required_reason(event.payload.get("reason")):
+            return event.id
+    return None
+
+
+def _review_loop_result_for_block(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    block_event_id: Optional[int],
+) -> Optional[str]:
+    """Return the already-recorded review result for one source block event."""
+    if block_event_id is None:
+        return None
+    for event in reversed(list_events(conn, source_task_id)):
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if payload.get("block_event_id") != block_event_id:
+            continue
+        if event.kind == "review_loop_requested":
+            review_task_id = str(payload.get("review_task_id") or "").strip()
+            if get_task(conn, review_task_id) is not None:
+                return review_task_id
+        if event.kind == "review_escalation" and payload.get("verdict") == REVIEW_LOOP_CANNOT_REVIEW:
+            return REVIEW_LOOP_CANNOT_REVIEW
+    return None
+
+
+def _record_review_loop_cannot_review(
+    conn: sqlite3.Connection,
+    source: Task,
+    *,
+    block_event_id: Optional[int],
+    block_reason: Optional[str],
+    reason: str,
+) -> str:
+    if block_event_id is None:
+        return REVIEW_LOOP_CANNOT_REVIEW
+    existing = _review_loop_result_for_block(conn, source.id, block_event_id)
+    if existing is not None:
+        return existing
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (
+                source.id,
+                REVIEW_LOOP_CREATED_BY,
+                "CANNOT_REVIEW: explicit review-required block did not include resolvable "
+                "structured repo/worktree plus branch-or-diff evidence; source remains blocked.",
+                int(time.time()),
+            ),
+        )
+        _append_event(
+            conn,
+            source.id,
+            "review_escalation",
+            {
+                "verdict": REVIEW_LOOP_CANNOT_REVIEW,
+                "reason": reason,
+                "block_event_id": block_event_id,
+                "block_reason": block_reason,
+            },
+        )
+    return REVIEW_LOOP_CANNOT_REVIEW
+
+
+def _maybe_create_review_loop_task(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    reason: Optional[str],
+) -> Optional[str]:
+    if not _is_review_required_reason(reason):
+        return None
+    gate = _review_gate_config()
+    if not gate.get("closed_loop_enabled"):
+        return None
+    source = get_task(conn, source_task_id)
+    if source is None:
+        return REVIEW_LOOP_CANNOT_REVIEW
+    block_event_id = _latest_review_required_block_event_id(conn, source_task_id)
+    existing_result = _review_loop_result_for_block(conn, source_task_id, block_event_id)
+    if existing_result is not None:
+        return existing_result
+    review_source = _review_source_for_review_loop(conn, source, gate)
+    if review_source is None:
+        return _record_review_loop_cannot_review(
+            conn,
+            source,
+            block_event_id=block_event_id,
+            block_reason=reason,
+            reason="insufficient_review_evidence",
+        )
+    max_rounds = max(1, int(gate.get("closed_loop_max_rounds") or DEFAULT_REVIEW_LOOP_MAX_ROUNDS))
+    existing_rounds = _review_loop_rounds_created(conn, source_task_id)
+    if existing_rounds >= max_rounds:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                source_task_id,
+                "review_escalation",
+                {
+                    "reason": "max_review_rounds_reached",
+                    "verdict": REVIEW_LOOP_CANNOT_REVIEW,
+                    "rounds": existing_rounds,
+                    "max_rounds": max_rounds,
+                    "block_event_id": block_event_id,
+                    "block_reason": reason,
+                },
+            )
+        return REVIEW_LOOP_CANNOT_REVIEW
+    round_no = existing_rounds + 1
+    idem = f"{REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_task_id}:{round_no}"
+    review_id = create_task(
+        conn,
+        title=f"review loop r{round_no}: {source.title}",
+        body=_review_loop_body(source, round_no, max_rounds, review_source),
+        assignee=str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
+        created_by=REVIEW_LOOP_CREATED_BY,
+        workspace_kind=(source.workspace_kind if source.workspace_kind in {"dir", "worktree"} else "dir"),
+        workspace_path=review_source.repo_path,
+        branch_name=(source.branch_name if source.workspace_kind == "worktree" else None),
+        tenant=source.tenant,
+        priority=source.priority,
+        idempotency_key=idem,
+        max_runtime_seconds=int(gate.get("max_runtime_seconds") or 30 * 60),
+        skills=gate.get("skills") or list(DEFAULT_REVIEW_GATE_SKILLS),
+        provider_override=(str(gate["provider"]).strip() if gate.get("provider") else None),
+        model_override=str(gate["model"]).strip() if gate.get("model") else None,
+        max_retries=1,
+        board=get_current_board(),
+        auto_review_gate=False,
+    )
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_loop_requested' "
+            "AND payload LIKE ? LIMIT 1",
+            (source_task_id, f'%"round": {round_no}%'),
+        ).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    source_task_id,
+                    REVIEW_LOOP_CREATED_BY,
+                    f"Closed-loop code review round {round_no}/{max_rounds} queued as {review_id}.",
+                    int(time.time()),
+                ),
+            )
+            _append_event(
+                conn,
+                source_task_id,
+                "review_loop_requested",
+                {
+                    "review_task_id": review_id,
+                    "round": round_no,
+                    "max_rounds": max_rounds,
+                    "block_event_id": block_event_id,
+                    "block_reason": reason,
+                },
+            )
+    return review_id
+
+
+def _extract_review_loop_verdict(
+    *,
+    metadata: Optional[dict],
+    summary: Optional[str],
+    result: Optional[str],
+) -> str:
+    if isinstance(metadata, dict):
+        raw = metadata.get("verdict") or metadata.get("review_verdict")
+        nested = metadata.get("review")
+        if raw is None and isinstance(nested, dict):
+            raw = nested.get("verdict") or nested.get("review_verdict")
+        if raw is None and "approved" in metadata:
+            return "approved" if bool(metadata.get("approved")) else "changes_requested"
+        if raw is None and isinstance(nested, dict) and "approved" in nested:
+            return "approved" if bool(nested.get("approved")) else "changes_requested"
+        if raw is not None:
+            value = str(raw).strip().lower().replace("-", "_").replace(" ", "_")
+            if value in {"approved", "approve", "pass", "passed", "lgtm"}:
+                return "approved"
+            if value in {"changes_requested", "request_changes", "block", "blocked", "warn", "warning"}:
+                return "changes_requested"
+            if value in {"cannot_review", "unable_to_review", "failed", "error"}:
+                return "cannot_review"
+    text = " ".join(part for part in [summary, result] if part).strip().lower()
+    first = text.splitlines()[0][:80] if text else ""
+    if first.startswith(("pass", "approved", "approve", "lgtm")):
+        return "approved"
+    if first.startswith(("block", "changes requested", "request changes", "warn")):
+        return "changes_requested"
+    if first.startswith(("cannot_review", "cannot review", "unable to review")):
+        return "cannot_review"
+    return "cannot_review"
+
+
+def _metadata_review_source_task_id(metadata: Optional[dict]) -> Optional[str]:
+    """Return the structured source task id from explicit review metadata."""
+    if not isinstance(metadata, dict):
+        return None
+    candidates: list[Any] = [
+        metadata.get("source_task_id"),
+        metadata.get("source_task"),
+        metadata.get("implementation_task"),
+        metadata.get("implementation_task_id"),
+        metadata.get("review_source_task_id"),
+        metadata.get("review_required_source_task_id"),
+    ]
+    nested = metadata.get("review")
+    if isinstance(nested, dict):
+        candidates.extend([
+            nested.get("source_task_id"),
+            nested.get("source_task"),
+            nested.get("implementation_task"),
+            nested.get("implementation_task_id"),
+            nested.get("task_id"),
+        ])
+    for raw in candidates:
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if re.fullmatch(r"t_[a-f0-9]{8,}", value):
+            return value
+    return None
+
+
+def _metadata_has_structured_review_verdict(metadata: Optional[dict]) -> bool:
+    """True when metadata, not prose, carries an explicit review verdict."""
+    if not isinstance(metadata, dict):
+        return False
+    if any(key in metadata for key in ("verdict", "review_verdict", "approved")):
+        return True
+    nested = metadata.get("review")
+    return isinstance(nested, dict) and any(
+        key in nested for key in ("verdict", "review_verdict", "approved")
+    )
+
+
+def _review_gate_source_from_task(conn: sqlite3.Connection, task: Task) -> Optional[str]:
+    """Resolve the source for a review-gate card from durable task relations."""
+    idem = (task.idempotency_key or "").strip()
+    prefix = f"{REVIEW_GATE_CREATED_BY}:"
+    if idem.startswith(prefix):
+        candidate = idem[len(prefix):].split(":", 1)[0]
+        if re.fullmatch(r"t_[a-f0-9]{8,}", candidate):
+            return candidate
+    body = task.body or ""
+    m = re.search(r"^Parent task:\s*(t_[a-f0-9]{8,})\s*$", body, re.MULTILINE)
+    if m:
+        return m.group(1)
+    parents = parent_ids(conn, task.id)
+    if len(parents) == 1 and re.fullmatch(r"t_[a-f0-9]{8,}", parents[0]):
+        return parents[0]
+    return None
+
+
+def _explicit_review_source_from_task(
+    conn: sqlite3.Connection,
+    task: Optional[Task],
+    metadata: Optional[dict],
+) -> Optional[str]:
+    """Resolve a source task for non-loop review cards with a safe contract.
+
+    Closed-loop cards are handled by ``_apply_review_loop_outcome``.  This
+    helper covers explicit/manual review cards without letting arbitrary tasks
+    spoof an approval: a source id must be structured metadata and the review
+    card must itself look like a review surface (review-gate created, assigned
+    to the configured review assignee, or carrying review skills).
+    """
+    if task is None or task.created_by == REVIEW_LOOP_CREATED_BY:
+        return None
+    source_task_id = _metadata_review_source_task_id(metadata)
+    if source_task_id is None and task.created_by == REVIEW_GATE_CREATED_BY:
+        source_task_id = _review_gate_source_from_task(conn, task)
+    if source_task_id is None:
+        return None
+    if not _metadata_has_structured_review_verdict(metadata):
+        return None
+
+    gate = _review_gate_config()
+    review_assignee = str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE).strip()
+    skill_names = set(task.skills or [])
+    review_skills = {str(s).strip() for s in (gate.get("skills") or DEFAULT_REVIEW_GATE_SKILLS) if str(s).strip()}
+
+    trusted = False
+    if task.created_by == REVIEW_GATE_CREATED_BY:
+        trusted = True
+    elif review_assignee and (task.assignee or "").strip() == review_assignee:
+        trusted = True
+    elif bool(skill_names.intersection(review_skills)):
+        trusted = True
+    if not trusted:
+        return None
+    return source_task_id
+
+
+def _record_source_review_outcome(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    review_task: Task,
+    verdict: str,
+    line: str,
+    round_no: Optional[int] = None,
+    actor: str,
+) -> None:
+    round_label = f" round {round_no}" if round_no else ""
+    suffix = f"\n{line}" if line else ""
+    if verdict == "approved":
+        body = (
+            f"Review{round_label} approved by "
+            f"{review_task.assignee or 'reviewer'} via {review_task.id}."
+            f"{suffix}"
+        )
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (source_task_id, actor, body, int(time.time())),
+            )
+            _append_event(
+                conn,
+                source_task_id,
+                "review_approved",
+                {"review_task_id": review_task.id, "round": round_no, "summary": line or None},
+            )
+        unblock_task(conn, source_task_id)
+        return
+    if verdict == "changes_requested":
+        body = f"Review{round_label} requested changes via {review_task.id}.{suffix}"
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (source_task_id, actor, body, int(time.time())),
+            )
+            _append_event(
+                conn,
+                source_task_id,
+                "review_changes_requested",
+                {"review_task_id": review_task.id, "round": round_no, "summary": line or None},
+            )
+        unblock_task(conn, source_task_id)
+        return
+    with write_txn(conn):
+        body = f"Review{round_label} could not complete via {review_task.id}.{suffix}"
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (source_task_id, actor, body, int(time.time())),
+        )
+        _append_event(
+            conn,
+            source_task_id,
+            "review_escalation",
+            {"review_task_id": review_task.id, "round": round_no, "verdict": verdict, "summary": line or None},
+        )
+
+
+def _apply_explicit_review_outcome(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> None:
+    review_task = get_task(conn, review_task_id)
+    source_task_id = _explicit_review_source_from_task(conn, review_task, metadata)
+    if review_task is None or source_task_id is None:
+        return
+    if get_task(conn, source_task_id) is None:
+        return
+    verdict = _extract_review_loop_verdict(metadata=metadata, summary=summary, result=result)
+    line = (summary or result or "").strip().splitlines()[0][:400]
+    _record_source_review_outcome(
+        conn,
+        source_task_id=source_task_id,
+        review_task=review_task,
+        verdict=verdict,
+        line=line,
+        actor=REVIEW_GATE_CREATED_BY if review_task.created_by == REVIEW_GATE_CREATED_BY else "explicit-review",
+    )
+
+
+def _apply_review_loop_outcome(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> None:
+    review_task = get_task(conn, review_task_id)
+    if review_task is None or review_task.created_by != REVIEW_LOOP_CREATED_BY:
+        return
+    source_info = _review_loop_source_from_task(review_task)
+    if source_info is None:
+        return
+    source_task_id, round_no = source_info
+    source = get_task(conn, source_task_id)
+    if source is None:
+        return
+    verdict = _extract_review_loop_verdict(metadata=metadata, summary=summary, result=result)
+    line = (summary or result or "").strip().splitlines()[0][:400]
+    if verdict == "approved":
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    source_task_id,
+                    REVIEW_LOOP_CREATED_BY,
+                    f"Review round {round_no or '?'} approved by {review_task.assignee or 'reviewer'} via {review_task_id}." + (f"\n{line}" if line else ""),
+                    int(time.time()),
+                ),
+            )
+            _append_event(
+                conn,
+                source_task_id,
+                "review_approved",
+                {"review_task_id": review_task_id, "round": round_no, "summary": line or None},
+            )
+        unblock_task(conn, source_task_id)
+        return
+    if verdict == "changes_requested":
+        with write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    source_task_id,
+                    REVIEW_LOOP_CREATED_BY,
+                    f"Review round {round_no or '?'} requested changes via {review_task_id}." + (f"\n{line}" if line else ""),
+                    int(time.time()),
+                ),
+            )
+            _append_event(
+                conn,
+                source_task_id,
+                "review_changes_requested",
+                {"review_task_id": review_task_id, "round": round_no, "summary": line or None},
+            )
+        # Return the original owner to the same task/branch so it can apply the
+        # requested edits and re-block as review-required if another round is needed.
+        unblock_task(conn, source_task_id)
+        return
+    with write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+            (
+                source_task_id,
+                REVIEW_LOOP_CREATED_BY,
+                f"Review round {round_no or '?'} could not complete via {review_task_id}." + (f"\n{line}" if line else ""),
+                int(time.time()),
+            ),
+        )
+        _append_event(
+            conn,
+            source_task_id,
+            "review_escalation",
+            {"review_task_id": review_task_id, "round": round_no, "verdict": verdict, "summary": line or None},
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2895,16 +4235,18 @@ def create_task(
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
-    max_retries: Optional[int] = None,
-    model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
+    model_override: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    max_retries: Optional[int] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
+    auto_review_gate: bool = True,
     project_id: Optional[str] = None,
+    supersedes: Optional[Iterable[str]] = None,
     project_source_task_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
@@ -2940,6 +4282,11 @@ def create_task(
     ``--reasoning <level>``. It is independent of ``model_override``: a task
     can run the profile's own model at a different depth.
 
+    ``supersedes`` is an explicit continuation-card contract. Every listed
+    original must also be a parent of the new task; after the child is created,
+    the original is closed as ``done`` with a superseded audit event. This keeps
+    replaced cards out of the blocked queue without guessing from ordinary
+    dependency edges.
     ``project_source_task_id`` is an internal cross-profile fallback for a
     worker-created child. When the active profile cannot resolve ``project_id``
     in its own projects.db, a matching canonical project-linked task in this
@@ -2967,7 +4314,6 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
-
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
     # (deterministic worktree + branch) without each surface repeating it.
@@ -3069,7 +4415,25 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
-    parents = tuple(p for p in parents if p)
+    parents = tuple(str(p).strip() for p in parents if str(p).strip())
+    supersedes_ids: tuple[str, ...] = tuple(
+        str(s).strip() for s in (supersedes or ()) if str(s).strip()
+    )
+    if supersedes_ids:
+        deduped_supersedes: list[str] = []
+        seen_supersedes: set[str] = set()
+        for sid in supersedes_ids:
+            if sid in seen_supersedes:
+                continue
+            seen_supersedes.add(sid)
+            deduped_supersedes.append(sid)
+        supersedes_ids = tuple(deduped_supersedes)
+        not_parent = [sid for sid in supersedes_ids if sid not in set(parents)]
+        if not_parent:
+            raise ValueError(
+                "superseded task(s) must also be listed as parents: "
+                + ", ".join(not_parent)
+            )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3142,6 +4506,14 @@ def create_task(
     # task would point cleanup at the user's source tree (#28818). The
     # containment guard in ``_cleanup_workspace`` is the safety rail, but
     # we also stop the bad state from being created in the first place.
+    #
+    # For worktree tasks, the board default is the *project repo*, not the
+    # worktree path itself. Put the per-card checkout under
+    # ``<repo>/.worktrees/<task_id>/`` so it stays project-local and
+    # discoverable without turning the main checkout into the task
+    # workspace. This preserves the one-card/one-worktree model and avoids
+    # the old profile-scratch/default-CWD ambiguity.
+    board_default: Optional[str] = None
     if (
         workspace_path is None
         and project_repo is None
@@ -3149,13 +4521,18 @@ def create_task(
     ):
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
-        board_default = board_meta.get("default_workdir")
-        if board_default:
-            workspace_path = str(board_default)
+        _raw_board_default = board_meta.get("default_workdir")
+        if _raw_board_default:
+            board_default = str(_raw_board_default)
+            if workspace_kind == "dir":
+                workspace_path = board_default
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        effective_workspace_path = workspace_path
+        if effective_workspace_path is None and workspace_kind == "worktree" and board_default:
+            effective_workspace_path = str(Path(board_default).expanduser() / ".worktrees" / task_id)
         try:
             with write_txn(conn):
                 # Determine task status from parent status, unless the caller
@@ -3195,10 +4572,11 @@ def create_task(
                 # these kill the random ``wt/<task-id>`` worker fallback and the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
                 if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(
+                    if project_repo and not effective_workspace_path:
+                        effective_workspace_path = os.path.join(
                             project_repo, ".worktrees", task_id
                         )
+                        workspace_path = effective_workspace_path
                     if not branch_name:
                         # _pdb was imported above when project_obj was resolved.
                         try:
@@ -3207,6 +4585,22 @@ def create_task(
                             )
                         except Exception:
                             branch_name = None
+
+                effective_goal_mode = bool(goal_mode)
+                effective_goal_max_turns = (
+                    int(goal_max_turns) if goal_max_turns is not None else None
+                )
+                if not effective_goal_mode:
+                    auto_goal, auto_goal_max_turns = _should_enable_review_goal_loop(
+                        title=title,
+                        created_by=created_by,
+                        assignee=assignee,
+                        workspace_path=effective_workspace_path,
+                        skills=skills_list,
+                    )
+                    if auto_goal:
+                        effective_goal_mode = True
+                        effective_goal_max_turns = auto_goal_max_turns
 
                 conn.execute(
                     """
@@ -3230,7 +4624,7 @@ def create_task(
                         created_by,
                         now,
                         workspace_kind,
-                        workspace_path,
+                        effective_workspace_path,
                         branch_name,
                         project_id,
                         tenant,
@@ -3241,8 +4635,8 @@ def create_task(
                         model_override,
                         provider_override,
                         reasoning_effort,
-                        1 if goal_mode else 0,
-                        int(goal_max_turns) if goal_max_turns is not None else None,
+                        1 if effective_goal_mode else 0,
+                        effective_goal_max_turns,
                         session_id,
                     ),
                 )
@@ -3264,13 +4658,78 @@ def create_task(
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
                         "project_id": project_id,
+                        "workspace_path": effective_workspace_path,
                         "skills": list(skills_list) if skills_list else None,
-                        "goal_mode": bool(goal_mode) or None,
-                        "model_override": model_override,
                         "provider_override": provider_override,
+                        "model_override": model_override,
+                        "reasoning_effort": reasoning_effort,
+                        "goal_mode": bool(effective_goal_mode) or None,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if initial_status == "blocked":
+                    # ``initial_status='blocked'`` is an intentional human/operator
+                    # gate. Mark it with the same sticky signal as ``block_task`` so
+                    # parent completion / dispatcher recompute cannot silently move
+                    # it into the runnable queue before an explicit unblock.
+                    _append_event(
+                        conn,
+                        task_id,
+                        "blocked",
+                        {
+                            "reason": "initial_status=blocked",
+                            "kind": None,
+                            "source": "initial_status",
+                        },
+                    )
+            if auto_review_gate:
+                should_review, gate = _should_create_review_gate(
+                    title=title,
+                    created_by=created_by,
+                    workspace_kind=workspace_kind,
+                    workspace_path=effective_workspace_path,
+                    skills=skills_list,
+                    provider_override=provider_override,
+                    model_override=model_override,
+                    triage=triage,
+                )
+                if should_review:
+                    create_task(
+                        conn,
+                        title=f"review: {title.strip()}",
+                        body=_review_gate_body(
+                            task_id,
+                            title,
+                            gate.get("fallback_model"),
+                            gate.get("fallback_provider"),
+                        ),
+                        assignee=str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
+                        created_by=REVIEW_GATE_CREATED_BY,
+                        workspace_kind=workspace_kind,
+                        workspace_path=effective_workspace_path,
+                        branch_name=branch_name,
+                        tenant=tenant,
+                        priority=priority,
+                        parents=[task_id],
+                        idempotency_key=f"{REVIEW_GATE_CREATED_BY}:{task_id}",
+                        max_runtime_seconds=int(gate.get("max_runtime_seconds") or 30 * 60),
+                        skills=gate.get("skills") or list(DEFAULT_REVIEW_GATE_SKILLS),
+                        provider_override=(
+                            str(gate["provider"]).strip() if gate.get("provider") else None
+                        ),
+                        model_override=str(gate["model"]).strip() if gate.get("model") else None,
+                        max_retries=1,
+                        board=board,
+                        auto_review_gate=False,
+                    )
+            if supersedes_ids:
+                _mark_tasks_superseded_by_continuation(
+                    conn,
+                    supersedes_ids,
+                    continuation_task_id=task_id,
+                    actor=created_by,
+                )
+                recompute_ready(conn)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3278,6 +4737,90 @@ def create_task(
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def _mark_tasks_superseded_by_continuation(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    continuation_task_id: str,
+    actor: Optional[str] = None,
+) -> list[str]:
+    """Close explicit continuation predecessors as superseded.
+
+    Creating a child dependency is not enough to close a parent: many child
+    cards are fan-out or follow-on work, and their parents still need a normal
+    result. This helper is only called for the explicit ``supersedes`` contract
+    on task creation, so the audit log carries an unambiguous replacement edge.
+    """
+    now = int(time.time())
+    closed: list[str] = []
+    with write_txn(conn):
+        for original_id in task_ids:
+            row = conn.execute(
+                "SELECT id, status FROM tasks WHERE id = ?",
+                (original_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown superseded task: {original_id}")
+            if original_id == continuation_task_id:
+                raise ValueError("a task cannot supersede itself")
+            status = row["status"]
+            if status in {"done", "archived"}:
+                _append_event(
+                    conn,
+                    original_id,
+                    "superseded_noop",
+                    {
+                        "continuation_task_id": continuation_task_id,
+                        "actor": actor,
+                        "status": status,
+                    },
+                )
+                continue
+
+            result = f"Superseded by continuation card {continuation_task_id}"
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'done',
+                       result        = ?,
+                       completed_at  = ?,
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL,
+                       block_kind    = NULL,
+                       block_recurrences = 0
+                 WHERE id = ?
+                   AND status NOT IN ('done', 'archived')
+                """,
+                (result, now, original_id),
+            )
+            run_id = _end_run(
+                conn,
+                original_id,
+                outcome="superseded",
+                status="done",
+                summary=result,
+                metadata={"superseded_by": continuation_task_id, "actor": actor},
+            )
+            if run_id is None:
+                run_id = _synthesize_ended_run(
+                    conn,
+                    original_id,
+                    outcome="superseded",
+                    summary=result,
+                    metadata={"superseded_by": continuation_task_id, "actor": actor},
+                )
+            _append_event(
+                conn,
+                original_id,
+                "superseded",
+                {"continuation_task_id": continuation_task_id, "actor": actor},
+                run_id=run_id,
+            )
+            closed.append(original_id)
+    return closed
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:
@@ -5029,6 +6572,15 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    # ── Dispatch-group drain recomputation ──
+    # When a tracked task completes, recompute its dispatch groups'
+    # active/drained state so drain notices fire promptly regardless
+    # of whether completion came through the tool wrapper, CLI,
+    # dashboard, or API.
+    try:
+        recompute_dispatch_groups_for_task(conn, task_id)
+    except Exception:
+        pass
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -5040,6 +6592,26 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    try:
+        _apply_review_loop_outcome(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+        )
+    except Exception:
+        _log.debug("failed to apply closed-loop review outcome for %s", task_id, exc_info=True)
+    try:
+        _apply_explicit_review_outcome(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+        )
+    except Exception:
+        _log.debug("failed to apply explicit review outcome for %s", task_id, exc_info=True)
     return True
 
 
@@ -5654,6 +7226,16 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    review_required = _is_review_required_reason(reason)
+    # ``review-required:`` is a control-plane handoff, not an ordinary parent
+    # dependency. Workers commonly describe review as a dependency even though
+    # the review task does not exist yet. If that kind reached the dependency
+    # branch below, the source would move to ``todo`` without a parent, be
+    # promoted immediately, and race the reviewer as a moving target. Normalize
+    # it to a sticky human-input block so the closed-loop review creator runs.
+    if review_required and kind == "dependency":
+        kind = "needs_input"
+    routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -5673,8 +7255,26 @@ def block_task(
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
-        # a dependency-wait as something to "unblock".
+        # a dependency-wait as something to "unblock". Refuse a dependency with
+        # no unfinished parent: ``all([])`` would otherwise promote it on the
+        # next dispatcher tick and create an immediate respawn loop.
         if kind == "dependency":
+            unfinished_parent = conn.execute(
+                """
+                SELECT 1
+                  FROM task_links l
+                  JOIN tasks p ON p.id = l.parent_id
+                 WHERE l.child_id = ?
+                   AND p.status NOT IN ('done', 'archived')
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if unfinished_parent is None:
+                raise ValueError(
+                    "dependency block requires at least one unfinished parent; "
+                    "link the parent first or use kind='needs_input'"
+                )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5724,6 +7324,21 @@ def block_task(
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
 
+        if review_required and recurrences >= BLOCK_RECURRENCE_LIMIT:
+            try:
+                gate = _review_gate_config()
+                max_rounds = max(
+                    1,
+                    int(gate.get("closed_loop_max_rounds") or DEFAULT_REVIEW_LOOP_MAX_ROUNDS),
+                )
+                if _review_loop_rounds_created(conn, task_id) < max_rounds:
+                    # A review-required block is an intentional agent↔reviewer
+                    # loop, not the generic unblock/re-block failure mode. Let
+                    # it reach the configured review-loop cap before triaging.
+                    recurrences = BLOCK_RECURRENCE_LIMIT - 1
+            except Exception:
+                pass
+
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
@@ -5763,6 +7378,19 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            if review_required:
+                _append_event(
+                    conn,
+                    task_id,
+                    "review_escalation",
+                    {
+                        "reason": "max_review_rounds_reached",
+                        "block_reason": reason,
+                        "recurrences": recurrences,
+                    },
+                    run_id=run_id,
+                )
+            routed_to = "triage"
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -5816,6 +7444,19 @@ def block_task(
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
+    # Dispatch-group tracking and plugin lifecycle hooks are best-effort and
+    # run after the transition commits, so observer failures cannot break the
+    # board state change.
+    if routed_to == "blocked":
+        try:
+            check_task_dispatch_blocked(conn, task_id)
+        except Exception:
+            pass
+        if review_required:
+            try:
+                _maybe_create_review_loop_task(conn, task_id, reason)
+            except Exception:
+                _log.debug("failed to create closed-loop review task for %s", task_id, exc_info=True)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
@@ -6163,6 +7804,11 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        root_subs = conn.execute(
+            "SELECT platform, chat_id, thread_id, user_id, notifier_profile "
+            "FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchall()
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -6311,6 +7957,15 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
+    # ── Dispatch-group drain recomputation ──
+    # When a tracked task is archived, recompute its dispatch groups'
+    # active/drained state so drain notices fire promptly regardless
+    # of whether archiving came through the tool wrapper, CLI,
+    # dashboard, or API.
+    try:
+        recompute_dispatch_groups_for_task(conn, task_id)
+    except Exception:
+        pass
     return True
 
 
@@ -6783,7 +8438,7 @@ _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
+    r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)",
     re.IGNORECASE,
 )
 
@@ -7785,6 +9440,91 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+def _is_pinned_review_gate_card_with_fallback(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True if *task_id* is a pinned review-gate card with a configured
+    fallback model for circuit-breaker recovery.
+
+    The normal Hopewell review gate runs on the reviewer profile's default model
+    and therefore has no automatic model-specific fallback.
+    """
+    gate = _review_gate_config()
+    gate_model = gate.get("model")
+    gate_provider = gate.get("provider")
+    fallback_model = gate.get("fallback_model")
+    if not gate_model or not fallback_model:
+        return False
+    row = conn.execute(
+        "SELECT created_by, provider_override, model_override, title FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return False
+    if row["created_by"] != REVIEW_GATE_CREATED_BY:
+        return False
+    if (row["model_override"] or "").strip() != str(gate_model).strip():
+        return False
+    if gate_provider and (row["provider_override"] or "").strip() != str(gate_provider).strip():
+        return False
+    return (row["title"] or "").strip().lower().startswith("review:")
+
+
+def _create_review_gate_fallback(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Create a configured fallback review card for *task_id*.
+
+    Only review gates with an explicit pinned model and explicit fallback model
+    use this path. Default-model review gates should block on failure instead of
+    silently switching models.
+    """
+    gate = _review_gate_config()
+    fallback_model = gate.get("fallback_model")
+    fallback_provider = gate.get("fallback_provider") or gate.get("provider")
+    if not fallback_model:
+        return False
+    row = conn.execute(
+        "SELECT title, assignee, workspace_kind, workspace_path, "
+        "branch_name, tenant FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return False
+
+    title = row["title"] or ""
+    parent_ids = [
+        p["parent_id"]
+        for p in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (task_id,)
+        )
+    ]
+
+    gb = _review_gate_body(
+        parent_ids[0] if parent_ids else task_id,
+        title,
+        str(fallback_model),
+        str(fallback_provider).strip() if fallback_provider else None,
+    )
+
+    create_task(
+        conn,
+        title=f"{title.strip()} (fallback retry)",
+        body=gb,
+        assignee=(row["assignee"] or DEFAULT_REVIEW_GATE_ASSIGNEE),
+        created_by=REVIEW_GATE_CREATED_BY,
+        workspace_kind=row["workspace_kind"] or "scratch",
+        workspace_path=row["workspace_path"],
+        branch_name=row["branch_name"],
+        tenant=row["tenant"],
+        parents=parent_ids,
+        idempotency_key=f"{REVIEW_GATE_CREATED_BY}:fallback:{task_id}",
+        max_runtime_seconds=30 * 60,
+        skills=gate.get("skills") or list(DEFAULT_REVIEW_GATE_SKILLS),
+        provider_override=str(fallback_provider).strip() if fallback_provider else None,
+        model_override=str(fallback_model).strip(),
+        max_retries=1,
+        auto_review_gate=False,
+    )
+    return True
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7843,6 +9583,7 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
+    _should_create_review_fallback = False
     with write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries "
@@ -7865,6 +9606,11 @@ def _record_task_failure(
             limit_source = "dispatcher"
 
         if force_trip or failures >= effective_limit:
+            # Before tripping the breaker, record whether this is a pinned
+            # review-gate card with a configured fallback model (the fallback is
+            # created AFTER this transaction commits, avoiding nested-write-txn
+            # deadlock).
+            _should_create_review_fallback = _is_pinned_review_gate_card_with_fallback(conn, task_id)
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
@@ -7945,6 +9691,19 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+    # After the failure transaction commits, create a configured fallback review
+    # card if this was a pinned review-gate card that just hit the circuit
+    # breaker. Runs in its own write_txn to avoid nested-transaction deadlock.
+    if blocked and _should_create_review_fallback:
+        try:
+            _create_review_gate_fallback(conn, task_id)
+        except Exception:
+            # Fallback creation is best-effort — do not let a fallback card
+            # creation failure shadow the real task failure.
+            _log.warning(
+                "review-gate: fallback creation failed for task %s", task_id,
+                exc_info=True,
+            )
     return blocked
 
 
@@ -8009,7 +9768,98 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
-def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+def _github_pr_cache_key(match: re.Match[str]) -> str:
+    """Return a stable cache key for a GitHub PR URL regex match."""
+    owner, repo, number = match.group(1), match.group(2), match.group(3)
+    repo = repo[:-4] if repo.lower().endswith(".git") else repo
+    return f"{owner.lower()}/{repo.lower()}#{int(number)}"
+
+
+def _github_pr_api_path(match: re.Match[str]) -> tuple[str, str, int]:
+    owner, repo, number = match.group(1), match.group(2), match.group(3)
+    repo = repo[:-4] if repo.lower().endswith(".git") else repo
+    return owner, repo, int(number)
+
+
+def _github_pr_is_open(
+    match: re.Match[str],
+    *,
+    cache: Optional[dict[str, Optional[bool]]] = None,
+) -> Optional[bool]:
+    """Return True for an open PR, False for closed/merged, None on failure.
+
+    The respawn guard is conservative: callers treat ``None`` as active so
+    GitHub outages or missing auth don't create duplicate PRs. The cache is
+    per-dispatch tick and keyed by owner/repo/number so repeated task comments
+    do not fan out into repeated API calls.
+    """
+    key = _github_pr_cache_key(match)
+    if cache is not None and key in cache:
+        return cache[key]
+    owner, repo, number = _github_pr_api_path(match)
+    api_path = f"repos/{owner}/{repo}/pulls/{number}"
+    result: Optional[bool] = None
+
+    # Prefer the GitHub CLI when available because it already carries the
+    # operator's auth state and keeps token handling out of Hermes logs.
+    try:
+        proc = subprocess.run(
+            ["gh", "api", api_path, "--jq", ".state"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode == 0:
+            state = (proc.stdout or "").strip().lower()
+            if state in {"open", "closed"}:
+                result = state == "open"
+        else:
+            _log.info(
+                "kanban respawn guard: gh could not check PR %s (%s)",
+                key,
+                (proc.stderr or "").strip()[:200],
+            )
+    except (FileNotFoundError, subprocess.SubprocessError, TimeoutError, OSError) as exc:
+        _log.info("kanban respawn guard: gh PR check failed for %s: %s", key, exc)
+
+    if result is None:
+        token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+        if token:
+            try:
+                import urllib.request
+
+                req = urllib.request.Request(
+                    f"https://api.github.com/{api_path}",
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "Authorization": f"Bearer {token}",
+                        "User-Agent": "hermes-kanban-respawn-guard",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    payload = json.loads(resp.read().decode("utf-8") or "{}")
+                state = str(payload.get("state") or "").lower()
+                if state in {"open", "closed"}:
+                    result = state == "open"
+            except Exception as exc:
+                _log.info("kanban respawn guard: GitHub API check failed for %s: %s", key, exc)
+        else:
+            _log.info("kanban respawn guard: no GitHub auth available to check PR %s", key)
+
+    if cache is not None:
+        cache[key] = result
+    return result
+
+
+def check_respawn_guard(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    pr_state_cache: Optional[dict[str, Optional[bool]]] = None,
+) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
     Called per ready task in ``dispatch_once`` before any claim attempt.
@@ -8048,9 +9898,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         arrives AFTER that completion — that's a deliberate re-run request.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        A GitHub PR URL appears in a task comment, the last worker run is
+        within ``_RESPAWN_GUARD_PR_WINDOW`` seconds, and GitHub reports the
+        PR is still open (or the PR state cannot be checked). Merged/closed
+        PRs do not guard. The window is measured from the worker run, not
+        comment timestamps, so reviewer comments quoting a URL do not extend
+        the guard forever.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -8132,14 +9985,34 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # 4. GitHub PR URL from prior worker output. Measure the guard window
+    # from the latest worker run, not from comment timestamps: reviewer/CLI
+    # comments quoting an old PR URL must not refresh the 24h hold.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    latest_worker_run = conn.execute(
+        "SELECT MAX(COALESCE(ended_at, started_at, 0)) FROM task_runs "
+        "WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    latest_worker_run_at = int(latest_worker_run[0] or 0) if latest_worker_run else 0
+    if latest_worker_run_at >= pr_cutoff:
+        for c in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchall():
+            body = c["body"] or ""
+            for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body):
+                is_open = _github_pr_is_open(match, cache=pr_state_cache)
+                if is_open is False:
+                    continue
+                if is_open is None:
+                    _log.info(
+                        "kanban respawn guard: deferring %s because PR state "
+                        "for %s could not be verified",
+                        task_id,
+                        _github_pr_cache_key(match),
+                    )
+                return "active_pr"
 
     return None
 
@@ -8214,6 +10087,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    ignore_respawn_guards: Optional[Iterable[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8248,6 +10122,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            ignore_respawn_guards=ignore_respawn_guards,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8264,6 +10139,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            ignore_respawn_guards=ignore_respawn_guards,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -8284,6 +10160,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    ignore_respawn_guards: Optional[Iterable[str]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8397,6 +10274,9 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+    ignored_guard_tasks = set(ignore_respawn_guards or ())
+    pr_state_cache: dict[str, Optional[bool]] = {}
+
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -8504,7 +10384,13 @@ def _dispatch_once_locked(
         # still trips the auto-block circuit breaker after failure_limit
         # consecutive failures, so a persistent auth error eventually
         # blocks via the normal path rather than on first occurrence.
-        guard_reason = check_respawn_guard(conn, row["id"])
+        guard_reason = None
+        if row["id"] not in ignored_guard_tasks:
+            guard_reason = check_respawn_guard(
+                conn,
+                row["id"],
+                pr_state_cache=pr_state_cache,
+            )
         if guard_reason is not None:
             result.respawn_guarded.append((row["id"], guard_reason))
             # Emit an event so operators can see why the task was
@@ -8922,7 +10808,18 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         token = set_hermes_home_override(hermes_home)
         try:
             cfg = load_config()
-            toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            raw_toolsets = sorted(_get_platform_tools(cfg, "cli"))
+            toolsets = [
+                name for name in raw_toolsets
+                if str(name).casefold() in KNOWN_TOOLSET_NAMES
+            ]
+            dropped = sorted(set(raw_toolsets) - set(toolsets))
+            if dropped:
+                _log.debug(
+                    "kanban worker: dropping unknown CLI toolsets for HERMES_HOME=%r: %s",
+                    hermes_home,
+                    ", ".join(dropped),
+                )
         finally:
             reset_hermes_home_override(token)
         return toolsets or None
@@ -9112,6 +11009,15 @@ def _default_spawn(
         for sk in task.skills:
             if sk:
                 cmd.extend(["--skills", sk])
+    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    cmd.append("chat")
+    # Per-task runtime overrides must be passed to the `chat` subcommand.
+    # The root parser also accepts -m/--provider/-t for a few entry points,
+    # but `hermes -p wren --provider deepseek -m deepseek-v4-pro chat ...`
+    # is normalized back to the profile default before chat initialization.
+    # Keeping worker overrides after `chat` exercises the same parser path as
+    # humans use (`hermes chat --provider ... -m ...`) and makes the override
+    # observable in agent logs.
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
@@ -9125,11 +11031,9 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
-        "chat",
         "-q", prompt,
     ])
     if task.goal_mode:
@@ -9959,9 +11863,16 @@ def advance_notify_cursor(
     thread_id: Optional[str] = None,
     new_cursor: int,
 ) -> None:
+    """Advance a notification cursor without regressing newer progress.
+
+    Claims already advance the cursor transactionally. This helper remains for
+    compatibility, but a late success from an older notifier must not overwrite
+    a newer claim.
+    """
     with write_txn(conn):
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "UPDATE kanban_notify_subs "
+            "SET last_event_id = MAX(last_event_id, ?) "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
             (int(new_cursor), task_id, platform, chat_id, thread_id or ""),
         )
@@ -10273,3 +12184,450 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Dispatch groups — agent-to-agent feedback loop
+# ---------------------------------------------------------------------------
+
+# Active statuses for dispatch group drain computation.
+# Tasks in these statuses are still "in flight" and keep the group active.
+_DISPATCH_ACTIVE_STATUSES = frozenset({"triage", "todo", "ready", "running", "scheduled", "review"})
+
+
+def _dispatch_group_id(profile: str, session_id: str, board: str) -> str:
+    """Derive a stable dispatch-group id from origin identity.
+
+    Session-scoped so every ``kanban_create`` call in the same agent
+    conversation feeds into the same group.
+    """
+    raw = f"{profile}:{session_id or ''}:{board or 'default'}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def get_or_create_dispatch_group(
+    conn: sqlite3.Connection,
+    *,
+    profile: str,
+    session_id: Optional[str] = None,
+    board: Optional[str] = None,
+) -> str:
+    """Return the group id for this (profile, session_id) pair, creating it if needed.
+
+    Uses INSERT OR IGNORE so concurrent callers racing on the same
+    (profile, session_id, board) tuple don't hit a unique-key violation.
+    """
+    gid = _dispatch_group_id(profile, session_id or "", board or "")
+    now = int(time.time())
+    conn.execute(
+        "INSERT OR IGNORE INTO dispatch_groups"
+        " (id, origin_profile, origin_session, board, created_at, state)"
+        " VALUES (?, ?, ?, ?, ?, 'active')",
+        (gid, profile, session_id, board, now),
+    )
+    return gid
+
+
+def add_task_to_dispatch_group(
+    conn: sqlite3.Connection, group_id: str, task_id: str
+) -> None:
+    """Enroll a task in a dispatch group."""
+    conn.execute(
+        "INSERT OR IGNORE INTO dispatch_group_tasks (group_id, task_id) VALUES (?, ?)",
+        (group_id, task_id),
+    )
+
+
+def recompute_dispatch_group_state(
+    conn: sqlite3.Connection, group_id: str
+) -> str:
+    """Recompute group state from tracked tasks and update the cached column.
+
+    Returns 'active' or 'drained'.
+    """
+    group_row = conn.execute(
+        "SELECT id, origin_profile, origin_session, state FROM dispatch_groups WHERE id = ?",
+        (group_id,),
+    ).fetchone()
+    if group_row is None:
+        return "drained"  # vanished group; nothing to track
+
+    # Count active tasks in the group.
+    active = conn.execute(
+        """
+        SELECT COUNT(*) AS cnt
+          FROM dispatch_group_tasks dgt
+          JOIN tasks t ON t.id = dgt.task_id
+         WHERE dgt.group_id = ?
+           AND t.status IN ({})
+        """.format(",".join("?" * len(_DISPATCH_ACTIVE_STATUSES))),
+        (group_id, *sorted(_DISPATCH_ACTIVE_STATUSES)),
+    ).fetchone()["cnt"]
+
+    new_state = "active" if active > 0 else "drained"
+    now = int(time.time())
+    conn.execute(
+        "UPDATE dispatch_groups SET state = ?, state_at = ? WHERE id = ?",
+        (new_state, now, group_id),
+    )
+    return new_state
+
+
+def _dispatch_notice_exists(
+    conn: sqlite3.Connection, group_id: str, kind: str,
+    *,
+    task_id: Optional[str] = None,
+) -> bool:
+    """Check if an identical unacked notice already exists (dedup).
+
+    For blocked notices, dedupe by (group_id, kind, task_id) so each
+    blocked card gets its own notice.  For drained notices, dedupe by
+    (group_id, kind) since there should not be two separate drain events
+    without an intervening active state.
+    """
+    if kind == "blocked" and task_id:
+        row = conn.execute(
+            "SELECT 1 FROM dispatch_notices "
+            "WHERE group_id = ? AND kind = ? AND acked = 0 "
+            "AND json_extract(payload, '$.task_id') = ? LIMIT 1",
+            (group_id, kind, task_id),
+        ).fetchone()
+        return row is not None
+    row = conn.execute(
+        "SELECT 1 FROM dispatch_notices "
+        "WHERE group_id = ? AND kind = ? AND acked = 0 LIMIT 1",
+        (group_id, kind),
+    ).fetchone()
+    return row is not None
+
+
+def emit_dispatch_notice(
+    conn: sqlite3.Connection,
+    *,
+    group_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+) -> Optional[int]:
+    """Emit a dispatch notice if one doesn't already exist for this group+kind.
+
+    Returns the new notice id, or None if deduped.
+    """
+    group_row = conn.execute(
+        "SELECT origin_profile, origin_session FROM dispatch_groups WHERE id = ?",
+        (group_id,),
+    ).fetchone()
+    if group_row is None:
+        return None
+
+    # Dedup: for blocked notices, dedupe by task_id so each blocked card
+    # gets its own notice.  For drained notices, dedupe by group+kind only.
+    task_id_for_dedup = (
+        payload.get("task_id") if (kind == "blocked" and payload) else None
+    )
+    if _dispatch_notice_exists(conn, group_id, kind, task_id=task_id_for_dedup):
+        return None
+
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO dispatch_notices (profile, session_id, group_id, kind, payload, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            group_row["origin_profile"],
+            group_row["origin_session"],
+            group_id,
+            kind,
+            json.dumps(payload) if payload else None,
+            now,
+        ),
+    )
+    return cur.lastrowid
+
+
+def get_pending_dispatch_notices(
+    conn: sqlite3.Connection,
+    profile: str,
+    session_id: Optional[str] = None,
+    *,
+    limit: Optional[int] = None,
+) -> list[dict]:
+    """Return unacked notices for a profile, newest first.
+
+    Session_id can be None to match notices with no session id (legacy),
+    or a string to match a specific session.  ``limit`` defaults to None
+    (all notices returned); set to an integer to cap results.
+    """
+    params: list = [profile]
+    sql = (
+        "SELECT id, kind, group_id, payload, created_at "
+        "FROM dispatch_notices "
+        "WHERE profile = ? "
+    )
+    if session_id:
+        sql += "AND session_id = ? "
+        params.append(session_id)
+    else:
+        sql += "AND session_id IS NULL "
+    sql += "AND acked = 0 ORDER BY created_at DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
+    results: list[dict] = []
+    for r in rows:
+        payload = None
+        if r["payload"]:
+            try:
+                payload = json.loads(r["payload"])
+            except Exception:
+                payload = {"raw": r["payload"]}
+        results.append({
+            "notice_id": r["id"],
+            "kind": r["kind"],
+            "group_id": r["group_id"],
+            "payload": payload,
+            "created_at": r["created_at"],
+        })
+    return results
+
+
+def ack_dispatch_notice(
+    conn: sqlite3.Connection, notice_id: int
+) -> bool:
+    """Mark a dispatch notice as acked so it won't be re-delivered."""
+    cur = conn.execute(
+        "UPDATE dispatch_notices SET acked = 1 WHERE id = ? AND acked = 0",
+        (notice_id,),
+    )
+    return cur.rowcount > 0
+
+
+def ack_all_dispatch_notices(
+    conn: sqlite3.Connection,
+    profile: str,
+    session_id: Optional[str] = None,
+) -> int:
+    """Ack all pending notices for a profile+session.  Returns count acked."""
+    if session_id:
+        cur = conn.execute(
+            "UPDATE dispatch_notices SET acked = 1 "
+            "WHERE profile = ? AND session_id = ? AND acked = 0",
+            (profile, session_id),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE dispatch_notices SET acked = 1 "
+            "WHERE profile = ? AND session_id IS NULL AND acked = 0",
+            (profile,),
+        )
+    return cur.rowcount
+
+
+def ack_dispatch_notices(
+    conn: sqlite3.Connection, notice_ids: list[int],
+) -> int:
+    """Ack specific dispatch notices by id.  Returns count acked.
+
+    Unlike ``ack_all_dispatch_notices`` which acks by profile+session,
+    this acks only the exact notice rows requested.  Safe to call with
+    an empty list (no-op).
+
+    Used by the conversation loop's deferred-ack path: collect notice
+    ids before the model turn, ack them only after the turn succeeds.
+    """
+    if not notice_ids:
+        return 0
+    placeholders = ",".join("?" * len(notice_ids))
+    cur = conn.execute(
+        f"UPDATE dispatch_notices SET acked = 1 "
+        f"WHERE id IN ({placeholders}) AND acked = 0",
+        notice_ids,
+    )
+    return cur.rowcount
+
+
+def recompute_all_dispatch_groups(
+    conn: sqlite3.Connection,
+) -> list[dict]:
+    """Walk every dispatch group, recompute state, and emit notices.
+
+    Called periodically by the dispatch-group watcher.  Returns a list
+    of ``{group_id, kind, notice_id}`` for newly-emitted notices.
+    """
+    groups = conn.execute(
+        "SELECT id, state FROM dispatch_groups"
+    ).fetchall()
+    emitted: list[dict] = []
+    for g in groups:
+        old_state = g["state"]
+        new_state = recompute_dispatch_group_state(conn, g["id"])
+        if new_state == "drained" and old_state == "active":
+            # Gather summary: how many done, blocked, etc.
+            summary = _build_drain_summary(conn, g["id"])
+            nid = emit_dispatch_notice(
+                conn, group_id=g["id"], kind="drained", payload=summary,
+            )
+            if nid is not None:
+                emitted.append({"group_id": g["id"], "kind": "drained", "notice_id": nid})
+    return emitted
+
+
+def recompute_dispatch_groups_for_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[dict]:
+    """Recompute dispatch-group state for only the groups a task belongs to.
+
+    Called after a task transition (complete / unblock) so drain notices
+    fire promptly without walking every group on the board.
+
+    Returns a list of ``{group_id, kind, notice_id}`` for newly-emitted
+    notices.
+    """
+    group_rows = conn.execute(
+        "SELECT DISTINCT group_id FROM dispatch_group_tasks WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    emitted: list[dict] = []
+    for gr in group_rows:
+        gid = gr["group_id"]
+        group_row = conn.execute(
+            "SELECT state FROM dispatch_groups WHERE id = ?", (gid,)
+        ).fetchone()
+        if group_row is None:
+            continue
+        old_state = group_row["state"]
+        new_state = recompute_dispatch_group_state(conn, gid)
+        if new_state == "drained" and old_state == "active":
+            summary = _build_drain_summary(conn, gid)
+            nid = emit_dispatch_notice(
+                conn, group_id=gid, kind="drained", payload=summary,
+            )
+            if nid is not None:
+                emitted.append({"group_id": gid, "kind": "drained", "notice_id": nid})
+    return emitted
+
+
+def check_task_dispatch_blocked(
+    conn: sqlite3.Connection, task_id: str
+) -> list[dict]:
+    """Called when a task is blocked.  Emits blocked notices for every
+    dispatch group this task belongs to, then recomputes group state.
+
+    Returns list of newly-emitted notices.
+    """
+    group_rows = conn.execute(
+        "SELECT group_id FROM dispatch_group_tasks WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    emitted: list[dict] = []
+    for gr in group_rows:
+        gid = gr["group_id"]
+        group_row = conn.execute(
+            "SELECT state FROM dispatch_groups WHERE id = ?", (gid,)
+        ).fetchone()
+        if group_row is None:
+            continue
+        # Emit blocked notice for this task
+        task_row = conn.execute(
+            "SELECT title FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        payload = {
+            "task_id": task_id,
+            "title": task_row["title"] if task_row else task_id,
+        }
+        nid = emit_dispatch_notice(
+            conn, group_id=gid, kind="blocked", payload=payload,
+        )
+        if nid is not None:
+            emitted.append({"group_id": gid, "kind": "blocked", "notice_id": nid, "task_id": task_id})
+        # Also recompute group state — if this was the last active task, it drains.
+        old_state = group_row["state"]
+        new_state = recompute_dispatch_group_state(conn, gid)
+        if new_state == "drained" and old_state == "active":
+            summary = _build_drain_summary(conn, gid)
+            nid2 = emit_dispatch_notice(
+                conn, group_id=gid, kind="drained", payload=summary,
+            )
+            if nid2 is not None:
+                emitted.append({"group_id": gid, "kind": "drained", "notice_id": nid2})
+    return emitted
+
+
+def _build_drain_summary(
+    conn: sqlite3.Connection, group_id: str
+) -> dict:
+    """Build a compact summary of a drained dispatch group."""
+    rows = conn.execute(
+        """
+        SELECT t.id, t.title, t.status, t.assignee
+          FROM dispatch_group_tasks dgt
+          JOIN tasks t ON t.id = dgt.task_id
+         WHERE dgt.group_id = ?
+        """,
+        (group_id,),
+    ).fetchall()
+    by_status: dict[str, list[dict]] = {}
+    for r in rows:
+        by_status.setdefault(r["status"], []).append({
+            "task_id": r["id"],
+            "title": r["title"],
+            "assignee": r["assignee"],
+        })
+    return {
+        "group_id": group_id,
+        "total": len(rows),
+        "by_status": {s: len(tasks) for s, tasks in by_status.items()},
+        "tasks": by_status,
+    }
+
+
+def format_dispatch_notice_for_prompt(notice: dict) -> str:
+    """Format a single dispatch notice as compact text for agent context injection.
+
+    Returns a string suitable for inclusion in the agent's system prompt
+    or prefill context.
+    """
+    kind = notice["kind"]
+    payload = notice.get("payload") or {}
+
+    if kind == "blocked":
+        task_id = payload.get("task_id", "?")
+        title = payload.get("title", task_id)
+        return f"[Kanban] Task {task_id} (\"{title}\") is blocked — may need review."
+
+    if kind == "drained":
+        total = payload.get("total", 0)
+        by_status = payload.get("by_status", {})
+        done = by_status.get("done", 0)
+        blocked = by_status.get("blocked", 0)
+        archived = by_status.get("archived", 0)
+        parts = []
+        if done:
+            parts.append(f"{done} completed")
+        if blocked:
+            parts.append(f"{blocked} blocked")
+        if archived:
+            parts.append(f"{archived} archived")
+        status_str = ", ".join(parts) if parts else "all resolved"
+        return (
+            f"[Kanban] Your dispatched work has drained: "
+            f"{total} tasks dispatched, {status_str}."
+        )
+
+    return f"[Kanban] Notice: {kind}"
+
+
+def build_dispatch_notices_context(
+    notices: list[dict],
+) -> str:
+    """Build a compact context block from pending dispatch notices.
+
+    Used to inject into the agent's next-turn context.  Returns ''
+    when there are no notices.
+    """
+    if not notices:
+        return ""
+    lines = ["[Dispatch notices — pending Kanban updates]"]
+    for n in notices:
+        lines.append(format_dispatch_notice_for_prompt(n))
+    return "\n".join(lines)

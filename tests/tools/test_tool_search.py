@@ -503,8 +503,6 @@ class TestCatalogListing:
         assert result.activated
         search = next(t for t in result.tool_defs if t["function"]["name"] == "tool_search")
         assert "mcp_x_0" not in search["function"]["description"]
-
-
 class TestDeferredCallSchemaProbe:
     """Blind tool_call invocations missing required arguments must return
     the tool's parameter schema instead of dispatching into an opaque

@@ -1157,6 +1157,25 @@ class TestDelegationReasoningEffort(unittest.TestCase):
 class TestDispatchDelegateTask(unittest.TestCase):
     """Tests for the _dispatch_delegate_task helper and full param forwarding."""
 
+    def test_background_forwarded_from_agent_dispatch_helper(self):
+        """Agent-loop delegate_task dispatch must preserve background=True."""
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        with patch("tools.delegate_tool.delegate_task", return_value="ok") as mock_delegate:
+            result = agent._dispatch_delegate_task(
+                {
+                    "goal": "slow research",
+                    "context": "ctx",
+                    "toolsets": ["web"],
+                    "background": True,
+                }
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertIs(mock_delegate.call_args.kwargs["parent_agent"], agent)
+        self.assertIs(mock_delegate.call_args.kwargs["background"], True)
+
     def test_model_acp_args_not_forwarded(self):
         """The live model dispatch path strips hidden ACP transport args."""
         import run_agent

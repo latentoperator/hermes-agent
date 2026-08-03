@@ -42,27 +42,69 @@ class TestSaveDisabledSkills:
 # ---------------------------------------------------------------------------
 
 class TestIsSkillDisabled:
+    @patch("agent.skill_utils.get_disabled_skill_names", return_value={"bad-skill"})
+    def test_globally_disabled(self, mock_disabled):
+        from tools.skills_tool import _is_skill_disabled
+        assert _is_skill_disabled("bad-skill") is True
+        mock_disabled.assert_called_once_with(None)
 
+    @patch("agent.skill_utils.get_disabled_skill_names", return_value={"other"})
+    def test_globally_enabled(self, mock_disabled):
+        from tools.skills_tool import _is_skill_disabled
+        assert _is_skill_disabled("good-skill") is False
 
-    @patch("hermes_cli.config.load_config")
-    def test_platform_disabled(self, mock_load):
-        mock_load.return_value = {"skills": {
-            "disabled": [],
-            "platform_disabled": {"telegram": ["tg-skill"]}
-        }}
+    @patch("agent.skill_utils.get_disabled_skill_names", return_value={"tg-skill"})
+    def test_platform_disabled(self, mock_disabled):
         from tools.skills_tool import _is_skill_disabled
         assert _is_skill_disabled("tg-skill", platform="telegram") is True
+        mock_disabled.assert_called_once_with("telegram")
 
+    @patch(
+        "agent.skill_utils.get_disabled_skill_names",
+        return_value={"skill-a", "tg-skill"},
+    )
+    def test_globally_disabled_stays_disabled_on_platform(self, mock_disabled):
+        from tools.skills_tool import _is_skill_disabled
+        # Union: a globally-disabled skill stays disabled on a platform that
+        # has its own platform_disabled list (matches issue #46201).
+        assert _is_skill_disabled("skill-a", platform="telegram") is True
+        assert _is_skill_disabled("tg-skill", platform="telegram") is True
 
+    @patch("agent.skill_utils.get_disabled_skill_names", return_value={"skill-a"})
+    def test_empty_platform_list_keeps_global_disabled(self, mock_disabled):
+        from tools.skills_tool import _is_skill_disabled
+        # An explicit empty platform list does NOT re-enable a globally-disabled
+        # skill — global disables hold on every platform.
+        assert _is_skill_disabled("skill-a", platform="telegram") is True
 
-    @patch("hermes_cli.config.load_config")
+    @patch("agent.skill_utils.get_disabled_skill_names", return_value={"skill-a"})
+    def test_platform_falls_back_to_global(self, mock_disabled):
+        from tools.skills_tool import _is_skill_disabled
+        # no platform_disabled for cli -> global
+        assert _is_skill_disabled("skill-a", platform="cli") is True
+
+    @patch("agent.skill_utils.get_disabled_skill_names", return_value=set())
+    def test_empty_config(self, mock_disabled):
+        from tools.skills_tool import _is_skill_disabled
+        assert _is_skill_disabled("any-skill") is False
+
+    @patch(
+        "agent.skill_utils.get_disabled_skill_names",
+        side_effect=Exception("config error"),
+    )
+    def test_exception_returns_false(self, mock_disabled):
+        from tools.skills_tool import _is_skill_disabled
+        assert _is_skill_disabled("any-skill") is False
+
+    @patch(
+        "agent.skill_utils.get_disabled_skill_names",
+        return_value={"discord-skill"},
+    )
     @patch.dict("os.environ", {"HERMES_PLATFORM": "discord"})
-    def test_env_var_platform(self, mock_load):
-        mock_load.return_value = {"skills": {
-            "platform_disabled": {"discord": ["discord-skill"]}
-        }}
+    def test_env_var_platform(self, mock_disabled):
         from tools.skills_tool import _is_skill_disabled
         assert _is_skill_disabled("discord-skill") is True
+        mock_disabled.assert_called_once_with("discord")
 
 
 # ---------------------------------------------------------------------------

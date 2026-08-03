@@ -379,6 +379,20 @@ def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
     return value or None
 
 
+def _git_banner_base_ref(repo_dir: Path) -> Optional[str]:
+    """Return the remote main ref used as the banner's upstream baseline.
+
+    Source installs can be checked out from a fork where ``origin/main`` is not
+    the canonical NousResearch main branch. Prefer the explicit ``upstream``
+    remote when it exists, and keep ``origin/main`` as the standard fallback for
+    single-remote installs.
+    """
+    for ref in ("upstream/main", "origin/main"):
+        if _git_short_hash(repo_dir, ref):
+            return ref
+    return None
+
+
 def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     """Return upstream/local git hashes for the startup banner.
 
@@ -404,10 +418,11 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
             pass
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    base_ref = _git_banner_base_ref(repo_dir)
+    upstream = _git_short_hash(repo_dir, base_ref) if base_ref else None
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
-        # Live-git lookup failed (e.g. shallow clone without origin/main).
+        # Live-git lookup failed (e.g. shallow clone without a remote main ref).
         # Fall back to the baked build SHA if available.
         try:
             from hermes_cli.build_info import get_build_sha
@@ -421,7 +436,7 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     ahead = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"{base_ref}..HEAD"],
             capture_output=True,
             text=True,
             encoding="utf-8",

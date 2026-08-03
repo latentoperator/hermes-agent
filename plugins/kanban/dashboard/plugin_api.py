@@ -151,6 +151,10 @@ BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
 
+# The Hopewell command board is a portfolio/control surface, not an execution
+# queue. Keep it visually compact so high-level project cards are readable.
+COMMAND_BOARD_COLUMNS: list[str] = ["triage", "ready", "blocked", "done"]
+
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
 
@@ -449,7 +453,8 @@ def get_board(
             "SELECT COALESCE(MAX(id), 0) AS m FROM task_events"
         ).fetchone()["m"]
 
-        columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
+        board_columns = COMMAND_BOARD_COLUMNS if board == "hopewell-command" else BOARD_COLUMNS
+        columns: dict[str, list[dict]] = {c: [] for c in board_columns}
         if include_archived:
             columns["archived"] = []
 
@@ -475,7 +480,8 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
-            col = t.status if t.status in columns else "todo"
+            fallback_column = "todo" if "todo" in columns else board_columns[0]
+            col = t.status if t.status in columns else fallback_column
             columns[col].append(d)
 
         # Stable per-column ordering already applied by list_tasks
@@ -488,14 +494,31 @@ def get_board(
                 "SELECT DISTINCT tenant FROM tasks WHERE tenant IS NOT NULL ORDER BY tenant"
             )
         ]
-        # List of distinct assignees for the lane-by-profile sub-grouping.
+        # List of known assignees for filters and create/reassign pickers.
+        # Include installed profiles even before any task has used them; a
+        # blank board should still let operators assign the first card.
         assignees = [
-            r["assignee"]
-            for r in conn.execute(
-                "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
-                "AND status != 'archived' ORDER BY assignee"
-            )
+            a["name"] for a in kanban_db.known_assignees(conn)
         ]
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+        raw_hidden = (cfg.get("kanban") or {}).get("hidden_assignees") or []
+        if isinstance(raw_hidden, str):
+            try:
+                parsed_hidden = json.loads(raw_hidden)
+                raw_hidden = parsed_hidden if isinstance(parsed_hidden, list) else [raw_hidden]
+            except Exception:
+                raw_hidden = [x.strip() for x in raw_hidden.split(",")]
+        hidden_assignees = set(
+            str(x).strip()
+            for x in raw_hidden
+            if str(x).strip()
+        )
+        if hidden_assignees:
+            assignees = [a for a in assignees if a not in hidden_assignees]
 
         return {
             "columns": [
@@ -602,6 +625,7 @@ class CreateTaskBody(BaseModel):
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
     parents: list[str] = Field(default_factory=list)
+    supersedes: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
     max_runtime_seconds: Optional[int] = None
@@ -634,6 +658,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             tenant=payload.tenant,
             priority=payload.priority,
             parents=payload.parents,
+            supersedes=payload.supersedes,
             triage=payload.triage,
             idempotency_key=payload.idempotency_key,
             max_runtime_seconds=payload.max_runtime_seconds,
@@ -646,6 +671,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             project_id=payload.project_id,
             board=board,
         )
+        _subscribe_task_to_home_channels(conn, task_id)
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
         # Surface a dispatcher-presence warning so the UI can show a
@@ -1996,6 +2022,31 @@ def _home_sub_matches(sub: dict, home: dict) -> bool:
         and str(sub.get("chat_id", "")) == str(home["chat_id"])
         and str(sub.get("thread_id") or "") == str(home["thread_id"] or "")
     )
+
+
+def _subscribe_task_to_home_channels(conn, task_id: str) -> None:
+    """Best-effort dashboard-created task notifications for every home channel.
+
+    Gateway slash-created Kanban cards are subscribed by the originating chat.
+    Dashboard-created cards have no chat origin, so attach configured home
+    channels. This makes dashboard/phone Triage intake produce the same
+    lifecycle pings as `/kanban create` without requiring a manual toggle.
+    """
+    for home in _configured_home_channels():
+        try:
+            kanban_db.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform=home["platform"],
+                chat_id=home["chat_id"],
+                thread_id=home.get("thread_id") or "",
+                notifier_profile=_active_profile_name(),
+            )
+        except Exception:
+            log.debug(
+                "dashboard: failed to auto-subscribe %s to %s home",
+                task_id, home.get("platform"), exc_info=True,
+            )
 
 
 @router.get("/home-channels")

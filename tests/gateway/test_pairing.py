@@ -677,4 +677,38 @@ class TestProfileScopedStorage:
             / "_rate_limits.json"
         )
 
+    def test_pairing_store_for_helper_routes_by_profile(self, tmp_path, monkeypatch):
+        """_pairing_store_for(source) on a gateway-like object picks the
+        per-profile store when source.profile is set, and falls back to
+        the global store when it isn't (defensive — single-profile
+        gateways, or any code path that hasn't stamped source.profile)."""
+        from gateway.session import SessionSource
+        from gateway.config import Platform
 
+        class FakeGateway:
+            def __init__(self):
+                self.pairing_store = object()  # sentinel
+                self.pairing_stores = {
+                    "default": "default-store",
+                    "yangyang": "yangyang-store",
+                }
+
+            # Method under test — copy of the real helper so this test
+            # is self-contained even if the real one moves.
+            def _pairing_store_for(self, source):
+                per_profile = getattr(self, "pairing_stores", None) or {}
+                profile = getattr(source, "profile", None)
+                if profile and profile in per_profile:
+                    return per_profile[profile]
+                return getattr(self, "pairing_store", None)
+
+        g = FakeGateway()
+        # source with profile="yangyang" → per-profile store
+        s_yy = SessionSource(platform=Platform.WEIXIN, chat_id="c", profile="yangyang")
+        assert g._pairing_store_for(s_yy) == "yangyang-store"
+        # source with no profile → fallback to global
+        s_none = SessionSource(platform=Platform.WEIXIN, chat_id="c")
+        assert g._pairing_store_for(s_none) is g.pairing_store
+        # source with an unknown profile → fallback (defensive)
+        s_unknown = SessionSource(platform=Platform.WEIXIN, chat_id="c", profile="ghost")
+        assert g._pairing_store_for(s_unknown) is g.pairing_store

@@ -35,6 +35,7 @@ import json
 import logging
 import os
 import platform
+import random
 import re
 import shutil
 import stat
@@ -55,7 +56,6 @@ from agent.secret_sources._cache import (
     CachedFetch as _CachedFetch,
     DiskCache,
     FetchResult,
-    is_valid_env_name as _is_valid_env_name,
 )
 from agent.secret_sources.base import ErrorKind, SecretSource
 from agent.secret_sources.base import get_source_environment
@@ -80,6 +80,8 @@ _BWS_CHECKSUM_NAME = f"bws-sha256-checksums-{_BWS_VERSION}.txt"
 # How long to wait for bws subprocesses and HTTP downloads, in seconds.
 _BWS_DOWNLOAD_TIMEOUT = 60
 _BWS_RUN_TIMEOUT = 30
+_BWS_RATE_LIMIT_MAX_ATTEMPTS = 5
+_BWS_RATE_LIMIT_BASE_DELAY = 1.0
 
 # In-process cache so repeated load_hermes_dotenv() calls (CLI startup,
 # gateway hot-reload, test suites) don't re-fetch from BSM.
@@ -688,31 +690,38 @@ def _run_bws_list(
     if server_url:
         env["BWS_SERVER_URL"] = server_url
 
-    try:
-        proc = subprocess.run(  # noqa: S603 — bws path is trusted
-            cmd,
-            env=env,
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=_BWS_RUN_TIMEOUT,
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets"
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError(f"failed to invoke bws: {exc}") from exc
+    last_error = ""
+    for attempt in range(1, _BWS_RATE_LIMIT_MAX_ATTEMPTS + 1):
+        try:
+            proc = subprocess.run(  # noqa: S603 — bws path is trusted
+                cmd,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=_BWS_RUN_TIMEOUT,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"failed to invoke bws: {exc}") from exc
 
-    if proc.returncode != 0:
-        # bws writes auth/network errors to stderr as a Rust error-report
-        # dump (color-eyre): an "Error:" header, indented cause lines, then
-        # "Location:" / "Backtrace omitted" noise.  Strip ANSI and boil it
-        # down to the meaningful cause line(s) before surfacing.
+        if proc.returncode == 0:
+            break
+
+        # Reduce bws's Rust color-eyre dump to the meaningful cause before
+        # deciding whether a rate-limit retry is warranted.
         err = _summarize_bws_stderr(proc.stderr or proc.stdout or "")
-        raise RuntimeError(
-            f"bws exited {proc.returncode}: {err[:200]}"
-        )
+        last_error = err[:200]
+        if not _is_bws_rate_limited(err) or attempt >= _BWS_RATE_LIMIT_MAX_ATTEMPTS:
+            raise RuntimeError(f"bws exited {proc.returncode}: {last_error}")
+        time.sleep(_bws_rate_limit_delay(attempt, err))
+    else:  # pragma: no cover - loop exits by break or raise
+        raise RuntimeError(f"bws exited non-zero: {last_error}")
 
     raw = proc.stdout.strip()
     if not raw:
@@ -746,6 +755,85 @@ def _run_bws_list(
     return secrets, warnings
 
 
+def _is_bws_rate_limited(message: str) -> bool:
+    lowered = message.lower()
+    return "429" in lowered or "too many requests" in lowered or "slow down" in lowered
+
+
+def _bws_rate_limit_delay(attempt: int, message: str) -> float:
+    """Return a small backoff for BWS 429s during parallel fleet starts."""
+    retry_after = _BWS_RATE_LIMIT_BASE_DELAY
+    marker = "try again in "
+    lowered = message.lower()
+    if marker in lowered:
+        tail = lowered.split(marker, 1)[1]
+        token = tail.split()[0].rstrip("s.,")
+        try:
+            retry_after = max(retry_after, float(token))
+        except ValueError:
+            pass
+    exponential = _BWS_RATE_LIMIT_BASE_DELAY * (2 ** (attempt - 1))
+    jitter = random.uniform(0.0, 0.75)
+    return min(max(retry_after, exponential) + jitter, 8.0)
+
+
+def _is_valid_env_name(name: str) -> bool:
+    if not name:
+        return False
+    if not (name[0].isalpha() or name[0] == "_"):
+        return False
+    return all(c.isalnum() or c == "_" for c in name)
+
+
+def _normalize_aliases(raw: object) -> dict[str, str]:
+    """Return valid string-to-string BSM alias mappings from config."""
+    if not isinstance(raw, dict):
+        return {}
+    aliases: dict[str, str] = {}
+    for source, target in raw.items():
+        if isinstance(source, str) and isinstance(target, str):
+            aliases[source] = target
+    return aliases
+
+
+def _normalize_string_list(raw: object) -> list[str]:
+    """Return a string list from config, ignoring invalid entries."""
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, str)]
+
+
+def _filter_and_alias_secrets(
+    secrets: Dict[str, str],
+    *,
+    aliases: Optional[Dict[str, str]] = None,
+    include_keys: Optional[List[str]] = None,
+) -> tuple[Dict[str, str], List[str], List[str]]:
+    """Apply Hopebox BSM include/alias config before env application.
+
+    Returns ``(filtered, skipped, warnings)``. ``include_keys`` match the
+    source BSM key names; aliases map source key -> target env var.
+    """
+    include_set = set(include_keys or [])
+    alias_map = aliases or {}
+    filtered: Dict[str, str] = {}
+    skipped: List[str] = []
+    warnings: List[str] = []
+    for key, value in secrets.items():
+        if include_set and key not in include_set:
+            skipped.append(key)
+            continue
+        target_key = alias_map.get(key, key)
+        if not _is_valid_env_name(target_key):
+            warnings.append(
+                f"Skipping alias target {target_key!r} for {key!r}: "
+                "not a valid env-var name"
+            )
+            continue
+        filtered[target_key] = value
+    return filtered, skipped, warnings
+
+
 # ---------------------------------------------------------------------------
 # Public entry point — called from hermes_cli.env_loader
 # ---------------------------------------------------------------------------
@@ -761,6 +849,8 @@ def apply_bitwarden_secrets(
     auto_install: bool = True,
     server_url: str = "",
     home_path: Optional[Path] = None,
+    aliases: Optional[Dict[str, str]] = None,
+    include_keys: Optional[List[str]] = None,
     encrypted_cache_enabled: bool = False,
     encrypted_cache_max_stale_seconds: float = 0,
 ) -> FetchResult:
@@ -821,21 +911,27 @@ def apply_bitwarden_secrets(
         result.error = str(exc)
         return result
 
-    result.secrets = secrets
+    result.secrets, skipped, alias_warnings = _filter_and_alias_secrets(
+        secrets,
+        aliases=aliases,
+        include_keys=include_keys,
+    )
+    result.skipped.extend(skipped)
     result.warnings.extend(warnings)
+    result.warnings.extend(alias_warnings)
 
-    for key, value in secrets.items():
-        if key == access_token_env:
+    for target_key, value in result.secrets.items():
+        if target_key == access_token_env:
             # Don't let BSM clobber the very token we used to fetch
             # itself — that would be a footgun if someone stored the
             # token as a BSM secret too.
-            result.skipped.append(key)
+            result.skipped.append(target_key)
             continue
-        if not override_existing and os.environ.get(key):
-            result.skipped.append(key)
+        if not override_existing and os.environ.get(target_key):
+            result.skipped.append(target_key)
             continue
-        os.environ[key] = value
-        result.applied.append(key)
+        os.environ[target_key] = value
+        result.applied.append(target_key)
 
     return result
 
@@ -906,6 +1002,14 @@ class BitwardenSource(SecretSource):
             "server_url": {
                 "description": "Region / self-hosted endpoint (empty = US Cloud)",
                 "default": "",
+            },
+            "aliases": {
+                "description": "Map BSM source keys to target env var names",
+                "default": {},
+            },
+            "include_keys": {
+                "description": "Optional allowlist of BSM source keys to import",
+                "default": [],
             },
         }
 
@@ -980,8 +1084,16 @@ class BitwardenSource(SecretSource):
                 )
             return result
 
-        result.secrets = secrets
+        aliases = _normalize_aliases(cfg.get("aliases"))
+        include_keys = _normalize_string_list(cfg.get("include_keys"))
+        result.secrets, skipped, alias_warnings = _filter_and_alias_secrets(
+            secrets,
+            aliases=aliases,
+            include_keys=include_keys,
+        )
+        result.skipped.extend(skipped)
         result.warnings.extend(warnings)
+        result.warnings.extend(alias_warnings)
         return result
 
     def remediation(self, kind, cfg: dict) -> str:

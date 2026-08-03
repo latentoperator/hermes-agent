@@ -947,6 +947,15 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     if age_seconds < threshold_seconds:
         return []
 
+    latest_guard_reason = None
+    latest_guard_ts = 0
+    for ev in events:
+        if _event_kind(ev) == "respawn_guarded":
+            t = _event_ts(ev)
+            if t >= last_ready_ts and t >= latest_guard_ts:
+                latest_guard_ts = t
+                latest_guard_reason = _parse_payload(ev).get("reason") or "unknown"
+
     # Format the age in the largest sensible unit.
     if age_seconds >= 3600:
         age_str = f"{age_seconds / 3600:.1f}h"
@@ -976,27 +985,59 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
         ),
     ]
 
+    data = {
+        "ready_since": last_ready_ts,
+        "age_seconds": int(age_seconds),
+        "assignee": assignee,
+        "threshold_seconds": int(threshold_seconds),
+    }
+    title = f"Ready for {age_str} with no worker"
+    detail = (
+        f"This task has been ready for {age_str} but nothing has "
+        f"claimed it. Common causes: assignee {assignee!r} is "
+        f"misspelled, the profile was deleted, or the external "
+        f"worker pool for this lane is down. Confirm the assignee "
+        f"is correct and that a worker is actually polling for it."
+    )
+    if latest_guard_reason:
+        title = (
+            f"Ready for {age_str}; respawn guard is deferring it "
+            f"({latest_guard_reason})"
+        )
+        detail = (
+            f"This task has been ready for {age_str}, and the dispatcher "
+            f"last skipped it because the respawn guard returned "
+            f"{latest_guard_reason!r}. Inspect the guard condition before "
+            f"assuming the worker pool is down. If an operator has verified "
+            f"the guarded condition is stale, run `hermes kanban dispatch "
+            f"--ignore-guards {_task_field(task, 'id')}` for a one-tick "
+            f"escape hatch."
+        )
+        data.update({
+            "respawn_guard_reason": latest_guard_reason,
+            "respawn_guarded_at": latest_guard_ts,
+        })
+        actions.append(DiagnosticAction(
+            kind="cli_hint",
+            label="Run one dispatch tick ignoring this guard",
+            payload={
+                "command": (
+                    "hermes kanban dispatch --ignore-guards "
+                    f"{_task_field(task, 'id')}"
+                )
+            },
+        ))
+
     return [Diagnostic(
         kind="stranded_in_ready",
         severity=severity,
-        title=f"Ready for {age_str} with no worker",
-        detail=(
-            f"This task has been ready for {age_str} but nothing has "
-            f"claimed it. Common causes: assignee {assignee!r} is "
-            f"misspelled, the profile was deleted, or the external "
-            f"worker pool for this lane is down. Confirm the assignee "
-            f"is correct and that a worker is actually polling for it."
-        ),
+        title=title,
+        detail=detail,
         actions=actions,
         first_seen_at=last_ready_ts,
-        last_seen_at=last_ready_ts,
+        last_seen_at=latest_guard_ts or last_ready_ts,
         count=1,
-        data={
-            "ready_since": last_ready_ts,
-            "age_seconds": int(age_seconds),
-            "assignee": assignee,
-            "threshold_seconds": int(threshold_seconds),
-        },
+        data=data,
     )]
 
 

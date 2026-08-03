@@ -1251,7 +1251,7 @@ def run_conversation(
             When None (default), API calls use the standard non-streaming path.
         persist_user_message: Optional clean user message to store in
             transcripts/history when user_message contains API-only
-            synthetic prefixes.
+            synthetic prefixes (e.g. dispatch notices, voice prefix).
         persist_user_timestamp: Optional platform event timestamp to store
             as metadata on that persisted user message.
         persist_user_display_kind: Optional presentation type for a
@@ -1261,7 +1261,6 @@ def run_conversation(
             the message unchanged.
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
-                or queuing follow-up prefetch work.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -1278,6 +1277,47 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    # ── Dispatch-group notice injection ──
+    # When an agent profile dispatches work to Kanban (via kanban_create)
+    # and that dispatched work drains — all tracked tasks done, archived,
+    # or blocked — the notifier writes a durable notice.  Inject it into
+    # the next turn so the agent is aware without manual polling.
+    # Defensive: notice lookup must never block a conversation turn.
+    #
+    # NOTE: Cron jobs also have HERMES_PROFILE set, so kanban_create calls
+    # inside cron sessions will enroll tasks in dispatch groups.  Since cron
+    # sessions never return for follow-up turns, those notices accumulate
+    # until the next matching profile+session turn acks them.  Harmless, but
+    # worth knowing when interpreting stale notice counts.
+    _dispatch_prefix = ""
+    _dispatch_notice_ids: list[int] = []
+    origin_profile = os.environ.get("HERMES_PROFILE")
+    if origin_profile:
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            _conn = _kb.connect()
+            try:
+                _notices = _kb.get_pending_dispatch_notices(
+                    _conn, origin_profile, agent.session_id,
+                )
+                if _notices:
+                    _dispatch_prefix = _kb.build_dispatch_notices_context(_notices)
+                    _dispatch_notice_ids = [
+                        n["notice_id"] for n in _notices
+                    ]
+            finally:
+                _conn.close()
+        except Exception:
+            pass
+
+    if _dispatch_prefix:
+        # Capture clean user message before injection so transcripts
+        # and memory don't get polluted with dispatch notice text.
+        if persist_user_message is None:
+            persist_user_message = user_message
+        user_message = _dispatch_prefix + "\n\n" + user_message
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
@@ -7227,7 +7267,7 @@ def run_conversation(
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
     from agent.turn_finalizer import finalize_turn
-    return finalize_turn(
+    result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -7245,6 +7285,25 @@ def run_conversation(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
 
+    # ── Deferred dispatch-notice ack ──
+    # Notices were fetched and injected into the user message before the
+    # model turn started, but the ack is deferred until here so that an
+    # API failure mid-turn doesn't lose notices forever.  Only ack when
+    # the turn actually completed (model response delivered); a failed or
+    # interrupted turn leaves notices unacked so they re-inject next time.
+    if _dispatch_notice_ids and result.get("completed"):
+        try:
+            from hermes_cli import kanban_db as _kb
+
+            _conn = _kb.connect()
+            try:
+                _kb.ack_dispatch_notices(_conn, _dispatch_notice_ids)
+            finally:
+                _conn.close()
+        except Exception:
+            pass
+
+    return result
 
 
 __all__ = ["run_conversation"]

@@ -161,3 +161,103 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_resolve_worker_cli_toolsets_drops_unknown_legacy_names(monkeypatch, tmp_path):
+    """Old configs may still contain aliases like 'messaging'; do not pass
+    them to the worker CLI where they emit startup warnings.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        """
+platform_toolsets:
+  cli:
+    - terminal
+    - messaging
+    - web
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    resolved = kb._resolve_worker_cli_toolsets(str(profile))
+
+    assert resolved is not None
+    assert "terminal" in resolved
+    assert "web" in resolved
+    assert "messaging" not in resolved
+
+
+def test_review_gate_inherits_root_config_when_profile_has_no_gate(monkeypatch, tmp_path):
+    """Profile workers should honor the machine/root review-gate policy.
+
+    Without this, a profile-scoped worker with no kanban.review_gate stanza
+    falls back to hard-coded defaults and can re-enable a root-disabled gate.
+    """
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text(
+        """
+kanban:
+  review_gate:
+    enabled: false
+    skills:
+      - github-operations
+""".lstrip(),
+        encoding="utf-8",
+    )
+    profile.joinpath("config.yaml").write_text("model:\n  default: test\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+
+    from hermes_cli import kanban_db as kb
+
+    gate = kb._review_gate_config()
+
+    assert gate["enabled"] is False
+    assert gate["skills"] == ["github-operations"]
+
+
+def test_default_spawn_passes_provider_and_model_overrides(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("toolsets:\n  - hermes-cli\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task = _make_task(kb, assignee="elias")
+    task.provider_override = "deepseek"
+    task.model_override = "deepseek-v4-pro"
+
+    pid = kb._default_spawn(task, str(workspace))
+
+    assert pid == 4243
+    chat_idx = captured["cmd"].index("chat")
+    provider_idx = captured["cmd"].index("--provider")
+    model_idx = captured["cmd"].index("-m")
+    assert provider_idx > chat_idx
+    assert model_idx > chat_idx
+    assert captured["cmd"][provider_idx + 1] == "deepseek"
+    assert captured["cmd"][model_idx + 1] == "deepseek-v4-pro"

@@ -569,6 +569,50 @@ class TestSanePathIncludesHomebrew:
         assert "PATH" not in result
 
 
+class TestHermesBinPathInjection:
+    """Hermes-managed host binaries should stay available with profile HOME isolation."""
+
+    def test_make_run_env_prepends_root_hermes_bin_for_profile_home(self, tmp_path):
+        from tools.environments.local import _make_run_env
+
+        root = tmp_path / ".hermes"
+        profile = root / "profiles" / "dante"
+        (root / "bin").mkdir(parents=True)
+        (profile / "home").mkdir(parents=True)
+
+        env = {
+            "HOME": str(tmp_path),
+            "HERMES_HOME": str(profile),
+            "PATH": "/usr/bin:/bin",
+            "TERMINAL_HOME_MODE": "profile",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            result = _make_run_env({})
+
+        assert result["HOME"] == str(profile / "home")
+        assert result["PATH"].split(":")[0] == str(root / "bin")
+
+    def test_sanitize_subprocess_env_prepends_root_hermes_bin(self, tmp_path):
+        from tools.environments.local import _sanitize_subprocess_env
+
+        root = tmp_path / ".hermes"
+        profile = root / "profiles" / "dante"
+        (root / "bin").mkdir(parents=True)
+        (profile / "home").mkdir(parents=True)
+
+        base_env = {
+            "HOME": str(tmp_path),
+            "HERMES_HOME": str(profile),
+            "PATH": "/usr/bin:/bin",
+            "TERMINAL_HOME_MODE": "profile",
+        }
+        with patch.dict(os.environ, base_env, clear=True):
+            result = _sanitize_subprocess_env(base_env)
+
+        assert result["HOME"] == str(profile / "home")
+        assert result["PATH"].split(":")[0] == str(root / "bin")
+
+
 class TestHermesBinDirOnPath:
     """The hermes install dir is reachable in the terminal subshell PATH.
 

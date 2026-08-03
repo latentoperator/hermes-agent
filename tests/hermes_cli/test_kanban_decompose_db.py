@@ -90,3 +90,60 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
 
 
 
+def test_decompose_per_child_workspace_override(kanban_home):
+    """An explicit per-child workspace beats inheritance."""
+    proj = "/home/teknium/myproject"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="root", assignee="worker",
+            workspace_kind="dir", workspace_path=proj, triage=True,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator",
+            children=[
+                {"title": "override", "workspace_kind": "dir",
+                 "workspace_path": "/other/repo"},
+                {"title": "inherit"},
+            ],
+            author="decomposer",
+        )
+    with kb.connect() as conn:
+        over = kb.get_task(conn, child_ids[0])
+        inh = kb.get_task(conn, child_ids[1])
+    assert over.workspace_path == "/other/repo"
+    assert inh.workspace_path == proj
+
+
+def test_decompose_inherits_root_notification_subscriptions(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn)
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            thread_id="5",
+            user_id="u1",
+            notifier_profile="default",
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orch",
+            children=[
+                {"title": "task A", "assignee": "researcher"},
+                {"title": "task B", "assignee": "engineer"},
+            ],
+            author="alice",
+        )
+    assert child_ids is not None
+
+    with kb.connect() as conn:
+        for cid in child_ids:
+            subs = kb.list_notify_subs(conn, cid)
+            assert len(subs) == 1
+            assert subs[0]["platform"] == "telegram"
+            assert subs[0]["chat_id"] == "123"
+            assert subs[0]["thread_id"] == "5"
+            assert subs[0]["user_id"] == "u1"
+            assert subs[0]["notifier_profile"] == "default"

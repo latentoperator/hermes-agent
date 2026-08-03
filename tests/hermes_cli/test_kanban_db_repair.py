@@ -4,6 +4,7 @@ and the ``hermes kanban repair`` CLI verb."""
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -145,14 +146,17 @@ def test_corrupt_backup_retention_cap_prunes_oldest(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(kb, "_CORRUPT_BACKUP_RETENTION", 3)
     db_path = tmp_path / "kanban.db"
-    _write_page_corrupt_db(db_path)
-
     minted: list[Path] = []
     for i in range(8):
-        # Mutate the corrupt bytes → new sha → new backup each round.
-        with db_path.open("r+b") as fh:
+        # Install a newly-corrupt inode each round, matching the recovery
+        # contract: the same quarantined inode reuses one forensic backup,
+        # while an atomically replaced inode is a distinct incident.
+        replacement = tmp_path / f"kanban-corrupt-{i}.db"
+        _write_page_corrupt_db(replacement)
+        with replacement.open("r+b") as fh:
             fh.seek(200)
             fh.write(bytes([i]) * 16)
+        os.replace(replacement, db_path)
         kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
         with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
             kb.connect(db_path=db_path)

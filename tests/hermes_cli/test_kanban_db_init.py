@@ -70,7 +70,6 @@ def _table_struct(conn: sqlite3.Connection, table: str):
 
 
 
-
 def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkeypatch):
     """A pre-AUTOINCREMENT DB is migrated in place: id columns become INTEGER
     PKs, ``last_event_id`` becomes INTEGER, data is preserved, and indexes
@@ -134,3 +133,102 @@ def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
         )
         assert isinstance(cursor, int)
         assert isinstance(events, list)
+
+
+def test_connect_skips_journal_mode_negotiation_after_process_init(tmp_path, monkeypatch):
+    """Kanban gateway opens many short-lived DB connections per dispatcher tick.
+
+    Re-running PRAGMA journal_mode=WAL on every connection can raise transient
+    sqlite3.OperationalError("disk I/O error") while workers/notifiers hold DB
+    locks. Once a process has initialized a board DB path, later connects should
+    skip journal-mode negotiation and remain usable.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    db_path = kb.kanban_db_path(board="default")
+    resolved = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(resolved)
+
+    calls = {"count": 0}
+
+    def fake_configure(conn, *, db_label):
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise sqlite3.OperationalError("disk I/O error")
+        return "delete"
+
+    monkeypatch.setattr("hermes_state.apply_wal_with_fallback", fake_configure)
+
+    first = kb.connect(board="default")
+    first.close()
+    assert calls["count"] == 1
+
+    second = kb.connect(board="default")
+    try:
+        assert second.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        second.close()
+    assert calls["count"] == 1
+
+
+def test_connect_reapplies_per_connection_pragmas_after_process_init(
+    tmp_path, monkeypatch
+):
+    """Fast-path connections retain durability and integrity pragmas."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    db_path = kb.kanban_db_path(board="default")
+    resolved = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(resolved)
+
+    real_connect = sqlite3.connect
+    calls = {"synchronous": 0, "foreign_keys": 0}
+
+    class CountingConnection:
+        def __init__(self, conn: sqlite3.Connection):
+            self._conn = conn
+
+        @property
+        def row_factory(self):
+            return self._conn.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value):
+            self._conn.row_factory = value
+
+        def execute(self, sql, *args, **kwargs):
+            normalized = " ".join(str(sql).upper().split())
+            if normalized == "PRAGMA SYNCHRONOUS=FULL":
+                calls["synchronous"] += 1
+            elif normalized == "PRAGMA FOREIGN_KEYS=ON":
+                calls["foreign_keys"] += 1
+            return self._conn.execute(sql, *args, **kwargs)
+
+        def close(self):
+            self._conn.close()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    def counting_connect(*args, **kwargs):
+        return CountingConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(kb.sqlite3, "connect", counting_connect)
+
+    first = kb.connect(board="default")
+    first.close()
+    assert calls == {"synchronous": 1, "foreign_keys": 1}
+
+    second = kb.connect(board="default")
+    try:
+        assert second.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        second.close()
+
+    assert calls == {"synchronous": 2, "foreign_keys": 2}

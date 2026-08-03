@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import multiprocessing
 import os
 import sqlite3
 import subprocess
@@ -162,6 +163,139 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # Task creation + status inference
 # ---------------------------------------------------------------------------
 
+def test_create_task_no_parents_is_ready(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship it", assignee="alice")
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.status == "ready"
+    assert t.assignee == "alice"
+    assert t.workspace_kind == "scratch"
+
+
+def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
+    with kb.connect() as conn:
+        p = kb.create_task(conn, title="parent")
+        c = kb.create_task(conn, title="child", parents=[p])
+        assert kb.get_task(conn, c).status == "todo"
+        kb.complete_task(conn, p, result="ok")
+        assert kb.get_task(conn, c).status == "ready"
+
+
+def test_create_task_unknown_parent_errors(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="unknown parent"):
+        kb.create_task(conn, title="orphan", parents=["t_ghost"])
+
+
+def test_create_task_with_explicit_supersedes_closes_blocked_original(kanban_home):
+    with kb.connect() as conn:
+        original = kb.create_task(
+            conn,
+            title="overscoped original",
+            assignee="dante",
+            initial_status="blocked",
+        )
+
+        continuation = kb.create_task(
+            conn,
+            title="smaller continuation",
+            assignee="dante",
+            parents=[original],
+            supersedes=[original],
+            created_by="wren-test",
+        )
+
+        original_task = kb.get_task(conn, original)
+        continuation_task = kb.get_task(conn, continuation)
+        assert original_task is not None
+        assert continuation_task is not None
+        assert original_task.status == "done"
+        assert original_task.result == f"Superseded by continuation card {continuation}"
+        assert continuation_task.status == "ready"
+
+        events = kb.list_events(conn, original)
+        superseded = [e for e in events if e.kind == "superseded"]
+        assert superseded
+        assert superseded[-1].payload == {
+            "continuation_task_id": continuation,
+            "actor": "wren-test",
+        }
+        run = kb.latest_run(conn, original)
+        assert run is not None
+        assert run.outcome == "superseded"
+        assert run.metadata is not None
+        assert run.metadata["superseded_by"] == continuation
+
+
+def test_create_task_parent_without_supersedes_does_not_close_blocked_original(kanban_home):
+    with kb.connect() as conn:
+        original = kb.create_task(
+            conn,
+            title="still needs decision",
+            assignee="dante",
+            initial_status="blocked",
+        )
+
+        child = kb.create_task(
+            conn,
+            title="ordinary follow-up",
+            assignee="dante",
+            parents=[original],
+        )
+
+        original_task = kb.get_task(conn, original)
+        child_task = kb.get_task(conn, child)
+        assert original_task is not None
+        assert child_task is not None
+        assert original_task.status == "blocked"
+        assert child_task.status == "todo"
+        assert not [e for e in kb.list_events(conn, original) if e.kind == "superseded"]
+
+
+def test_create_task_supersedes_must_also_be_parent(kanban_home):
+    with kb.connect() as conn:
+        original = kb.create_task(conn, title="original", assignee="dante")
+        with pytest.raises(ValueError, match="must also be listed as parents"):
+            kb.create_task(
+                conn,
+                title="bad continuation",
+                assignee="dante",
+                supersedes=[original],
+            )
+
+
+def test_workspace_kind_validation(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="workspace_kind"):
+        kb.create_task(conn, title="bad ws", workspace_kind="cloud")
+
+
+def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
+    target = tmp_path / ".worktrees" / "t6-wire"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship worktree",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name=" wt/t6-wire ",
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        context = kb.build_worker_context(conn, tid)
+
+    assert task.branch_name == "wt/t6-wire"
+    assert events[0].payload["branch_name"] == "wt/t6-wire"
+    assert "Branch:   wt/t6-wire" in context
+
+
+def test_branch_name_requires_worktree_workspace(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
+        kb.create_task(
+            conn,
+            title="bad branch",
+            workspace_kind="scratch",
+            branch_name="wt/bad",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +503,143 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
 # Complete / block / unblock / archive / assign
 # ---------------------------------------------------------------------------
 
+def test_complete_records_result(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        assert kb.complete_task(conn, t, result="done and dusted")
+        task = kb.get_task(conn, t)
+    assert task.status == "done"
+    assert task.result == "done and dusted"
+    assert task.completed_at is not None
+
+
+def test_block_then_unblock(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="need input")
+        assert kb.get_task(conn, t).status == "blocked"
+        assert kb.unblock_task(conn, t)
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dependency_block_requires_unfinished_parent(kanban_home):
+    """A parentless dependency must not enter an immediate retry loop."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="parentless dependency", assignee="a")
+        initial_task = kb.get_task(conn, task_id)
+        assert initial_task is not None
+        initial_status = initial_task.status
+
+        with pytest.raises(
+            ValueError,
+            match="dependency block requires at least one unfinished parent",
+        ):
+            kb.block_task(
+                conn,
+                task_id,
+                reason="waiting on work that was never linked",
+                kind="dependency",
+            )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == initial_status
+
+
+def test_dependency_block_waits_when_unfinished_parent_is_linked(kanban_home):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent", assignee="a")
+        child_id = kb.create_task(
+            conn,
+            title="child",
+            assignee="a",
+            parents=[parent_id],
+        )
+        assert kb.promote_task(
+            conn,
+            child_id,
+            actor="test",
+            force=True,
+        ) == (True, None)
+        assert kb.block_task(
+            conn,
+            child_id,
+            reason="waiting on linked parent",
+            kind="dependency",
+        )
+
+        task = kb.get_task(conn, child_id)
+        assert task is not None
+        assert task.status == "todo"
+        event_kinds = [event.kind for event in kb.list_events(conn, child_id)]
+        assert event_kinds.count("dependency_wait") == 1
+
+
+def test_unblock_resets_failure_counters(kanban_home):
+    """unblock_task must reset consecutive_failures and last_failure_error."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="need input")
+        # Simulate accumulated failures from the circuit breaker
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 5, "
+            "last_failure_error = 'test error' WHERE id = ?",
+            (t,),
+        )
+        conn.commit()
+        assert kb.unblock_task(conn, t)
+        task = kb.get_task(conn, t)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+
+
+def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
+    """recompute_ready must not auto-recover tasks whose consecutive_failures
+    has reached the circuit-breaker limit (#35072).
+
+    Without this guard, a task that repeatedly exhausts its iteration
+    budget would cycle forever: block → auto-recover (counter reset)
+    → respawn → budget exhausted → block → …
+    """
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(conn, title="child", assignee="a",
+                               parents=[parent])
+        # Complete the parent so the child's dependencies are satisfied.
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, summary="done")
+
+        # Simulate the child having exhausted its budget twice,
+        # hitting the default failure limit (2).
+        kb.claim_task(conn, child)
+        kb._record_task_failure(
+            conn, child, error="budget exhausted 1",
+            outcome="timed_out", release_claim=True, end_run=True,
+            failure_limit=2,
+        )
+        kb._record_task_failure(
+            conn, child, error="budget exhausted 2",
+            outcome="timed_out", release_claim=True, end_run=True,
+            failure_limit=2,
+        )
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked"
+        assert task.consecutive_failures >= 2
+
+        # recompute_ready must NOT promote this task — the circuit
+        # breaker has tripped and it should stay blocked.
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, child).status == "blocked"
+
+        # Explicit unblock should still work and reset the counter.
+        assert kb.unblock_task(conn, child)
+        task = kb.get_task(conn, child)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
 
 
 
@@ -506,6 +777,260 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
+def test_respawn_guard_active_pr_in_comment(kanban_home, monkeypatch):
+    """An open GitHub PR URL plus a recent worker run triggers active_pr."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        kb.add_comment(
+            conn, t, "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_merged_pr_in_comments_not_guarded(kanban_home, monkeypatch):
+    """Merged/closed PRs are ignored so completed review flow can respawn."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: False)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="merged-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        kb.add_comment(
+            conn, t, "worker",
+            "Merged PR: https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_reviewer_comment_does_not_refresh_pr_window(kanban_home, monkeypatch):
+    """A fresh reviewer comment quoting a PR URL does not extend an old worker-run window."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reviewer-quote", assignee="alice")
+        old_end = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, old_end - 120, old_end),
+        )
+        kb.add_comment(
+            conn, t, "reviewer",
+            "Reviewing https://github.com/totemx-AI/subsidysmart/pull/42 again",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
+    """A GitHub PR URL in a comment older than the PR window does not block."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="old-pr", assignee="alice")
+        old_ts = int(time.time()) - kb._RESPAWN_GUARD_PR_WINDOW - 60
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', "
+            "'PR: https://github.com/totemx-AI/subsidysmart/pull/10', ?)",
+            (t, old_ts),
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once defers (does NOT auto-block) a ready task whose last
+    error is a blocker_auth.
+
+    The old behaviour auto-blocked on first occurrence, which was too
+    aggressive: a transient 429 rate-limit (which typically clears in
+    seconds to minutes) would end up requiring manual unblock. The new
+    behaviour defers the spawn this tick; the task stays in ``ready``
+    and gets another chance next tick. If the auth error genuinely
+    persists, the existing ``consecutive_failures`` circuit breaker
+    will auto-block via the normal failure-limit path.
+    """
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="quota-storm", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("rate limit exceeded: 429 Too Many Requests", t),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    # Critical: task is NOT auto-blocked on first occurrence.
+    assert t not in res.auto_blocked, (
+        f"blocker_auth should defer, not auto-block on first occurrence; "
+        f"got auto_blocked={res.auto_blocked!r}"
+    )
+    # It IS recorded as respawn_guarded with the reason.
+    assert (t, "blocker_auth") in res.respawn_guarded, (
+        f"expected (task_id, 'blocker_auth') in respawn_guarded; "
+        f"got {res.respawn_guarded!r}"
+    )
+    # And it's NOT spawned this tick.
+    assert t not in spawned_ids
+    # Status stays ``ready`` so a future tick (or operator action) can
+    # retry without manual unblock.
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_respawn_guard_skips_recent_success(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once skips (but does not block) a task with a recent completed run."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="recent-winner", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 300, now - 60),
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "recent_success") in res.respawn_guarded
+    assert t not in spawned_ids
+    assert t not in res.auto_blocked
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"  # not blocked, just skipped
+
+
+def test_dispatch_respawn_guard_skips_active_pr(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """dispatch_once skips (but does not block) a task with an active PR comment."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="has-pr", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 300, now - 60),
+        )
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in res.respawn_guarded
+    assert t not in spawned_ids
+    assert t not in res.auto_blocked
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_respawn_guard_dry_run_no_auto_block(
+    kanban_home, all_assignees_spawnable
+):
+    """In dry_run mode, blocker_auth tasks are recorded in respawn_guarded (not auto-blocked)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="dry-quota", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("quota exceeded", t),
+        )
+        res = kb.dispatch_once(conn, dry_run=True)
+
+    assert (t, "blocker_auth") in res.respawn_guarded
+    assert t not in res.auto_blocked
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "ready"  # dry_run: no writes
+
+
+def test_dispatch_respawn_guard_allows_clean_task(
+    kanban_home, all_assignees_spawnable
+):
+    """A task with no guard triggers is spawned normally."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="clean-task", assignee="alice")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert t in spawned_ids
+    assert not res.respawn_guarded
+    assert t not in res.auto_blocked
+
+
+def test_dispatch_ignore_respawn_guard_escape_hatch(
+    kanban_home, all_assignees_spawnable
+):
+    """Operator escape hatch bypasses a known guard for one dispatch tick."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="quota-storm", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("rate limit exceeded: 429 Too Many Requests", t),
+        )
+        res = kb.dispatch_once(
+            conn, spawn_fn=fake_spawn, ignore_respawn_guards=[t]
+        )
+
+    assert t in spawned_ids
+    assert not res.respawn_guarded
+
+
+def test_dispatch_respawn_guard_emits_event_for_skipped_task(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once emits a respawn_guarded task_event so operators can diagnose stuck-ready tasks."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="event-check", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 300, now - 60),
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events = kb.list_events(conn, t)
+
+    kinds = [e.kind for e in events]
+    assert "respawn_guarded" in kinds
+    guarded_evt = next(e for e in events if e.kind == "respawn_guarded")
+    # Event.payload is already parsed as a dict by list_events.
+    assert isinstance(guarded_evt.payload, dict)
+    assert guarded_evt.payload.get("reason") == "recent_success"
 
 
 # ---------------------------------------------------------------------------
@@ -1285,44 +1810,202 @@ def _write_corrupt_db(path: Path) -> bytes:
     return blob
 
 
+def _quarantine_process_worker(
+    db_path: str,
+    counter_path: str,
+    barrier,
+) -> None:
+    """Process target that makes duplicate backup attempts observable."""
+    from hermes_cli import kanban_db as child_kb
+
+    real_backup = child_kb._backup_corrupt_db
+
+    def _counted_slow_backup(path: Path):
+        fd = os.open(counter_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+        finally:
+            os.close(fd)
+        time.sleep(0.2)
+        return real_backup(path)
+
+    child_kb._backup_corrupt_db = _counted_slow_backup
+    barrier.wait(timeout=5)
+    child_kb.quarantine_corrupt_db(
+        Path(db_path), "database disk image is malformed"
+    )
 
 
-def test_repeated_corrupt_open_reuses_single_backup(tmp_path):
-    """Repeated quarantines of the same corrupt bytes must not amplify disk usage.
+def test_vulnerable_sqlite_defaults_kanban_to_delete_journal(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_JOURNAL_MODE", raising=False)
+    monkeypatch.setattr(kb.sqlite3, "sqlite_version_info", (3, 50, 4))
+    db_path = tmp_path / "kanban.db"
+    conn = kb.connect(db_path=db_path)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+    finally:
+        conn.close()
 
-    Regression for the gateway dispatcher's 5-min retry loop on shared kanban
-    DBs across multi-profile fleets: each retry on an unchanged corrupt file
-    used to create a fresh ``.corrupt.<timestamp>.bak`` until disk filled. The
-    content-addressed backup name is deterministic in the DB's sha256, so
-    N retries of the same bytes share one backup.
+
+def test_init_db_refuses_corrupt_existing_file(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    original = _write_corrupt_db(db_path)
+    # Ensure the cache doesn't mask the guard.
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.init_db(db_path=db_path)
+
+    err = excinfo.value
+    assert err.db_path == db_path
+    assert err.backup_path is not None
+    assert err.backup_path.exists()
+    assert err.backup_path.read_bytes() == original
+    # Original bytes untouched — no schema was written on top.
+    assert db_path.read_bytes() == original
+    assert str(db_path) in str(err)
+    assert str(err.backup_path) in str(err)
+
+
+def test_connect_refuses_corrupt_existing_file(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with pytest.raises(kb.KanbanDbCorruptError):
+        kb.connect(db_path=db_path)
+
+
+def test_corrupt_inode_quarantine_bounds_backups_across_in_place_changes(tmp_path):
+    """Once an inode is quarantined, later writes cannot amplify backups.
+
+    Cached gateway connections may keep changing otherwise-readable tables
+    after one b-tree becomes malformed. The quarantine is therefore bound to
+    the database inode, not its byte hash or mtime: one damaged inode gets one
+    preserved backup until an operator atomically replaces the DB.
     """
     db_path = tmp_path / "kanban.db"
     original = _write_corrupt_db(db_path)
 
-    backups: set[Path] = set()
-    for _ in range(10):
-        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-        with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
-            kb.connect(db_path=db_path)
-        assert excinfo.value.backup_path is not None
-        backups.add(excinfo.value.backup_path)
+    first_backup = kb.quarantine_corrupt_db(
+        db_path, "database disk image is malformed"
+    )
+    assert first_backup is not None
+    assert first_backup.read_bytes() == original
+    marker = kb._quarantine_marker_path(db_path)
+    assert marker.exists()
 
-    assert len(backups) == 1, f"expected 1 deterministic backup, got {len(backups)}"
-    (backup,) = backups
-    assert backup.exists()
-    assert backup.read_bytes() == original
-
-    # Mutate the corrupt bytes — fingerprint changes, separate backup preserved.
+    # Simulate a cached writer changing a healthy page on the same damaged
+    # database inode. That must not create a second multi-megabyte backup.
     with db_path.open("r+b") as f:
         f.seek(4096)
         f.write(b"\xAB" * 64)
-    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
-    with pytest.raises(kb.KanbanDbCorruptError) as excinfo2:
+    second_backup = kb.quarantine_corrupt_db(
+        db_path, "database disk image is malformed"
+    )
+    assert second_backup == first_backup
+    assert list(tmp_path.glob("kanban.db.corrupt.*.bak")) == [first_backup]
+
+    # Simulate a different process whose initialization cache already contains
+    # the path: it must load the on-disk marker and fail closed before opening
+    # another writer connection.
+    kb._QUARANTINED_PATHS.clear()
+    kb._INITIALIZED_PATHS.add(str(db_path.resolve()))
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
         kb.connect(db_path=db_path)
-    second_backup = excinfo2.value.backup_path
-    assert second_backup is not None
-    assert second_backup != backup
-    assert second_backup.exists()
+    assert excinfo.value.backup_path == first_backup
+
+
+def test_quarantine_blocks_already_open_connection_writes(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    try:
+        task_id = kb.create_task(conn, title="preserved")
+        kb.quarantine_corrupt_db(db_path, "simulated runtime detection")
+
+        # Reads remain available for recovery, but a held connection must not
+        # start another write after another process quarantines the inode.
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.title == "preserved"
+        with pytest.raises(kb.KanbanDbCorruptError):
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET title = 'lost' WHERE id = ?", (task_id,))
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.title == "preserved"
+    finally:
+        conn.close()
+
+
+def test_quarantine_appearing_mid_transaction_rolls_back(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    conn = kb.connect(db_path=db_path)
+    try:
+        task_id = kb.create_task(conn, title="before")
+        with pytest.raises(kb.KanbanDbCorruptError):
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET title = 'uncommitted' WHERE id = ?", (task_id,))
+                kb.quarantine_corrupt_db(db_path, "detected while transaction open")
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.title == "before"
+    finally:
+        conn.close()
+
+
+def test_corrupt_inode_quarantine_serializes_backup_across_processes(tmp_path):
+    """Concurrent detectors preserve one copy, not one copy per process."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("requires fork multiprocessing context")
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    counter = tmp_path / "backup-attempts.txt"
+    ctx = multiprocessing.get_context("fork")
+    process_count = 6
+    barrier = ctx.Barrier(process_count)
+    processes = [
+        ctx.Process(
+            target=_quarantine_process_worker,
+            args=(str(db_path), str(counter), barrier),
+        )
+        for _ in range(process_count)
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    attempts = counter.read_text().splitlines()
+    assert len(attempts) == 1, attempts
+    assert len(list(tmp_path.glob("kanban.db.corrupt.*.bak"))) == 1
+
+
+def test_atomic_replacement_clears_inode_quarantine(tmp_path):
+    """A verified DB installed with os.replace is a new inode and may reopen."""
+    db_path = tmp_path / "kanban.db"
+    _write_corrupt_db(db_path)
+    kb.quarantine_corrupt_db(db_path, "database disk image is malformed")
+    marker = kb._quarantine_marker_path(db_path)
+    assert marker.exists()
+
+    replacement = tmp_path / "replacement.db"
+    kb.init_db(db_path=replacement)
+    with kb.connect_closing(db_path=replacement) as conn:
+        kb.create_task(conn, title="preserved replacement")
+    for suffix in ("-wal", "-shm"):
+        sidecar = replacement.with_name(replacement.name + suffix)
+        try:
+            sidecar.unlink()
+        except FileNotFoundError:
+            pass
+    os.replace(replacement, db_path)
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+    with kb.connect(db_path=db_path) as conn:
+        assert [task.title for task in kb.list_tasks(conn)] == ["preserved replacement"]
+    assert not marker.exists()
 
 
 def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):

@@ -332,7 +332,7 @@ class EventBridge:
         # In-memory approval tracking (populated from events)
         self._pending_approvals: Dict[str, dict] = {}
         # mtime cache — skip expensive work when state.db hasn't changed
-        self._state_db_mtime: float = 0.0
+        self._state_db_mtime: int = 0
         self._cached_sessions_index: dict = {}
 
     def start(self):
@@ -466,9 +466,9 @@ class EventBridge:
         except ImportError:
             db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
         try:
-            self._state_db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
+            self._state_db_mtime = db_file.stat().st_mtime_ns if db_file.exists() else 0
         except OSError:
-            self._state_db_mtime = 0.0
+            self._state_db_mtime = 0
         try:
             self._cached_sessions_index = _load_sessions_index()
         except Exception:
@@ -519,9 +519,9 @@ class EventBridge:
             db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
 
         try:
-            db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
+            db_mtime = db_file.stat().st_mtime_ns if db_file.exists() else 0
         except OSError:
-            db_mtime = 0.0
+            db_mtime = 0
 
         if db_mtime == self._state_db_mtime:
             return  # Nothing changed since last poll — skip entirely

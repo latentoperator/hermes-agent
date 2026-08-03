@@ -26,8 +26,8 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return the module."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -39,7 +39,12 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    return _load_plugin_module().router
 
 
 @pytest.fixture
@@ -76,13 +81,78 @@ def test_board_empty(client):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
-    assert data["assignees"] == []
+    assert data["assignees"] == ["default"]
     assert data["latest_event_id"] == 0
 
 
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
+
+
+def test_board_assignees_include_profiles_on_disk(client, kanban_home):
+    """The dashboard create form needs installed profiles, not only used assignees."""
+    profiles = kanban_home / "profiles"
+    (profiles / "dante").mkdir(parents=True)
+    (profiles / "dante" / "config.yaml").write_text("model:\n  default: test\n")
+    (profiles / "wren").mkdir(parents=True)
+    (profiles / "wren" / "config.yaml").write_text("model:\n  default: test\n")
+
+    response = client.get("/api/plugins/kanban/board")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert "dante" in data["assignees"]
+    assert "wren" in data["assignees"]
+
+
+def test_board_assignees_honor_hidden_profiles(client, kanban_home):
+    profiles = kanban_home / "profiles"
+    for name in ("dante", "triss", "syren"):
+        (profiles / name).mkdir(parents=True)
+        (profiles / name / "config.yaml").write_text("model:\n  default: test\n")
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  hidden_assignees:\n    - triss\n    - syren\n"
+    )
+
+    data = client.get("/api/plugins/kanban/board").json()
+
+    assert "dante" in data["assignees"]
+    assert "triss" not in data["assignees"]
+    assert "syren" not in data["assignees"]
+
+
+def test_dashboard_create_auto_subscribes_home_channels(kanban_home, monkeypatch):
+    mod = _load_plugin_module()
+    monkeypatch.setattr(
+        mod,
+        "_configured_home_channels",
+        lambda: [
+            {
+                "platform": "telegram",
+                "chat_id": "7593705216",
+                "thread_id": "",
+                "name": "Home",
+            }
+        ],
+    )
+    monkeypatch.setattr(mod, "_active_profile_name", lambda: "default")
+    app = FastAPI()
+    app.include_router(mod.router, prefix="/api/plugins/kanban")
+    local_client = TestClient(app)
+
+    response = local_client.post(
+        "/api/plugins/kanban/tasks", json={"title": "from dashboard"}
+    )
+
+    assert response.status_code == 200, response.text
+    task_id = response.json()["task"]["id"]
+    with kb.connect() as conn:
+        subs = kb.list_notify_subs(conn, task_id)
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "7593705216"
+    assert subs[0]["notifier_profile"] == "default"
 
 
 def test_create_task_appears_on_board(client):
@@ -113,6 +183,107 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_dashboard_create_with_supersedes_closes_original(client):
+    original = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "overscoped original", "assignee": "wren"},
+    ).json()["task"]
+    client.patch(
+        f"/api/plugins/kanban/tasks/{original['id']}",
+        json={"status": "blocked", "block_reason": "split into continuation"},
+    )
+
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "safe continuation",
+            "assignee": "wren",
+            "parents": [original["id"]],
+            "supersedes": [original["id"]],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    continuation = response.json()["task"]
+    assert continuation["status"] == "ready"
+
+    original_detail = client.get(
+        f"/api/plugins/kanban/tasks/{original['id']}"
+    ).json()
+    assert original_detail["task"]["status"] == "done"
+    assert original_detail["task"]["result"] == (
+        f"Superseded by continuation card {continuation['id']}"
+    )
+    superseded = [
+        event
+        for event in original_detail["events"]
+        if event["kind"] == "superseded"
+    ]
+    assert superseded
+    assert superseded[-1]["payload"] == {
+        "continuation_task_id": continuation["id"],
+        "actor": "dashboard",
+    }
+
+
+def test_board_list_recommends_persistent_workspace_for_configured_workdir(
+    client, tmp_path
+):
+    """Board metadata should tell the UI which safe task default to use."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    kb.write_board_metadata("default", default_workdir=str(repo))
+
+    plain_dir = tmp_path / "notes"
+    plain_dir.mkdir()
+    kb.create_board("notes", default_workdir=str(plain_dir))
+    kb.create_board("disposable")
+
+    response = client.get("/api/plugins/kanban/boards")
+
+    assert response.status_code == 200
+    boards = {board["slug"]: board for board in response.json()["boards"]}
+    assert boards["default"]["default_workspace_kind"] == "worktree"
+    assert boards["notes"]["default_workspace_kind"] == "dir"
+    assert boards["disposable"]["default_workspace_kind"] == "scratch"
+
+
+def test_create_board_persists_project_directory(client, tmp_path):
+    """The dashboard board form should anchor future tasks to its project."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    response = client.post(
+        "/api/plugins/kanban/boards",
+        json={
+            "slug": "project-board",
+            "name": "Project Board",
+            "default_workdir": str(project_dir),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    board = response.json()["board"]
+    assert board["default_workdir"] == str(project_dir.resolve())
+    assert board["default_workspace_kind"] == "dir"
+    assert kb.read_board_metadata("project-board")["default_workdir"] == str(
+        project_dir.resolve()
+    )
+
+
+@pytest.mark.parametrize("path", ["relative/project", "~/missing-project"])
+def test_create_board_rejects_invalid_project_directory(client, path):
+    """A board must not persist a path that cannot anchor worker output."""
+    response = client.post(
+        "/api/plugins/kanban/boards",
+        json={"slug": "invalid-project", "default_workdir": path},
+    )
+
+    assert response.status_code == 400
+    assert "project directory" in response.json()["detail"].lower()
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):
@@ -507,6 +678,80 @@ _FALLBACK_AGE = {
 }
 
 
+def test_board_endpoint_survives_task_age_exception(client, monkeypatch):
+    """If task_age raises for any reason, GET /board must NOT 500.
+
+    Pre-fix behavior (without the try/except in _task_dict): a single corrupt
+    row turned the entire board response into a 500. The fallback dict lets
+    the dashboard render every other card normally.
+    """
+    create = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "doomed", "assignee": "alice"},
+    )
+    assert create.status_code == 200, create.text
+
+    # Force task_age to raise an exception type _safe_int does NOT handle —
+    # simulates a future regression where someone re-introduces an unguarded
+    # operation in task_age. ValueError on '%s' would be absorbed by _safe_int
+    # and never reach the outer try/except, so it would not exercise the
+    # contract this test pins.
+    def _boom(_task):
+        raise RuntimeError("simulated future task_age bug")
+    monkeypatch.setattr("hermes_cli.kanban_db.task_age", _boom)
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200, r.text
+
+    payload = r.json()
+    # /board returns columns as a list of {name, tasks} — not a dict — so
+    # flatten across all columns to find our seeded task.
+    tasks = [t for col in payload["columns"] for t in col["tasks"]]
+    assert len(tasks) == 1, f"expected exactly the seeded task, got {tasks!r}"
+    # Strict equality: the literal fallback dict from plugin_api._task_dict
+    # is the published contract the dashboard UI relies on. Key renames or
+    # silent additions should fail this test on purpose.
+    assert tasks[0]["age"] == _FALLBACK_AGE
+
+
+def test_single_task_endpoint_survives_task_age_exception(client, monkeypatch):
+    """GET /tasks/:id also calls _task_dict — same fallback should kick in.
+
+    This is the "drawer view" path: the user clicks one card and we serialize
+    just that task. A corrupt timestamp on a single task should not block the
+    user from opening its drawer.
+    """
+    create = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "drawer-target", "assignee": "bob"},
+    )
+    task_id = create.json()["task"]["id"]
+
+    def _boom(_task):
+        raise RuntimeError("simulated future task_age bug")
+    monkeypatch.setattr("hermes_cli.kanban_db.task_age", _boom)
+
+    r = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert r.status_code == 200, r.text
+    assert r.json()["task"]["age"] == _FALLBACK_AGE
+
+
+def test_create_task_probe_error_does_not_break_create(client, monkeypatch):
+    """Probe failure must never break task creation."""
+    def _raise(**kw):
+        raise RuntimeError("probe crashed")
+    monkeypatch.setattr(
+        "hermes_cli.kanban._check_dispatcher_presence", _raise,
+    )
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "resilient", "assignee": "worker"},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["title"] == "resilient"
+
+
+
 # ---------------------------------------------------------------------------
 # Home-channel subscription endpoints (#19534 follow-up: GUI opt-in)
 # ---------------------------------------------------------------------------
@@ -542,6 +787,124 @@ def test_home_channels_lists_only_platforms_with_home(client, with_home_channels
     )
     for h in r.json()["home_channels"]:
         assert h["subscribed"] is False
+
+
+def test_home_channels_no_task_id_all_unsubscribed(client, with_home_channels):
+    """Without task_id, every entry's subscribed=false (UI "no task" state)."""
+    r = client.get("/api/plugins/kanban/home-channels")
+    assert r.status_code == 200
+    assert all(not h["subscribed"] for h in r.json()["home_channels"])
+
+
+def test_home_subscribe_creates_notify_sub_row(client, with_home_channels):
+    """POST .../home-subscribe/telegram writes a kanban_notify_subs row
+    keyed to the telegram home's (chat_id, thread_id)."""
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
+
+    r = client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "1234567"
+    assert subs[0]["thread_id"] == "42"
+    assert subs[0]["notifier_profile"] == "default"
+
+
+def test_home_subscribe_flips_subscribed_flag_in_subsequent_get(client, with_home_channels):
+    """After subscribe, the GET endpoint reports subscribed=true for that
+    platform and false for the others."""
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
+    client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+
+    r = client.get(f"/api/plugins/kanban/home-channels?task_id={task_id}")
+    flags = {h["platform"]: h["subscribed"] for h in r.json()["home_channels"]}
+    assert flags == {"telegram": True, "discord": False}
+
+
+def test_home_subscribe_is_idempotent(client, with_home_channels):
+    """Re-subscribing keeps a single row at the DB layer."""
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
+    client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+    client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+    client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, task_id)) == 1
+    finally:
+        conn.close()
+
+
+def test_home_subscribe_backfills_owner_on_legacy_row(client, with_home_channels):
+    """Re-subscribing should backfill notifier ownership on ownerless rows."""
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
+
+    conn = kb.connect()
+    try:
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="1234567",
+            thread_id="42",
+        )
+    finally:
+        conn.close()
+
+    r = client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+    assert r.status_code == 200
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, task_id)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "default"
+
+
+def test_home_subscribe_unknown_platform_returns_404(client, with_home_channels):
+    """Platforms without a home configured (slack in the fixture) return 404."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.post(f"/api/plugins/kanban/tasks/{t['id']}/home-subscribe/slack")
+    assert r.status_code == 404
+    assert "slack" in r.json()["detail"]
+
+
+def test_home_subscribe_unknown_task_returns_404(client, with_home_channels):
+    r = client.post("/api/plugins/kanban/tasks/t_nonexistent/home-subscribe/telegram")
+    assert r.status_code == 404
+
+
+def test_home_unsubscribe_removes_notify_sub_row(client, with_home_channels):
+    """DELETE .../home-subscribe/telegram removes the matching row."""
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x")
+    client.post(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+    r = client.delete(f"/api/plugins/kanban/tasks/{task_id}/home-subscribe/telegram")
+    assert r.status_code == 200
+
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, task_id) == []
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -706,5 +1069,4 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
 

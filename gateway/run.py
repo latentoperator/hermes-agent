@@ -9148,7 +9148,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if self._restart_requested
             else "Your current task will be interrupted."
         )
-        msg = f"⚠️ Gateway {action} — {hint}"
+        msg = f"Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
@@ -9222,6 +9222,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reply_to_message_id=reply_to_message_id,
                     adapter=adapter,
                 )
+                if platform == Platform.DISCORD:
+                    metadata = _non_conversational_metadata(
+                        metadata,
+                        platform=platform,
+                    )
 
                 result = await adapter.send(chat_id, msg, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
@@ -9303,6 +9308,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     home.thread_id,
                     adapter=adapter,
                 )
+                if platform == Platform.DISCORD:
+                    metadata = _non_conversational_metadata(
+                        metadata,
+                        platform=platform,
+                    )
                 if metadata:
                     result = await adapter.send(str(home.chat_id), msg, metadata=metadata)
                 else:
@@ -14019,6 +14029,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "status": self._handle_status_command,
                 "context": self._handle_context_command,
                 "restart": self._handle_restart_command,
+                "fleet": self._handle_fleet_command,
                 "approve": self._handle_approve_command,
                 "deny": self._handle_deny_command,
                 "agents": self._handle_agents_command,
@@ -14990,7 +15001,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
-        
+
+        if canonical == "fleet":
+            return await self._handle_fleet_command(event)
+
         if canonical == "stop":
             return await self._handle_stop_command(event)
         
@@ -22269,7 +22283,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
+    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, str | None], dict[str, Any]] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -22277,16 +22291,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @classmethod
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
-        """Extract Honcho identity keys, memoized by honcho.json mtime."""
+        """Extract Honcho identity keys, memoized by honcho.json content."""
         try:
+            import hashlib
+
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
 
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                content_digest = hashlib.sha256(path.read_bytes()).hexdigest()
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                content_digest = None
+            memo_key = (str(path), content_digest)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)

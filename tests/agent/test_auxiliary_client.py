@@ -901,13 +901,10 @@ class TestExpiredCodexFallback:
         import base64
         import time as _time
 
-        # Belt-and-suspenders: _try_openrouter marks openrouter unhealthy
-        # when OPENROUTER_API_KEY is absent (which the preceding test in
-        # this class exercises).  The file-level _clean_env autouse fixture
-        # clears the cache, but fixture ordering with the conftest
-        # _hermetic_environment autouse can leave a narrow window where
-        # the mark reappears.  Explicitly clear here so this test is
-        # independent of run order.
+        # Belt-and-suspenders: clear the process-local unhealthy cache so this
+        # test is independent of any previous provider-fallback test. Missing
+        # OpenRouter credentials no longer mark the provider as a payment
+        # failure, but real 402/rate-limit tests still can.
         import agent.auxiliary_client as _aux_mod
         _aux_mod._aux_unhealthy_until.clear()
         _aux_mod._aux_unhealthy_logged_at.clear()
@@ -972,6 +969,20 @@ class TestExplicitProviderRouting:
 
 
 
+    def test_missing_openrouter_credentials_do_not_mark_payment_unhealthy(self, monkeypatch, caplog):
+        """Absent OpenRouter credentials are not a billing/credit failure."""
+        import agent.auxiliary_client as aux
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        aux._reset_aux_unhealthy_cache()
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+                client, model = aux._try_openrouter()
+        assert client is None
+        assert model is None
+        assert not aux._is_provider_unhealthy("openrouter")
+        assert not any("payment / credit error" in record.message for record in caplog.records)
+
     def test_try_openrouter_pool_exhausted_falls_back_to_env(self, monkeypatch):
         """Pool present but exhausted → fall through to OPENROUTER_API_KEY env var."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-env-fallback")
@@ -988,6 +999,18 @@ class TestExplicitProviderRouting:
         assert mock_openai.call_args.kwargs["api_key"] == "sk-or-env-fallback"
         assert mock_openai.call_args.kwargs["base_url"] == OPENROUTER_BASE_URL
 
+    def test_try_openrouter_pool_exhausted_no_env_does_not_mark_payment_unhealthy(self, monkeypatch):
+        """Pool exhausted AND no env var is missing config, not a billing failure."""
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(True, None)), \
+             patch("agent.auxiliary_client._mark_provider_unhealthy") as mock_mark, \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = _try_openrouter()
+
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+        mock_mark.assert_not_called()
 
 class TestOpenRouterPaidLaneGuard:
     """Issue #75803: auxiliary auto-chain OpenRouter fallback must be

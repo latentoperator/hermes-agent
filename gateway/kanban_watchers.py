@@ -109,6 +109,77 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _active_dispatcher_profile(kanban_cfg: dict[str, Any]) -> str:
+    """Return the optional profile that is allowed to host the dispatcher."""
+    return str(kanban_cfg.get("dispatcher_profile") or "").strip()
+
+
+def _profile_matches_dispatcher_pin(active_profile: str, dispatcher_profile: str) -> bool:
+    """Return whether this gateway profile may host the embedded dispatcher."""
+    if not dispatcher_profile:
+        return True
+    return (active_profile or "default").strip().casefold() == dispatcher_profile.casefold()
+
+
+def _spawnable_kanban_work_exists(kb_module) -> bool:
+    """Return True when any board has ready/review work a dispatcher could spawn."""
+    try:
+        boards = kb_module.list_boards(include_archived=False)
+    except Exception:
+        boards = [kb_module.read_board_metadata(kb_module.DEFAULT_BOARD)]
+    for board in boards:
+        slug = board.get("slug") or kb_module.DEFAULT_BOARD
+        conn = None
+        try:
+            conn = kb_module.connect(board=slug)
+            if kb_module.has_spawnable_ready(conn) or kb_module.has_spawnable_review(conn):
+                return True
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return False
+
+
+def _maybe_create_no_dispatcher_decision_card(
+    *,
+    profile: str,
+    lock_path: Path,
+    age_seconds: float,
+) -> str:
+    """Create a best-effort shared Decision Card for a no-dispatcher alarm."""
+    try:
+        from gateway import decision_cards
+
+        card = decision_cards.create_card(
+            question="Kanban dispatcher lock is absent while work is ready — inspect gateway?",
+            context=(
+                f"Profile expected to dispatch: {profile or 'default'}\n"
+                f"Lock missing/contended for at least {int(age_seconds)}s\n"
+                f"Lock path: {lock_path}"
+            ),
+            default_action="Inspect and restart the pinned gateway if needed.",
+            fire_at="now",
+            requested_by="kanban-dispatcher-watchdog",
+            source_ref="kanban.dispatcher_profile",
+            originating_profile=profile or "default",
+            action_kind="ops_review",
+            action_payload={"lock_path": str(lock_path), "age_seconds": int(age_seconds)},
+            explanation="The Kanban queue has spawnable work but no embedded dispatcher is holding the singleton lock.",
+        )
+        return card.id
+    except Exception:
+        logger.debug(
+            "kanban dispatcher: failed to create no-dispatcher Decision Card",
+            exc_info=True,
+        )
+        return ""
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -350,6 +421,21 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: subscription for %s on board %s failed: %s",
                                         sub.get("task_id"), slug, sub_exc,
                                     )
+                        except sqlite3.DatabaseError as exc:
+                            if not _kb.is_corrupt_db_error(exc):
+                                raise
+                            backup = _kb.quarantine_corrupt_db(
+                                Path(resolved_db_path),
+                                f"runtime SQLite corruption detected by notifier: {exc}",
+                            )
+                            logger.error(
+                                "kanban notifier: quarantined corrupt board %s database %s; "
+                                "all fresh Kanban connections will fail closed until the DB "
+                                "is atomically replaced (backup=%s)",
+                                slug,
+                                resolved_db_path,
+                                backup or "<backup failed>",
+                            )
                         finally:
                             conn.close()
                     return deliveries
@@ -994,36 +1080,23 @@ class GatewayKanbanWatchersMixin:
             )
             return
 
+        active_profile_fn = getattr(self, "_active_profile_name", None)
+        active_profile = str(active_profile_fn() if callable(active_profile_fn) else "default")
+        dispatcher_profile = _active_dispatcher_profile(kanban_cfg)
+        if not _profile_matches_dispatcher_pin(active_profile, dispatcher_profile):
+            logger.info(
+                "kanban dispatcher: disabled because kanban.dispatcher_profile=%r "
+                "does not match active profile %r",
+                dispatcher_profile,
+                active_profile,
+            )
+            return
+
         try:
             from hermes_cli import kanban_db as _kb
         except Exception:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
-
-        # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
-        # new profile gateway (or a same-profile restart race) can silently
-        # start a second dispatcher; concurrent dispatchers double reclaim
-        # frequency, double claim-attempt events, and — with
-        # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
-        # index pages. The lock lives at the machine-global kanban root
-        # (shared across profiles by design), so it serialises ALL gateways.
-        self._kanban_dispatcher_lock_handle = None
-        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
-        _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
-        if _lock_state == "contended":
-            logger.info(
-                "kanban dispatcher: another gateway already holds the dispatcher "
-                "lock (%s); this gateway will NOT dispatch.", _lock_path,
-            )
-            return
-        if _lock_state == "held":
-            self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
-            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
-        else:
-            logger.warning(
-                "kanban dispatcher: advisory lock unavailable at %s; proceeding "
-                "on config control alone.", _lock_path,
-            )
 
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
@@ -1034,6 +1107,76 @@ class GatewayKanbanWatchersMixin:
             )
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
+
+        raw_alarm_after = kanban_cfg.get("no_dispatcher_alarm_after_seconds", 300)
+        try:
+            alarm_after = max(0, int(raw_alarm_after or 0))
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.no_dispatcher_alarm_after_seconds=%r; using 300",
+                raw_alarm_after,
+            )
+            alarm_after = 300
+
+        # Only the pinned profile reaches this point. If another process owns
+        # the machine-global singleton, retry so a dead dispatcher is recovered
+        # after its lock is released instead of opting out until restart.
+        self._kanban_dispatcher_lock_handle = None
+        lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
+        lock_wait_started_at: Optional[float] = None
+        lock_alarm_sent = False
+        while self._running:
+            lock_handle, lock_state = _acquire_singleton_lock(lock_path)
+            if lock_state == "held":
+                self._kanban_dispatcher_lock_handle = lock_handle
+                logger.info(
+                    "kanban dispatcher: holding singleton dispatcher lock (%s)",
+                    lock_path,
+                )
+                break
+            if lock_state == "unavailable":
+                logger.warning(
+                    "kanban dispatcher: advisory lock unavailable at %s; proceeding "
+                    "on config pin control alone.",
+                    lock_path,
+                )
+                break
+            if lock_wait_started_at is None:
+                lock_wait_started_at = time.monotonic()
+                logger.info(
+                    "kanban dispatcher: another process holds dispatcher lock (%s); "
+                    "pinned profile %r will retry every %.1fs.",
+                    lock_path,
+                    active_profile,
+                    interval,
+                )
+            waited = time.monotonic() - lock_wait_started_at
+            if (
+                alarm_after
+                and not lock_alarm_sent
+                and waited >= alarm_after
+                and _spawnable_kanban_work_exists(_kb)
+            ):
+                card_id = _maybe_create_no_dispatcher_decision_card(
+                    profile=active_profile,
+                    lock_path=lock_path,
+                    age_seconds=waited,
+                )
+                logger.error(
+                    "kanban dispatcher unavailable: pinned profile %r has waited %.0fs "
+                    "for lock %s while spawnable work exists%s",
+                    active_profile,
+                    waited,
+                    lock_path,
+                    f" (Decision Card {card_id})" if card_id else "",
+                )
+                lock_alarm_sent = True
+            slept = 0.0
+            while slept < interval and self._running:
+                await asyncio.sleep(min(1.0, interval - slept))
+                slept += 1.0
+        if not self._running:
+            return
 
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)

@@ -2943,6 +2943,21 @@ def _terminal_width_for_streaming() -> int:
     return max(20, cols - len(_STREAM_PAD) - 2)
 
 
+def _terminal_width_for_rich_output() -> int:
+    """Display cells available for Rich console rendering inside the chat loop.
+
+    Rich panels rendered at the exact terminal width can still be hard-wrapped
+    by prompt_toolkit, tmux/zellij, or the terminal emulator if any layer is
+    one cell off.  Subtract a small right gutter so Rich wraps before the
+    terminal does.
+    """
+    try:
+        cols = shutil.get_terminal_size((80, 24)).columns
+    except Exception:
+        cols = 80
+    return max(20, cols - 2)
+
+
 def _render_final_assistant_content(text: str, mode: str = "render"):
     """Render final assistant content as markdown, stripped text, or raw text."""
     from rich.markdown import Markdown
@@ -3893,8 +3908,9 @@ class ChatConsole:
     def print(self, *args, **kwargs):
         self._buffer.seek(0)
         self._buffer.truncate()
-        # Read terminal width at render time so panels adapt to current size
-        self._inner.width = shutil.get_terminal_size((80, 24)).columns
+        # Use a conservative width so Rich wraps before the terminal
+        # hard-wraps — prevents mid-word splits at the physical edge.
+        self._inner.width = _terminal_width_for_rich_output()
         self._inner.print(*args, **kwargs)
         output = self._buffer.getvalue()
         # Strip OSC escape sequences (e.g. OSC-8 hyperlinks) before
@@ -4494,25 +4510,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _resolve_prefill_messages_file(CLI_CONFIG)
         )
         
-        # Reasoning config (OpenRouter reasoning effort level)
-        # Per-model override > global reasoning_effort — resolved through the
-        # shared chokepoint in hermes_constants (Closes #21256).
+        # Reasoning config (OpenRouter reasoning effort level). An explicit
+        # worker/CLI override wins for this process; otherwise use upstream's
+        # per-model > global resolver.
         from hermes_constants import resolve_reasoning_config
-        self.reasoning_config = resolve_reasoning_config(CLI_CONFIG, self.model)
-        # An explicit --reasoning wins over config for this run only (never
-        # persisted). Kanban's dispatcher uses it to pin a task's thinking
-        # depth without touching the worker profile's config.yaml. An
-        # unparseable level is ignored with a warning rather than silently
-        # swapping in the default — same contract as the config path.
-        if reasoning is not None and str(reasoning).strip():
-            _cli_reasoning = _parse_reasoning_config(reasoning)
-            if _cli_reasoning is None:
-                logger.warning(
-                    "Unknown --reasoning '%s', keeping the configured level",
-                    reasoning,
-                )
-            else:
-                self.reasoning_config = _cli_reasoning
+        self.reasoning_config = (
+            _parse_reasoning_config(reasoning)
+            if reasoning is not None
+            else resolve_reasoning_config(CLI_CONFIG, self.model)
+        )
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -6805,8 +6811,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Emit complete lines, keep partial remainder in buffer
         _tc = getattr(self, "_stream_text_ansi", "")
 
+        # Use a conservative width for prose lines so long text breaks
+        # on word boundaries rather than at the terminal's hard-wrap
+        # column (which can split mid-word like "wr/ap").
+        _safe_prose_width = max(20, (
+            shutil.get_terminal_size((80, 24)).columns
+            - len(_STREAM_PAD) - 2
+        ))
+
         def _emit_one(printed_line: str) -> None:
-            _cprint(f"{_STREAM_PAD}{_tc}{printed_line}{_RST}" if _tc else f"{_STREAM_PAD}{printed_line}")
+            if len(printed_line) > _safe_prose_width:
+                for wrapped in textwrap.wrap(
+                    printed_line,
+                    width=_safe_prose_width,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                    replace_whitespace=False,
+                ):
+                    _cprint(f"{_STREAM_PAD}{_tc}{wrapped}{_RST}" if _tc else f"{_STREAM_PAD}{wrapped}")
+            else:
+                _cprint(f"{_STREAM_PAD}{_tc}{printed_line}{_RST}" if _tc else f"{_STREAM_PAD}{printed_line}")
 
         def _flush_table_buf() -> None:
             buf = self._stream_table_buf
@@ -6921,7 +6945,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if self._stream_buf:
             line = _strip_markdown_syntax(self._stream_buf) if self.final_response_markdown == "strip" else self._stream_buf
-            _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
+            _safe_prose_width = max(20, (
+                shutil.get_terminal_size((80, 24)).columns
+                - len(_STREAM_PAD) - 2
+            ))
+            if len(line) > _safe_prose_width:
+                for wrapped in textwrap.wrap(
+                    line,
+                    width=_safe_prose_width,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                    replace_whitespace=False,
+                ):
+                    _cprint(f"{_STREAM_PAD}{_tc}{wrapped}{_RST}" if _tc else f"{_STREAM_PAD}{wrapped}")
+            else:
+                _cprint(f"{_STREAM_PAD}{_tc}{line}{_RST}" if _tc else f"{_STREAM_PAD}{line}")
             self._stream_buf = ""
 
         # Close the response box

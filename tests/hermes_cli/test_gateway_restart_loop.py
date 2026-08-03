@@ -102,6 +102,16 @@ class TestGatewayLifecyclePattern:
         "Monitor the gateway and tell me if a restart is recommended",
         "research how the OpenAI API gateway handles restart after rate limiting",
         "compare AWS API Gateway vs Cloudflare on restart latency",
+        # Regression: the kill branch must require a command-word boundary.
+        # Benign cron names / skill fields containing "skill" or "skills" must
+        # not trip the gateway-lifecycle guard just because they include the
+        # substring "kill" followed by a separator.
+        "weekly-skill-drift-readonly",
+        "skill",
+        "skills",
+        "skill-drift",
+        "weekly_skill_drift_readonly.py",
+        "One-sentence version: deterministic read-only scan of live and archived SKILL.md files across the Hopewell Hermes fleet; no skill files, archives, configs, curator state, or gateway/runtime state were changed.",
     ])
     def test_safe_commands(self, text):
         assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
@@ -628,6 +638,20 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("", str(script))
 
+
+    def test_skill_word_near_hermes_gateway_prose_does_not_raise(self, tmp_path):
+        """Regression for the weekly-skill-drift-readonly no-agent script: the
+        kill/pkill branch must not match the substring "kill" inside prose
+        words like SKILL/skill before later Hermes + gateway mentions."""
+        from cron.lifecycle_guard import check_gateway_lifecycle
+        script = tmp_path / "weekly_skill_drift_readonly.py"
+        script.write_text(
+            "One-sentence version: deterministic read-only scan of live and "
+            "archived SKILL.md files across the Hopewell Hermes fleet; no "
+            "skill files, archives, configs, curator state, or gateway/runtime "
+            "state were changed.\n"
+        )
+        check_gateway_lifecycle("", str(script))
 
     def test_relative_script_resolved_under_scripts_dir(self, tmp_path, monkeypatch):
         """A bare/relative script name resolves under HERMES_HOME/scripts (the

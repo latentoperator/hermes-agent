@@ -6416,6 +6416,70 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.resume_typing_for_chat(str(query_chat_id))
             return
 
+        # --- Decision Card callbacks (decision:<card_id>:<action>) ---
+        if data.startswith("decision:"):
+            try:
+                from gateway.decision_cards import handle_action, parse_custom_id
+                card_id, action = parse_custom_id(data)
+            except Exception:
+                await query.answer(text="Invalid decision card data.")
+                return
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to answer this decision card.")
+                return
+
+            user_display = getattr(query.from_user, "first_name", "User")
+            try:
+                # message/channel ids stay empty on purpose: handle_action
+                # COALESCEs non-empty values into the card row, and those
+                # columns belong to the Discord message the card's primary
+                # buttons live on.
+                card, receipt = handle_action(
+                    card_id,
+                    action,
+                    actor=user_display,
+                    actor_id=caller_id,
+                )
+            except Exception as exc:
+                await query.answer(text=f"Could not record decision: {exc}"[:190])
+                return
+
+            label_map = {
+                "yes": "✅ Yes",
+                "no": "❌ No",
+                "wait": "⏸ Wait",
+                "info": "ℹ️ More info",
+            }
+            label = label_map.get(action, action)
+            await query.answer(text=f"{label} recorded")
+
+            if action in {"yes", "no", "wait"}:
+                # Append the outcome to the mirrored card text and drop the
+                # buttons. Mirror text is sent without parse_mode, so edit
+                # plain as well.
+                original = getattr(query_message, "text", "") or ""
+                try:
+                    await query.edit_message_text(
+                        text=f"{original}\n\n{label} by {user_display}",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+            if query_message is not None:
+                try:
+                    await query_message.reply_text(receipt)
+                except Exception:
+                    pass
+            return
+
         # --- Slash-confirm callbacks (sc:choice:confirm_id) ---
         if data.startswith("sc:"):
             parts = data.split(":", 2)

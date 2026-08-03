@@ -215,6 +215,61 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         conn2.close()
 
 
+def test_complete_goal_mode_transport_failure_leaves_task_running(
+    monkeypatch, tmp_path
+):
+    """A reachable judge transport failure must not approve completion."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "tools.kanban_tools.judge_goal",
+        lambda *args, **kwargs: (
+            "continue",
+            "goal judge request timed out",
+            False,
+            None,
+            True,
+        ),
+    )
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    result = json.loads(kt._handle_complete({"summary": "unverified"}))
+    assert "judge transport failed" in result["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_goal_mode_availability_error_leaves_task_running(
+    monkeypatch, tmp_path
+):
+    """A broken availability lookup is not the same as no configured judge."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+
+    def broken_lookup():
+        raise RuntimeError("auxiliary configuration is invalid")
+
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", broken_lookup)
+
+    result = json.loads(kt._handle_complete({"summary": "unverified"}))
+    assert "could not be verified" in result["error"]
+    assert "RuntimeError" in result["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "running"
+    finally:
+        conn.close()
+
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_block({"reason": "need clarification"})
@@ -412,6 +467,61 @@ def test_create_happy_path(worker_env):
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
         assert child.assignee == "peer"
+    finally:
+        conn.close()
+
+
+def test_create_default_child_does_not_share_worker_directory(
+    monkeypatch, worker_env
+):
+    """Persistent directory sharing requires explicit child workspace args."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        parent_id = kb.create_task(
+            conn,
+            title="persistent worker",
+            assignee="test-worker",
+            workspace_kind="dir",
+            workspace_path="/home/hopewell/hopewell-dev/example",
+        )
+        kb.claim_task(conn, parent_id)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent_id)
+
+    result = json.loads(
+        kt._handle_create({"title": "follow-up", "assignee": "peer"})
+    )
+    assert result["ok"] is True
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, result["task_id"])
+        assert child.workspace_kind == "scratch"
+        assert child.workspace_path is None
+    finally:
+        conn.close()
+
+
+def test_create_without_worker_task_defaults_to_scratch(monkeypatch, worker_env):
+    """Taskless orchestrator callers retain an isolated scratch default."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    result = json.loads(
+        kt._handle_create({"title": "orchestrated child", "assignee": "peer"})
+    )
+    assert result["ok"] is True
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, result["task_id"])
+        assert child.workspace_kind == "scratch"
+        assert child.workspace_path is None
     finally:
         conn.close()
 

@@ -71,6 +71,45 @@ skills:
     assert parse_count == 1
 
 
+def test_skill_config_raw_cache_invalidates_on_config_edit(tmp_path, monkeypatch):
+    """Editing config.yaml should invalidate the shared raw config cache."""
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("skills:\n  disabled: [old-skill]\n", encoding="utf-8")
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+    assert get_disabled_skill_names() == {"old-skill"}
+
+    # Use a different file size so cache invalidation is deterministic even on
+    # filesystems where back-to-back writes can share the same mtime tick.
+    config_path.write_text("skills:\n  disabled: [newer-skill]\n", encoding="utf-8")
+    import os
+    os.utime(config_path, None)
+
+    assert get_disabled_skill_names() == {"newer-skill"}
+
+
+def test_disabled_skill_names_accept_legacy_json_string_config(tmp_path, monkeypatch):
+    """Legacy config may store skills.disabled as a JSON string, not YAML list."""
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "skills:\n"
+        "  disabled: '[\"hermes-agent-skill-authoring\", \"other-skill\"]'\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+
+    assert get_disabled_skill_names() == {"hermes-agent-skill-authoring", "other-skill"}
 
 
 

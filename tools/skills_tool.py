@@ -79,7 +79,6 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
-from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
@@ -118,22 +117,39 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     sig = []
     for d in dirs_to_scan:
         try:
-            m = d.stat().st_mtime
+            root_stat = d.stat()
         except OSError:
             continue
+        children = []
         try:
             with os.scandir(d) as it:
                 for entry in it:
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            em = entry.stat(follow_symlinks=False).st_mtime
-                            if em > m:
-                                m = em
+                            entry_stat = entry.stat(follow_symlinks=False)
+                            try:
+                                with os.scandir(entry.path) as child_it:
+                                    child_names = tuple(sorted(child.name for child in child_it))
+                            except OSError:
+                                child_names = ()
+                            children.append(
+                                (
+                                    entry.name,
+                                    entry_stat.st_mtime,
+                                    child_names,
+                                )
+                            )
                     except OSError:
                         continue
         except OSError:
             pass
-        sig.append((str(d), m))
+        sig.append(
+            (
+                str(d),
+                root_stat.st_mtime,
+                tuple(sorted(children)),
+            )
+        )
     return (tuple(sig), frozenset(disabled), platform)
 
 
@@ -650,19 +666,9 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
     3. ``HERMES_SESSION_PLATFORM`` from gateway session context
     """
     try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        skills_cfg = config.get("skills", {})
-        resolved_platform = platform or os.getenv("HERMES_PLATFORM") or _get_session_platform()
-        global_disabled = skills_cfg.get("disabled", [])
-        if resolved_platform:
-            platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
-            if platform_disabled is not None:
-                # A globally-disabled skill stays disabled on every platform;
-                # the platform list adds to it rather than replacing it. Keep
-                # in sync with agent.skill_utils.get_disabled_skill_names.
-                return name in platform_disabled or name in global_disabled
-        return name in global_disabled
+        resolved_platform = platform or os.getenv("HERMES_PLATFORM") or _get_session_platform() or None
+        from agent.skill_utils import get_disabled_skill_names
+        return name in get_disabled_skill_names(resolved_platform)
     except Exception:
         return False
 

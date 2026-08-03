@@ -50,7 +50,10 @@ def _other():
 
 @pytest.fixture(autouse=True)
 def _no_file_check(monkeypatch):
-    # Isolate the boundary behaviour from the post-commit invariant.
+    # Isolate the boundary behaviour from filesystem-backed safety checks.
+    # The fake connection only models transaction boundary SQL and does not
+    # implement PRAGMA database_list, which the quarantine guard requires.
+    monkeypatch.setattr(kb, "_raise_if_connection_quarantined", lambda conn: None)
     monkeypatch.setattr(kb, "_check_file_length_invariant", lambda conn: None)
 
 

@@ -292,8 +292,6 @@ class TestBareCustomNoBaseUrlHealsFromConfig:
 
         persisted = captured.get("model_config") or {}
         assert persisted.get("provider") == "custom:mimo-v2.5-pro"
-
-
 # --- Regression: bare "custom" + no base_url + DIFFERENT default provider ----
 #
 # The config-provider fallback above only heals when ``config.model.provider``
@@ -342,4 +340,108 @@ class TestModelNameRecoversEntryIdentity:
             == "custom:hermes-ultra"
         )
 
+    def test_identity_by_model_from_legacy_default_model(self, monkeypatch):
+        monkeypatch.setattr(rp, "load_config", lambda: ULTRA_LEGACY_CONFIG)
 
+        assert (
+            rp.find_custom_provider_identity_by_model("hermes-ultra-sft")
+            == "custom:hermes-ultra"
+        )
+
+    def test_identity_by_model_unknown_model_returns_none(self, monkeypatch):
+        monkeypatch.setattr(rp, "load_config", lambda: ULTRA_CONFIG)
+
+        assert rp.find_custom_provider_identity_by_model("gpt-5.5") is None
+        assert rp.find_custom_provider_identity_by_model("") is None
+
+    def test_canonical_identity_prefers_base_url_over_model(self, monkeypatch):
+        """URL ownership beats model-name matching when both are present."""
+        config = {
+            "model": {"default": "x", "provider": "nous"},
+            "providers": {
+                "by-url": {"api": ULTRA_URL, "api_key": "k1"},
+                "by-model": {
+                    "api": "http://other:9000/v1",
+                    "api_key": "k2",
+                    "models": ["hermes-ultra-sft"],
+                },
+            },
+        }
+        monkeypatch.setattr(rp, "load_config", lambda: config)
+
+        assert (
+            rp.canonical_custom_identity(
+                base_url=ULTRA_URL, model="hermes-ultra-sft"
+            )
+            == "custom:by-url"
+        )
+
+    def test_canonical_identity_recovers_from_model_when_config_points_elsewhere(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(rp, "load_config", lambda: ULTRA_CONFIG)
+        monkeypatch.setattr(rp, "_get_model_config", lambda: ULTRA_CONFIG["model"])
+
+        assert (
+            rp.canonical_custom_identity(base_url=None, model="hermes-ultra-sft")
+            == "custom:hermes-ultra"
+        )
+
+    def test_restore_heals_bare_custom_row_via_model_name(self, monkeypatch):
+        """The b200/hermes-ultra-sft report: row has bare custom, no base_url,
+        and the global default provider is a built-in. Before the model tier,
+        the bare provider was dropped and resume silently rerouted the
+        session's model to the default provider (Nous 404: "Model
+        'hermes-ultra-sft' not found... OpenRouter catalog")."""
+        monkeypatch.setattr(rp, "load_config", lambda: ULTRA_CONFIG)
+        monkeypatch.setattr(rp, "_get_model_config", lambda: ULTRA_CONFIG["model"])
+
+        from tui_gateway.server import _stored_session_runtime_overrides
+
+        row = {
+            "model": "hermes-ultra-sft",
+            "model_config": json.dumps(
+                {"model": "hermes-ultra-sft", "provider": "custom"}
+            ),
+            "billing_provider": "custom",
+        }
+        overrides = _stored_session_runtime_overrides(row)
+
+        assert overrides["provider_override"] == "custom:hermes-ultra"
+        assert overrides["model_override"]["provider"] == "custom:hermes-ultra"
+
+    def test_persist_heals_bare_custom_via_model_when_no_base_url(self, monkeypatch):
+        monkeypatch.setattr(rp, "load_config", lambda: ULTRA_CONFIG)
+        monkeypatch.setattr(rp, "_get_model_config", lambda: ULTRA_CONFIG["model"])
+
+        from tui_gateway.server import _runtime_model_config
+
+        agent = types.SimpleNamespace(
+            model="hermes-ultra-sft",
+            provider="custom",
+            base_url="",
+            api_mode="chat_completions",
+            reasoning_config=None,
+            service_tier=None,
+        )
+        config = _runtime_model_config(agent)
+
+        assert config["provider"] == "custom:hermes-ultra"
+
+    def test_make_agent_heals_via_model_end_to_end(self, monkeypatch):
+        """resume → _make_agent with bare custom + no base_url + built-in
+        global default must rebuild against the entry's endpoint + key, not
+        the default provider."""
+        override = {
+            "model": "hermes-ultra-sft",
+            "provider": "custom",
+            "base_url": None,
+            "api_mode": "chat_completions",
+        }
+
+        kwargs = _make_agent_with_override(
+            override, monkeypatch, ULTRA_CONFIG, model_cfg=ULTRA_CONFIG["model"]
+        )
+
+        assert kwargs["base_url"] == ULTRA_URL
+        assert kwargs["api_key"] == "sk-ultra"

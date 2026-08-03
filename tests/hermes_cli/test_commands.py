@@ -80,6 +80,15 @@ class TestResolveCommand:
         assert topic.name == "topic"
         assert "topic" in GATEWAY_KNOWN_COMMANDS
 
+    def test_fleet_is_gateway_command(self):
+        fleet = resolve_command("fleet")
+        assert fleet is not None
+        assert fleet.name == "fleet"
+        assert fleet.gateway_only is True
+        assert fleet.busy_policy == "dispatch"
+        assert "reset-session" in SUBCOMMANDS["/fleet"]
+        assert "fleet" in GATEWAY_KNOWN_COMMANDS
+
     def test_context_command_registered_with_ctx_alias(self):
         ctx = resolve_command("context")
         assert ctx is not None

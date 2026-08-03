@@ -506,6 +506,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
 
+    _inject_hermes_bin_path(sanitized, profile_home_enabled=_uses_profile_home(sanitized))
     _apply_windows_msys_bash_env_defaults(sanitized)
 
     sanitized = _scrub_delegated_child_kanban_env(sanitized)
@@ -1265,6 +1266,48 @@ def _path_env_key(run_env: dict) -> str | None:
     return None
 
 
+def _prepend_path_entry(env: dict, directory: str | os.PathLike | None) -> None:
+    """Prepend an existing directory to PATH if not already present."""
+    if not directory:
+        return
+    directory_str = os.fspath(directory)
+    if not os.path.isdir(directory_str):
+        return
+    path_key = _path_env_key(env)
+    if path_key is None:
+        return
+    existing_path = env.get(path_key, "")
+    parts = [part for part in existing_path.split(os.pathsep) if part]
+    if directory_str not in parts:
+        env[path_key] = os.pathsep.join([directory_str, *parts]) if parts else directory_str
+
+
+def _inject_hermes_bin_path(env: dict, *, profile_home_enabled: bool = False) -> None:
+    """Make Hermes-managed host binaries available in tool subprocesses."""
+    if _IS_WINDOWS or not profile_home_enabled:
+        return
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        _prepend_path_entry(env, get_default_hermes_root() / "bin")
+    except Exception:
+        pass
+
+
+def _uses_profile_home(env: dict) -> bool:
+    """Return True when subprocess HOME is the active profile's home dir."""
+    hermes_home = str(env.get("HERMES_HOME") or "").strip()
+    home = str(env.get("HOME") or "").strip()
+    if not hermes_home or not home:
+        return False
+    try:
+        expected = os.path.normcase(os.path.abspath(os.path.join(hermes_home, "home")))
+        actual = os.path.normcase(os.path.abspath(os.path.expanduser(home)))
+        return actual == expected
+    except Exception:
+        return False
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
@@ -1312,6 +1355,8 @@ def _make_run_env(env: dict) -> dict:
 
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(run_env)
+
+    _inject_hermes_bin_path(run_env, profile_home_enabled=_uses_profile_home(run_env))
 
     # Bridge ContextVar-based session vars into the subprocess env (with the
     # cross-session leak guard — strips _UNSET vars when a concurrent host is

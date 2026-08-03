@@ -5,6 +5,7 @@ heavy dependency chain.  It is safe to import at module level without triggering
 tool registration or provider resolution.
 """
 
+import json
 import logging
 import os
 import re
@@ -459,7 +460,20 @@ def _normalize_string_set(values) -> Set[str]:
     if values is None:
         return set()
     if isinstance(values, str):
-        values = [values]
+        stripped = values.strip()
+        if not stripped:
+            return set()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, list):
+                values = parsed
+            else:
+                values = [item.strip().strip("\"'") for item in stripped[1:-1].split(",")]
+        else:
+            values = [stripped]
     return {str(v).strip() for v in values if str(v).strip()}
 
 

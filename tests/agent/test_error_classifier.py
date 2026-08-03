@@ -984,8 +984,6 @@ class Test408RequestTimeout:
         assert result.retryable is False
         assert result.should_fallback is True
         assert result.should_compress is False
-
-
 # ── Test: throttle vs overflow disambiguation + new overflow shapes ─────
 # Port of anomalyco/opencode#37848 (expand context overflow patterns +
 # rate-limit exclusion guard).
@@ -1048,5 +1046,10 @@ class TestExpandedOverflowPatterns:
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
 
-
-
+    def test_configured_context_size_still_overflow(self):
+        e = Exception(
+            "Prompt has 5,958,968 tokens, but the configured context size "
+            "is 256,000 tokens"
+        )
+        result = classify_api_error(e, provider="ollama", model="m")
+        assert result.reason == FailoverReason.context_overflow
