@@ -438,9 +438,57 @@ def test_review_required_block_creates_ready_closed_loop_review_card(tmp_path, m
     review = reviews[0]
     assert review.status == "ready"
     assert review.assignee == "code-reviewer"
+    assert review.workspace_kind == "dir"
     assert review.workspace_path == str(repo)
+    assert review.branch_name is None
     assert review.idempotency_key == f"{kb.REVIEW_LOOP_IDEMPOTENCY_PREFIX}:{source_id}:1"
-    assert f"Source task: {source_id}" in (review.body or "")
+    body = review.body or ""
+    assert f"Source task: {source_id}" in body
+    assert f"Workspace: {repo}" in body
+    assert f"Review source: {repo}" in body
+
+
+def test_review_loop_reuses_existing_source_worktree_as_dir(tmp_path, monkeypatch):
+    db_path = tmp_path / "kanban.db"
+    root = tmp_path / "hopewell-dev"
+    worktree = root / "demo-repo" / ".worktrees" / "source-task"
+    worktree.mkdir(parents=True)
+    branch = "dante/source-task-security-fix"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ENABLED", "false")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_LOOP_ENABLED", "true")
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ROOTS", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_REVIEW_GATE_ASSIGNEE", "code-reviewer")
+
+    with kb.connect_closing() as conn:
+        source_id = kb.create_task(
+            conn,
+            title="repair security-sensitive refund behavior",
+            assignee="dante",
+            workspace_kind="worktree",
+            workspace_path=str(worktree),
+            branch_name=branch,
+            auto_review_gate=False,
+        )
+        assert kb.block_task(conn, source_id, reason="review-required: branch ready")
+        review = next(
+            task
+            for task in kb.list_tasks(conn, include_archived=True)
+            if task.created_by == kb.REVIEW_LOOP_CREATED_BY
+        )
+
+    # The source branch is already checked out here. A reviewer must inspect
+    # that checkout directly instead of asking the dispatcher for a second
+    # worktree on the same branch.
+    assert review.workspace_kind == "dir"
+    assert review.workspace_path == str(worktree)
+    assert review.branch_name is None
+    assert kb.resolve_workspace(review) == worktree
+    body = review.body or ""
+    assert f"Source task: {source_id}" in body
+    assert f"Workspace: {worktree}" in body
+    assert f"Review source: {worktree}" in body
+    assert f"Branch: {branch}" in body
 
 
 def test_review_required_dependency_block_stays_blocked_and_routes_review(tmp_path, monkeypatch):
