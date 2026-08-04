@@ -3875,9 +3875,13 @@ def _maybe_create_review_loop_task(
         body=_review_loop_body(source, round_no, max_rounds, review_source),
         assignee=str(gate.get("assignee") or DEFAULT_REVIEW_GATE_ASSIGNEE),
         created_by=REVIEW_LOOP_CREATED_BY,
-        workspace_kind=(source.workspace_kind if source.workspace_kind in {"dir", "worktree"} else "dir"),
+        # Reviewers inspect the resolved source checkout in place. In
+        # particular, a worktree source already owns its branch; copying the
+        # worktree kind and branch onto this card would make the dispatcher try
+        # to check out the same branch in a second worktree, which Git rejects.
+        workspace_kind="dir",
         workspace_path=review_source.repo_path,
-        branch_name=(source.branch_name if source.workspace_kind == "worktree" else None),
+        branch_name=None,
         tenant=source.tenant,
         priority=source.priority,
         idempotency_key=idem,
