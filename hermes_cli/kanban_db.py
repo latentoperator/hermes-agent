@@ -7602,10 +7602,16 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _append_event(
-            conn, task_id, "unblocked",
-            {"status": new_status} if new_status != "ready" else None,
-        )
+        comment_row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        unblock_payload: dict[str, Any] = {
+            "comment_cursor": int(comment_row[0] or 0) if comment_row else 0,
+        }
+        if new_status != "ready":
+            unblock_payload["status"] = new_status
+        _append_event(conn, task_id, "unblocked", unblock_payload)
         return True
 
 
@@ -8439,6 +8445,10 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
+
+# Surface one operator-visible event when an active-PR guard has kept a task
+# ready for this long after an explicit unblock.
+_RESPAWN_GUARD_ALERT_SECONDS = 15 * 60
 
 # Pattern matching a GitHub PR URL in task comments.
 _RESPAWN_GUARD_PR_URL_RE = re.compile(
@@ -9858,6 +9868,88 @@ def _github_pr_is_open(
     return result
 
 
+def _latest_unblock_state(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[tuple[int, int, Optional[int]]]:
+    """Return ``(event_id, created_at, comment_cursor)`` for the last unblock.
+
+    New unblock events record the latest task-comment id so PR activity can be
+    ordered exactly even when a review decision and follow-up comment land in
+    the same second. Older events have no cursor; callers conservatively fall
+    back to their timestamp.
+    """
+    row = conn.execute(
+        "SELECT id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'unblocked' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    cursor: Optional[int] = None
+    if row["payload"]:
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("comment_cursor"), int):
+            cursor = int(payload["comment_cursor"])
+    return int(row["id"]), int(row["created_at"] or 0), cursor
+
+
+def _event_payload_has_reason(payload_text: Optional[str], reason: str) -> bool:
+    """Return whether a serialized task-event payload names ``reason``."""
+    if not payload_text:
+        return False
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("reason") == reason
+
+
+def _active_pr_guard_age_alert_payload(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now: int,
+) -> Optional[dict[str, Any]]:
+    """Build a deduplicated stale-guard alert for the latest unblock span."""
+    latest_unblock = _latest_unblock_state(conn, task_id)
+    if latest_unblock is None:
+        return None
+    unblock_event_id, unblocked_at, _ = latest_unblock
+
+    first_guarded_at = 0
+    already_alerted = False
+    for event in conn.execute(
+        "SELECT kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND id > ? "
+        "AND kind IN ('respawn_guarded', 'respawn_guard_age_alert') "
+        "ORDER BY id ASC",
+        (task_id, unblock_event_id),
+    ):
+        if not _event_payload_has_reason(event["payload"], "active_pr"):
+            continue
+        if event["kind"] == "respawn_guarded" and not first_guarded_at:
+            first_guarded_at = int(event["created_at"] or 0)
+        elif event["kind"] == "respawn_guard_age_alert":
+            already_alerted = True
+
+    if not first_guarded_at or already_alerted:
+        return None
+    age_seconds = max(0, int(now) - first_guarded_at)
+    if age_seconds < _RESPAWN_GUARD_ALERT_SECONDS:
+        return None
+    return {
+        "reason": "active_pr",
+        "age_seconds": age_seconds,
+        "threshold_seconds": _RESPAWN_GUARD_ALERT_SECONDS,
+        "since_unblocked_at": unblocked_at,
+        "first_guarded_at": first_guarded_at,
+    }
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9905,9 +9997,11 @@ def check_respawn_guard(
         A GitHub PR URL appears in a task comment, the last worker run is
         within ``_RESPAWN_GUARD_PR_WINDOW`` seconds, and GitHub reports the
         PR is still open (or the PR state cannot be checked). Merged/closed
-        PRs do not guard. The window is measured from the worker run, not
-        comment timestamps, so reviewer comments quoting a URL do not extend
-        the guard forever.
+        PRs do not guard. An explicit unblock permits one claim despite PR
+        evidence already known at unblock time; a later claim consumes that
+        bypass, and new PR-bearing comments after unblock re-arm the guard.
+        The window is measured from the worker run, not comment timestamps,
+        so reviewer comments quoting a URL do not extend the guard forever.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -10000,12 +10094,33 @@ def check_respawn_guard(
     ).fetchone()
     latest_worker_run_at = int(latest_worker_run[0] or 0) if latest_worker_run else 0
     if latest_worker_run_at >= pr_cutoff:
+        latest_unblock = _latest_unblock_state(conn, task_id)
+        bypass_available = False
+        if latest_unblock is not None:
+            unblock_event_id, _, _ = latest_unblock
+            bypass_consumed = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? "
+                "AND kind = 'claimed' AND id > ? LIMIT 1",
+                (task_id, unblock_event_id),
+            ).fetchone()
+            bypass_available = bypass_consumed is None
         for c in conn.execute(
-            "SELECT body FROM task_comments WHERE task_id = ?",
+            "SELECT id, body, created_at FROM task_comments WHERE task_id = ?",
             (task_id,),
         ).fetchall():
             body = c["body"] or ""
             for match in _RESPAWN_GUARD_PR_URL_RE.finditer(body):
+                if bypass_available and latest_unblock is not None:
+                    _, unblocked_at, comment_cursor = latest_unblock
+                    if comment_cursor is not None:
+                        evidence_after_unblock = int(c["id"]) > comment_cursor
+                    else:
+                        # Legacy unblock rows lack an exact comment cursor.
+                        # Equal timestamps are ambiguous, so guard rather than
+                        # risk duplicating work on an unverifiable ordering.
+                        evidence_after_unblock = int(c["created_at"] or 0) >= unblocked_at
+                    if not evidence_after_unblock:
+                        continue
                 is_open = _github_pr_is_open(match, cache=pr_state_cache)
                 if is_open is False:
                     continue
@@ -10401,11 +10516,24 @@ def _dispatch_once_locked(
             # skipped when reading `hermes kanban tail` — without
             # this the task appears stuck in ready with no diagnosis.
             if not dry_run:
+                now = int(time.time())
                 with write_txn(conn):
+                    alert_payload = None
+                    if guard_reason == "active_pr":
+                        alert_payload = _active_pr_guard_age_alert_payload(
+                            conn, row["id"], now=now
+                        )
                     _append_event(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+                    if alert_payload is not None:
+                        _append_event(
+                            conn,
+                            row["id"],
+                            "respawn_guard_age_alert",
+                            alert_payload,
+                        )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))

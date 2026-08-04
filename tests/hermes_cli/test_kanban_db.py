@@ -796,6 +796,81 @@ def test_respawn_guard_active_pr_in_comment(kanban_home, monkeypatch):
     assert reason == "active_pr"
 
 
+def test_post_unblock_active_pr_bypass_is_consumed_by_one_respawn(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """An explicit unblock permits one retry, then the old open PR guards again."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review-approved", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+        assert kb.block_task(conn, t, reason="review approved")
+        assert kb.unblock_task(conn, t)
+
+        first = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        assert t in spawned_ids
+        assert not first.respawn_guarded
+
+        assert not kb._record_task_failure(
+            conn,
+            t,
+            "worker exited before completing follow-up",
+            outcome="spawn_failed",
+            failure_limit=3,
+            release_claim=True,
+            end_run=True,
+        )
+        second = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") in second.respawn_guarded
+    assert spawned_ids == [t]
+
+
+def test_active_pr_activity_after_unblock_rearms_guard(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """A new PR-bearing comment after unblock cancels the one-shot bypass."""
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+    spawned_ids = []
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review-follow-up", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        assert kb.block_task(conn, t, reason="review approved")
+        assert kb.unblock_task(conn, t)
+        kb.add_comment(
+            conn, t, "worker",
+            "Updated https://github.com/totemx-AI/subsidysmart/pull/42",
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned_ids.append(task.id),
+        )
+
+    assert (t, "active_pr") in result.respawn_guarded
+    assert spawned_ids == []
+
+
 def test_respawn_guard_merged_pr_in_comments_not_guarded(kanban_home, monkeypatch):
     """Merged/closed PRs are ignored so completed review flow can respawn."""
     monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: False)
@@ -1031,6 +1106,123 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
     # Event.payload is already parsed as a dict by list_events.
     assert isinstance(guarded_evt.payload, dict)
     assert guarded_evt.payload.get("reason") == "recent_success"
+
+
+def test_post_unblock_active_pr_guard_alert_emits_once_after_fifteen_minutes(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """A stale post-unblock active-PR guard emits one dashboard-visible alert."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="stale-active-pr", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 1200, now - 1100),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', ?, ?)",
+            (t, '{"comment_cursor": 0}', now - 1000),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "Updated https://github.com/acme/widget/pull/7", now - 990),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'respawn_guarded', ?, ?)",
+            (t, '{"reason": "active_pr"}', now - 901),
+        )
+
+        first = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: None)
+        second = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: None)
+        events = kb.list_events(conn, t)
+
+    assert (t, "active_pr") in first.respawn_guarded
+    assert (t, "active_pr") in second.respawn_guarded
+    alerts = [e for e in events if e.kind == "respawn_guard_age_alert"]
+    assert len(alerts) == 1
+    assert alerts[0].payload == {
+        "reason": "active_pr",
+        "age_seconds": 901,
+        "threshold_seconds": kb._RESPAWN_GUARD_ALERT_SECONDS,
+        "since_unblocked_at": now - 1000,
+        "first_guarded_at": now - 901,
+    }
+
+
+def test_post_unblock_active_pr_guard_alert_waits_fifteen_minutes(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """The active-PR alert is not emitted before the stale threshold."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+    monkeypatch.setattr(kb, "_github_pr_is_open", lambda match, cache=None: True)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fresh-active-pr-guard", assignee="alice")
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'blocked', ?, ?)",
+            (t, now - 1200, now - 1100),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', ?, ?)",
+            (t, '{"comment_cursor": 0}', now - 1000),
+        )
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, 'worker', ?, ?)",
+            (t, "Updated https://github.com/acme/widget/pull/7", now - 990),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'respawn_guarded', ?, ?)",
+            (t, '{"reason": "active_pr"}', now - 899),
+        )
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: None)
+        events = kb.list_events(conn, t)
+
+    assert (t, "active_pr") in result.respawn_guarded
+    assert not [e for e in events if e.kind == "respawn_guard_age_alert"]
+
+
+def test_post_unblock_stale_alert_ignores_unrelated_guard_reasons(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    """The new alert does not change quota/auth guard event behavior."""
+    now = int(time.time())
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="quota-guard", assignee="alice")
+        conn.execute(
+            "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+            ("quota exceeded", t),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'unblocked', ?, ?)",
+            (t, '{"comment_cursor": 0}', now - 1000),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'respawn_guarded', ?, ?)",
+            (t, '{"reason": "blocker_auth"}', now - 901),
+        )
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: None)
+        events = kb.list_events(conn, t)
+
+    assert (t, "blocker_auth") in result.respawn_guarded
+    assert not [e for e in events if e.kind == "respawn_guard_age_alert"]
 
 
 # ---------------------------------------------------------------------------
