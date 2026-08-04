@@ -7198,6 +7198,8 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    run_summary: Optional[str] = None,
+    run_metadata: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -7223,6 +7225,12 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    ``run_summary`` and ``run_metadata`` optionally preserve a structured
+    worker handoff on the run row. Ordinary blocks keep the historical
+    behavior of using ``reason`` as the run summary. Keeping these fields in
+    the same transaction as the state transition ensures a failed optional
+    comment cannot strand a blocked task without its resume context.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -7241,6 +7249,7 @@ def block_task(
         kind = "needs_input"
     routed_to = "blocked"
     recurrences = 0
+    effective_run_summary = reason if run_summary is None else run_summary
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -7298,11 +7307,16 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=effective_run_summary,
+                metadata=run_metadata,
             )
-            if run_id is None and reason:
+            if run_id is None and (effective_run_summary or run_metadata):
                 run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+                    conn,
+                    task_id,
+                    outcome="blocked",
+                    summary=effective_run_summary,
+                    metadata=run_metadata,
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
@@ -7366,11 +7380,16 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=effective_run_summary,
+                metadata=run_metadata,
             )
-            if run_id is None and reason:
+            if run_id is None and (effective_run_summary or run_metadata):
                 run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="blocked", summary=reason,
+                    conn,
+                    task_id,
+                    outcome="blocked",
+                    summary=effective_run_summary,
+                    metadata=run_metadata,
                 )
             _append_event(
                 conn, task_id, "block_loop_detected",
@@ -7432,15 +7451,17 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=effective_run_summary,
+                metadata=run_metadata,
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
-            if run_id is None and reason:
+            if run_id is None and (effective_run_summary or run_metadata):
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
-                    summary=reason,
+                    summary=effective_run_summary,
+                    metadata=run_metadata,
                 )
             _append_event(
                 conn, task_id, "blocked",
