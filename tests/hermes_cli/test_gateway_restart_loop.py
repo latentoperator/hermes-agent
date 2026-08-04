@@ -550,6 +550,45 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            '-c "print(1)"',
+            "- <<'PY'\nprint(1)\nPY",
+        ],
+    )
+    def test_absolute_python_interpreter_commands_pass_through(
+        self, monkeypatch, tmp_path, arguments
+    ):
+        """Binary interpreters are commands, not referenced shell scripts."""
+        import tools.terminal_tool as tt
+
+        calls = []
+        interpreter = tmp_path / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        # Deterministic binary payload whose decoded text contains a path with
+        # an embedded NUL, matching the production interpreter failure class.
+        interpreter.write_bytes(b"/tmp/from-binary\x00junk")
+        interpreter.chmod(0o700)
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "1", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = f"{interpreter} {arguments}"
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt
@@ -718,6 +757,53 @@ class TestLifecycleGuardModule:
             '/usr/bin/python3 -c "print(1)"'
         )
         assert result is False
+
+    def test_remote_binary_reader_output_is_not_retokenized(self, tmp_path):
+        """A remote executable's NUL-bearing bytes are not shell source."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        interpreter = tmp_path / "remote" / "venv" / "bin" / "python"
+        reads = []
+
+        def read_remote_script(path):
+            reads.append(path)
+            return "/tmp/from-binary\x00junk"
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f'{interpreter} -c "print(1)"',
+            read_remote_script=read_remote_script,
+        )
+
+        assert result is False
+        assert reads == [str(interpreter)]
+
+    def test_embedded_nul_in_parser_derived_path_does_not_crash(self):
+        """Invalid parser-derived paths are rejected before the OS open call."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        assert not contains_gateway_lifecycle_command_or_referenced_script(
+            "/tmp/from-binary\x00junk"
+        )
+
+    def test_absolute_python_interpreter_lifecycle_payload_still_blocks(
+        self, tmp_path
+    ):
+        """Skipping interpreter binaries must not skip command-text scanning."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        interpreter = tmp_path / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_bytes(b"\x7fELF\x00binary")
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            f'{interpreter} -c "hermes gateway restart"'
+        )
 
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
