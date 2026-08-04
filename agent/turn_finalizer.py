@@ -66,6 +66,89 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _kanban_budget_stop_reason(api_call_count: int, max_iterations: int) -> str:
+    return (
+        f"Iteration budget exhausted ({api_call_count}/{max_iterations}). "
+        "Review the saved handoff and decompose or narrow the remaining scope "
+        "before re-dispatch."
+    )
+
+
+def _kanban_worker_run_id() -> int | None:
+    raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _stop_kanban_on_budget_exhaustion(
+    kb,
+    conn,
+    task_id: str,
+    *,
+    final_response,
+    api_call_count: int,
+    max_iterations: int,
+    session_id,
+    logger,
+) -> bool:
+    """Stop a Kanban task on first budget exhaustion with a durable handoff.
+
+    The task transition and run summary/metadata are one DB transaction via
+    ``block_task``. The human-friendly comment is deliberately best-effort:
+    run history remains the canonical resume context if comment persistence
+    fails.
+    """
+    reason = _kanban_budget_stop_reason(api_call_count, max_iterations)
+    summary = str(final_response or "").strip() or reason
+    worker_session_id = str(session_id or "").strip() or None
+    metadata = {
+        "worker_session_id": worker_session_id,
+        "budget_used": api_call_count,
+        "budget_max": max_iterations,
+        "stop_reason": "iteration_budget_exhausted",
+        "resume_action": "review_and_decompose",
+    }
+    stopped = kb.block_task(
+        conn,
+        task_id,
+        reason=reason,
+        kind="needs_input",
+        expected_run_id=_kanban_worker_run_id(),
+        run_summary=summary,
+        run_metadata=metadata,
+    )
+    if not stopped:
+        return False
+
+    comment_summary = summary
+    if len(comment_summary) > 4000:
+        comment_summary = comment_summary[:4000] + "… [truncated]"
+    comment = (
+        "Iteration-budget handoff created automatically.\n\n"
+        f"Budget: {api_call_count}/{max_iterations} model calls.\n"
+        f"Worker session: {worker_session_id or '(unknown)'}\n"
+        "The task was stopped on the first exhaustion rather than retried "
+        "unchanged. Review the saved workspace/branch state and decompose or "
+        "narrow the remaining scope before re-dispatch.\n\n"
+        "Final model summary:\n"
+        f"{comment_summary}"
+    )
+    try:
+        kb.add_comment(conn, task_id, "worker", comment)
+    except Exception:
+        logger.warning(
+            "Failed to add budget-exhaustion handoff comment for task %s; "
+            "run summary and metadata remain durable",
+            task_id,
+            exc_info=True,
+        )
+    return True
+
+
 def finalize_turn(
     agent,
     *,
@@ -142,42 +225,42 @@ def finalize_turn(
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
-        # If running as a kanban worker, signal the dispatcher that the
-        # worker could not complete (rather than treating it as a
-        # protocol violation). This applies whether the user-facing fallback
-        # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
-        #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
+        # A Kanban worker's first budget exhaustion is a decomposition signal,
+        # not permission to retry unchanged scope. Stop the task in a visible
+        # human-input state and preserve the final model summary + worker
+        # session id on the closed run. This applies whether the fallback came
+        # from the toolless summary call or a pending continuation candidate.
+        # Non-Kanban turns never enter this branch and retain prior behavior.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
-                    _kb._record_task_failure(
+                    _stopped = _stop_kanban_on_budget_exhaustion(
+                        _kb,
                         _conn,
                         _kanban_task,
-                        error=(
-                            f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
-                            "task could not complete within the allowed "
-                            "iterations"
-                        ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
-                            "budget_used": api_call_count,
-                            "budget_max": agent.max_iterations,
-                        },
+                        final_response=final_response,
+                        api_call_count=api_call_count,
+                        max_iterations=agent.max_iterations,
+                        session_id=getattr(agent, "session_id", None),
+                        logger=logger,
                     )
-                    logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
-                    )
+                    if _stopped:
+                        logger.info(
+                            "stopped budget-exhausted task %s with durable "
+                            "handoff (%d/%d)",
+                            _kanban_task,
+                            api_call_count,
+                            agent.max_iterations,
+                        )
+                    else:
+                        logger.warning(
+                            "Did not stop budget-exhausted task %s because its "
+                            "run/state no longer matched this worker",
+                            _kanban_task,
+                        )
                 finally:
                     try:
                         _conn.close()
@@ -185,7 +268,7 @@ def finalize_turn(
                         pass
             except Exception:
                 logger.warning(
-                    "Failed to record budget-exhausted failure for task %s",
+                    "Failed to stop budget-exhausted task %s",
                     _kanban_task,
                     exc_info=True,
                 )

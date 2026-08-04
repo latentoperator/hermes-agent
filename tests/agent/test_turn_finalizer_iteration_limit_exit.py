@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.turn_finalizer import finalize_turn
+from hermes_cli import kanban_db as kb
 
 
 class _LimitAgent:
@@ -165,13 +166,16 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
-def test_pending_response_records_kanban_timeout(monkeypatch):
+def test_pending_response_stops_kanban_task_with_durable_handoff(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
-    record = MagicMock(name="record_task_failure")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    block = MagicMock(name="block_task", return_value=True)
+    comment = MagicMock(name="add_comment")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db.block_task", block)
+    monkeypatch.setattr("hermes_cli.kanban_db.add_comment", comment)
     agent = _LimitAgent()
 
     result = _finalize(
@@ -182,18 +186,159 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
     assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
-    record.assert_called_once_with(
+    block.assert_called_once_with(
         conn,
         "task-123",
-        error=(
-            "Iteration budget exhausted (60/60) — task could not complete "
-            "within the allowed iterations"
+        reason=(
+            "Iteration budget exhausted (60/60). Review the saved handoff and "
+            "decompose or narrow the remaining scope before re-dispatch."
         ),
-        outcome="timed_out",
-        release_claim=True,
-        end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        kind="needs_input",
+        expected_run_id=42,
+        run_summary="composed report",
+        run_metadata={
+            "worker_session_id": "sess-test",
+            "budget_used": 60,
+            "budget_max": 60,
+            "stop_reason": "iteration_budget_exhausted",
+            "resume_action": "review_and_decompose",
+        },
     )
+    comment.assert_called_once()
+
+
+def _run_real_kanban_budget_exhaustion(
+    monkeypatch,
+    tmp_path,
+    *,
+    fail_comment=False,
+):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="oversized task",
+            assignee="wren",
+            workspace_kind="scratch",
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="test-worker")
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        kb._set_worker_pid(conn, task_id, 12345)
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    if fail_comment:
+        def _fail_comment(*_args, **_kwargs):
+            raise OSError("comment store unavailable")
+
+        monkeypatch.setattr(kb, "add_comment", _fail_comment)
+
+    agent = _LimitAgent(max_iterations=3)
+    agent.session_id = "sess-budget-handoff"
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        api_call_count=3,
+    )
+    return task_id, run_id, result
+
+
+def test_first_kanban_budget_exhaustion_closes_claim_and_preserves_handoff(
+    monkeypatch, tmp_path
+):
+    task_id, run_id, result = _run_real_kanban_budget_exhaustion(
+        monkeypatch, tmp_path
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+        context = kb.build_worker_context(conn, task_id)
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.block_kind == "needs_input"
+    assert task.current_run_id is None
+    assert task.claim_lock is None
+    assert task.claim_expires is None
+    assert task.worker_pid is None
+    assert task.consecutive_failures == 0
+    assert task.last_failure_error is None
+
+    assert len(runs) == 1
+    run = runs[0]
+    assert run.id == run_id
+    assert run.status == "blocked"
+    assert run.outcome == "blocked"
+    assert run.ended_at is not None
+    assert run.claim_lock is None
+    assert run.claim_expires is None
+    assert run.worker_pid is None
+    assert run.summary == "summary from extra call"
+    assert run.metadata == {
+        "worker_session_id": "sess-budget-handoff",
+        "budget_used": 3,
+        "budget_max": 3,
+        "stop_reason": "iteration_budget_exhausted",
+        "resume_action": "review_and_decompose",
+    }
+
+    assert comments
+    assert "summary from extra call" in comments[-1].body
+    assert "sess-budget-handoff" in comments[-1].body
+    assert "summary from extra call" in context
+    assert "sess-budget-handoff" in context
+    assert result["final_response"] == "summary from extra call"
+    assert result["completed"] is False
+
+
+def test_budget_handoff_survives_optional_comment_failure(monkeypatch, tmp_path):
+    task_id, _run_id, _result = _run_real_kanban_budget_exhaustion(
+        monkeypatch,
+        tmp_path,
+        fail_comment=True,
+    )
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        run = kb.latest_run(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+
+    assert task is not None
+    assert task.status == "blocked"
+    assert task.current_run_id is None
+    assert run is not None
+    assert run.outcome == "blocked"
+    assert run.summary == "summary from extra call"
+    assert run.metadata is not None
+    assert run.metadata["worker_session_id"] == "sess-budget-handoff"
+    assert comments == []
+
+
+def test_non_kanban_budget_exhaustion_does_not_touch_board(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    block = MagicMock(name="block_task")
+    monkeypatch.setattr("hermes_cli.kanban_db.block_task", block)
+    agent = _LimitAgent(max_iterations=3)
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        api_call_count=3,
+    )
+
+    block.assert_not_called()
+    assert result["final_response"] == "summary from extra call"
+    assert result["completed"] is False
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
