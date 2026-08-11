@@ -1,5 +1,6 @@
 """Tests for hermes_constants module."""
 
+import io
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -359,6 +360,42 @@ class TestIsContainer:
         self._reset_cache(monkeypatch)
         monkeypatch.setattr(os.path, "exists", lambda p: False)
         monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.43.0.1")
+        assert is_container() is True
+
+    def test_ignores_unrelated_containerd_mounts_on_host(self, monkeypatch):
+        self._reset_cache(monkeypatch)
+        monkeypatch.setattr(os.path, "exists", lambda _p: False)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+        files = {
+            "/proc/1/cgroup": "0::/\n",
+            "/proc/self/mountinfo": (
+                "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+                "73 22 0:55 / /var/lib/containerd/io.containerd.snapshotter.v1 "
+                "rw - overlay overlay rw\n"
+            ),
+        }
+        monkeypatch.setattr(
+            "builtins.open",
+            lambda path, *_a, **_kw: io.StringIO(files[path]),
+        )
+
+        assert is_container() is False
+
+    def test_detects_container_marker_on_root_mount(self, monkeypatch):
+        self._reset_cache(monkeypatch)
+        monkeypatch.setattr(os.path, "exists", lambda _p: False)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+        files = {
+            "/proc/1/cgroup": "0::/\n",
+            "/proc/self/mountinfo": (
+                "22 1 0:55 /containerd/rootfs / rw - overlay overlay rw\n"
+            ),
+        }
+        monkeypatch.setattr(
+            "builtins.open",
+            lambda path, *_a, **_kw: io.StringIO(files[path]),
+        )
+
         assert is_container() is True
 
 
