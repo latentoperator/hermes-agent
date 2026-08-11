@@ -1259,7 +1259,7 @@ class SessionStore:
     """
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+                 has_active_processes_fn=None, session_db=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
@@ -1324,7 +1324,11 @@ class SessionStore:
         # diagnostics exactly where they were: the live-DB isolation guard
         # still raises during construction, and the JSONL-fallback warning
         # is still printed once at startup rather than on first use.
-        self._db_pinned = _DB_UNPINNED
+        # Fleet reset passes an already-open database so it can operate on an
+        # explicitly selected profile.  Pin that injected handle; otherwise
+        # production stores continue resolving one cached handle per active
+        # profile scope.
+        self._db_pinned = session_db if session_db is not None else _DB_UNPINNED
         self._db_handles: Dict[Path, Any] = {}
         self._db_handles_lock = threading.Lock()
         # profile name -> its HERMES_HOME (or None to use the ambient scope).
@@ -1355,7 +1359,8 @@ class SessionStore:
             self._routing_home: Optional[Path] = Path(get_hermes_home())
         except Exception:
             self._routing_home = None
-        self._open_session_db_for_active_scope()
+        if session_db is None:
+            self._open_session_db_for_active_scope()
 
     def _open_session_db_for_active_scope(self, db_path: Optional[Path] = None):
         """Return the SessionDB for the profile scope active on this task.
