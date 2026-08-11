@@ -1334,6 +1334,33 @@ class TestEventBridgePollE2E:
         assert result["events"][0]["session_key"] == "agent:main:telegram:dm:late"
         assert result["events"][0]["content"].startswith("Hello from a freshly")
 
+    def test_poll_detects_same_second_nanosecond_db_change(self, tmp_path, monkeypatch):
+        import mcp_serve
+
+        db_path = tmp_path / "state.db"
+        db_path.write_text("placeholder")
+        baseline_ns = 1_700_000_000_000_000_000
+        os.utime(db_path, ns=(baseline_ns, baseline_ns))
+
+        index_loads = []
+        monkeypatch.setattr(
+            mcp_serve,
+            "_load_sessions_index",
+            lambda: index_loads.append(True) or {},
+        )
+
+        bridge = mcp_serve.EventBridge()
+        bridge._state_db_mtime = db_path.stat().st_mtime_ns
+        os.utime(db_path, ns=(baseline_ns + 1, baseline_ns + 1))
+        assert db_path.stat().st_mtime == baseline_ns / 1_000_000_000
+
+        class DB:
+            def get_messages(self, _sid):
+                return []
+
+        bridge._poll_once(DB())
+        assert index_loads == [True]
+
     def test_startup_baseline_suppresses_historical_replay(self, tmp_path, monkeypatch):
         """start()'s baseline records existing history without emitting it, so a
         fresh EventBridge does not replay stored messages on startup; only
