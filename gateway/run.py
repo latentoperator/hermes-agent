@@ -16234,6 +16234,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "status": self._handle_status_command,
                 "context": self._handle_context_command,
                 "restart": self._handle_restart_command,
+                "fleet": self._handle_fleet_command,
                 "approve": self._handle_approve_command,
                 "deny": self._handle_deny_command,
                 "pause": self._handle_pause_command,
@@ -17411,6 +17412,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "restart":
             return await self._handle_restart_command(event)
+
+        if canonical == "fleet":
+            return await self._handle_fleet_command(event)
         
         if canonical == "stop":
             return await self._handle_stop_command(event)
