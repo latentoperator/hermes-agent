@@ -153,6 +153,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                busy_policy="interrupt_then_dispatch", busy_handler="new"),
     CommandDef("topic", "Enable or inspect Telegram DM topic sessions", "Session",
                gateway_only=True, args_hint="[off|help|session-id]"),
+    CommandDef("fleet", "Fleet operations across Hermes profiles", "Session",
+               gateway_only=True, args_hint="reset-session <all|profile[,profile]>",
+               subcommands=("reset-session",), busy_policy="dispatch"),
     CommandDef("clear", "Clear screen and start a new session", "Session",
                cli_only=True, desktop="terminal"),
     CommandDef("redraw", "Force a full UI repaint (recovers from terminal drift)", "Session",
@@ -1478,7 +1481,13 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+#   - fleet: rare, destructive multi-profile maintenance; reached via
+#     /hermes fleet on Slack instead of displacing a daily-use native slash.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup", "moa", "debug", "egress", "init", "version", "diff", "update",
+    "heartbeat", "refine", "review", "pause", "whoami", "platform",
+    "insights", "fleet",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:
