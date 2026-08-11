@@ -695,6 +695,16 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_skill_prose_near_hermes_gateway_does_not_match_kill_branch(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        assert not contains_gateway_lifecycle_command_or_referenced_script(
+            "Read archived SKILL.md files across the Hermes fleet; no "
+            "gateway or runtime state was changed."
+        )
+
     def test_nul_byte_in_path_token_does_not_crash_guard(self):
         """Residual #76762 class: when a NUL byte survives into the *path
         token itself* (tokenized binary-adjacent command text), ``os.open``
