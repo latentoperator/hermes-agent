@@ -207,6 +207,7 @@ from gateway.platforms.base import (
     cache_audio_from_url,
     cache_audio_from_bytes_async,
     cache_document_from_bytes_async,
+    classify_send_error,
     SUPPORTED_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit,
@@ -2488,6 +2489,26 @@ class DiscordAdapter(BasePlatformAdapter):
         message = str(exc).lower()
         return code == 10062 or (status == 404 and "unknown interaction" in message)
 
+    @staticmethod
+    def _discord_unavailable_target_kind(exc: BaseException) -> Optional[str]:
+        """Classify errors proving a captured Discord route is gone."""
+        code = getattr(exc, "code", None)
+        if code is None:
+            data = getattr(exc, "data", None)
+            if isinstance(data, dict):
+                code = data.get("code")
+        try:
+            code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code = None
+
+        text = str(exc).lower()
+        if code == 50001 or "error code: 50001" in text or "missing access" in text:
+            return "forbidden"
+        if code == 10003 or "error code: 10003" in text or "unknown channel" in text:
+            return "not_found"
+        return None
+
     def _command_sync_mutation_interval_seconds(self) -> float:
         return _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS
 
@@ -3575,12 +3596,12 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return result
 
+        nonconversational = _metadata_marks_nonconversational(metadata)
         try:
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
             if metadata and metadata.get("thread_id"):
                 thread_id = metadata["thread_id"]
-            nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
 
             channel = None
@@ -3710,17 +3731,39 @@ class DiscordAdapter(BasePlatformAdapter):
             return result
 
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
+            unavailable_target_kind = self._discord_unavailable_target_kind(e)
+            error_kind = unavailable_target_kind or classify_send_error(e)
+            if nonconversational and unavailable_target_kind is not None:
+                logger.debug(
+                    "[%s] Skipping non-conversational Discord send to "
+                    "unavailable target: %s",
+                    self.name,
+                    e,
+                )
+            else:
+                logger.error(
+                    "[%s] Failed to send Discord message: %s",
+                    self.name,
+                    e,
+                    exc_info=True,
+                )
             if _is_discord_transport_error(e):
                 # Connection-shaped failure (WS drop / closed session): use
                 # the ledger's runtime-retryable marker so the reconnect
                 # sweep can replay this final response instead of stranding
                 # it until a process restart (#95382 silent partial loss).
                 result = SendResult(
-                    success=False, error="send_path_degraded", retryable=True
+                    success=False,
+                    error="send_path_degraded",
+                    error_kind=error_kind,
+                    retryable=True,
                 )
             else:
-                result = SendResult(success=False, error=str(e))
+                result = SendResult(
+                    success=False,
+                    error=str(e),
+                    error_kind=error_kind,
+                )
             await asyncio.to_thread(
                 self._record_discord_response,
                 reply_to=reply_to,
