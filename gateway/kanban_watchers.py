@@ -476,11 +476,8 @@ class GatewayKanbanWatchersMixin:
                     try:
                         plat = _Platform(platform_str)
                     except ValueError:
-                        # Unknown platform string; skip and advance cursor so
-                        # we don't replay forever.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
+                        # The atomic claim already advanced the cursor, so an
+                        # unknown platform cannot replay forever.
                         continue
                     sub_profile = sub.get("notifier_profile") or ""
                     # Route via the SAME chokepoint the authorization path uses
@@ -965,14 +962,9 @@ class GatewayKanbanWatchersMixin:
                                     )
                                 continue
 
-                        # Delivery complete (text ping for push adapters, wake
-                        # self-post for non-push, wake injection for wake-only
-                        # push subs): advance cursor. The cursor is the dedup
-                        # mechanism — it prevents re-delivery of the same
-                        # event on subsequent ticks.
-                        await asyncio.to_thread(
-                            self._kanban_advance, sub, d["cursor"], board_slug,
-                        )
+                        # Delivery complete. The atomic claim already advanced
+                        # the cursor; writing it again here could finish after a
+                        # newer claim and regress progress to a stale value.
                         if not _is_push_adapter:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
