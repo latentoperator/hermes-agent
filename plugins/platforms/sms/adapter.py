@@ -507,10 +507,17 @@ async def _standalone_send(
 
 
 def _is_connected(config) -> bool:
-    """SMS is connected when Twilio credentials are present. Mirrors the legacy
-    _PLATFORM_CONNECTED_CHECKERS[Platform.SMS] = bool(TWILIO_ACCOUNT_SID)."""
-    import hermes_cli.gateway as gateway_mod
-    return bool((gateway_mod.get_env_value("TWILIO_ACCOUNT_SID") or "").strip())
+    """Return whether the complete outbound Twilio identity is configured.
+
+    Fleet-wide secret hydration can expose a shared SID/token to profiles that
+    do not run SMS.  A sender number is required to reply, so partial shared
+    credentials must not auto-enable the plugin.
+    """
+    return bool(
+        str(_get_scoped_secret("TWILIO_ACCOUNT_SID", "") or "").strip()
+        and str(_get_scoped_secret("TWILIO_AUTH_TOKEN", "") or "").strip()
+        and (os.getenv("TWILIO_PHONE_NUMBER") or "").strip()
+    )
 
 
 def _build_adapter(config):
