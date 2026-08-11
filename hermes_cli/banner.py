@@ -193,6 +193,20 @@ def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str
     return (result.stdout or "").strip()
 
 
+def _canonical_main_remote(repo_dir: Path) -> str:
+    """Return the remote that tracks canonical Nous Research main.
+
+    Fork checkouts conventionally keep the fork as ``origin`` and add Nous as
+    ``upstream``. Prefer any remote whose URL resolves to the official repo,
+    then fall back to the standard origin remote for single-remote installs.
+    """
+    for remote in ("upstream", "origin"):
+        url = _git_stdout(["remote", "get-url", remote], cwd=repo_dir)
+        if _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL:
+            return remote
+    return "origin"
+
+
 def _github_compare_behind(current_rev: str, target_rev: str) -> Optional[int]:
     """Exact behind-count via the GitHub compare API for uncountable graphs.
 
@@ -280,11 +294,13 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+    """Count commits behind canonical Nous Research main."""
     from hermes_cli._subprocess_compat import noninteractive_git_env
 
-    origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
+    remote = _canonical_main_remote(repo_dir)
+    remote_url = _git_stdout(["remote", "get-url", remote], cwd=repo_dir)
+    base_ref = f"{remote}/main"
+    if _is_official_ssh_remote(remote_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         if not head_rev:
             return None
@@ -343,10 +359,10 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # on this repo — measured 3.0 s vs 0.55 s scoped) and can burn the full
         # 10 s timeout on slow links. ``cmd_update`` already scopes its fetch
         # for the same reason. Modern git updates the ``origin/main`` tracking
-        # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
+        # ref on a scoped fetch, so the ``HEAD..<remote>/main`` count below is
         # unaffected; the shallow path compares against FETCH_HEAD, which a
         # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
+        fetch_args = ["git", "fetch", remote, "main"]
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
@@ -371,7 +387,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         if not is_shallow:
             try:
                 result = subprocess.run(
-                    ["git", "rev-list", "--count", "HEAD..origin/main"],
+                    ["git", "rev-list", "--count", f"HEAD..{base_ref}"],
                     capture_output=True, text=True, encoding="utf-8", errors="replace",
                     timeout=5,
                     cwd=str(repo_dir),
@@ -387,11 +403,11 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     if is_shallow:
         # No history to count across the shallow boundary. `origin/main` may not
         # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
+        # updated by the fetch above) and fall back to the tracking ref.
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", base_ref], cwd=repo_dir)
         )
         if not head_rev or not target_rev:
             return None
@@ -406,7 +422,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{base_ref}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=5,
             cwd=str(repo_dir),
@@ -423,7 +439,7 @@ def check_for_updates() -> Optional[int]:
 
     Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
     it to upstream main via ``git ls-remote``. Otherwise look for a local
-    git checkout and count commits behind ``origin/main``.
+    git checkout and count commits behind canonical Nous Research main.
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
@@ -533,6 +549,15 @@ def _git_short_hash(repo_dir: Path, rev: str) -> Optional[str]:
 _git_banner_state_cache: Optional[tuple] = None  # (state_or_None,) once computed
 
 
+def _git_banner_base_ref(repo_dir: Path) -> Optional[str]:
+    """Return the best available canonical-main ref for a source checkout."""
+    preferred = f"{_canonical_main_remote(repo_dir)}/main"
+    for ref in dict.fromkeys((preferred, "origin/main")):
+        if _git_short_hash(repo_dir, ref):
+            return ref
+    return None
+
+
 def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     """Return upstream/local git hashes for the startup banner.
 
@@ -574,7 +599,8 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
             pass
         return None
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    base_ref = _git_banner_base_ref(repo_dir)
+    upstream = _git_short_hash(repo_dir, base_ref) if base_ref else None
     local = _git_short_hash(repo_dir, "HEAD")
     if not upstream or not local:
         # Live-git lookup failed (e.g. shallow clone without origin/main).
@@ -591,7 +617,7 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     ahead = 0
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            ["git", "rev-list", "--count", f"{base_ref}..HEAD"],
             capture_output=True,
             text=True,
             encoding="utf-8",
