@@ -107,7 +107,7 @@ _SKILLS_CACHE_KEY_FILTERED = "filtered"
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
-    O(#dirs + #categories) stat calls, not a recursive walk. Includes the
+    O(#dirs + #categories + #skills) directory entries, not a file walk. Includes the
     platform the scan's ``skill_matches_platform`` filter will use (read
     from ``agent.skill_utils``'s ``sys`` so test patches of that module
     are honored) — the scan result is platform-dependent.
@@ -118,22 +118,41 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     sig = []
     for d in dirs_to_scan:
         try:
-            m = d.stat().st_mtime
+            root_stat = d.stat()
         except OSError:
             continue
+        children = []
         try:
             with os.scandir(d) as it:
                 for entry in it:
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            em = entry.stat(follow_symlinks=False).st_mtime
-                            if em > m:
-                                m = em
+                            entry_stat = entry.stat(follow_symlinks=False)
+                            try:
+                                with os.scandir(entry.path) as child_it:
+                                    child_names = tuple(
+                                        sorted(child.name for child in child_it)
+                                    )
+                            except OSError:
+                                child_names = ()
+                            children.append(
+                                (
+                                    entry.name,
+                                    entry_stat.st_mtime_ns,
+                                    child_names,
+                                )
+                            )
                     except OSError:
                         continue
         except OSError:
             pass
-        sig.append((str(d), m))
+        sig.append(
+            (
+                str(d),
+                root_stat.st_mtime_ns,
+                tuple(sorted(children)),
+            )
+        )
     return (tuple(sig), frozenset(disabled), platform)
 
 
