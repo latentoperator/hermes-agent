@@ -2344,10 +2344,15 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
 
     # SMS (Twilio)
     twilio_sid = getenv("TWILIO_ACCOUNT_SID")
-    if twilio_sid:
+    twilio_auth = getenv("TWILIO_AUTH_TOKEN")
+    twilio_phone = getenv("TWILIO_PHONE_NUMBER")
+    # Broad fleet secret hydration may expose Twilio credentials to profiles
+    # that do not run SMS. Only auto-enable the adapter when its complete send
+    # configuration is present.
+    if twilio_sid and twilio_auth and twilio_phone:
         # Honors an explicit ``platforms.sms.enabled: false`` (#48820).
         _enable_from_env(Platform.SMS)
-        config.platforms[Platform.SMS].api_key = getenv("TWILIO_AUTH_TOKEN", "")
+        config.platforms[Platform.SMS].api_key = twilio_auth
     sms_home = getenv("SMS_HOME_CHANNEL")
     if sms_home and Platform.SMS in config.platforms:
         config.platforms[Platform.SMS].home_channel = HomeChannel(
