@@ -988,6 +988,40 @@ class TestExplicitProviderRouting:
         assert mock_openai.call_args.kwargs["api_key"] == "sk-or-env-fallback"
         assert mock_openai.call_args.kwargs["base_url"] == OPENROUTER_BASE_URL
 
+    def test_missing_openrouter_credentials_do_not_mark_payment_unhealthy(
+        self, monkeypatch, caplog
+    ):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        aux._reset_aux_unhealthy_cache()
+        with patch(
+            "agent.auxiliary_client._select_pool_entry",
+            return_value=(False, None),
+        ), caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            client, model = aux._try_openrouter()
+
+        assert client is None
+        assert model is None
+        assert not aux._is_provider_unhealthy("openrouter")
+        assert not any(
+            "payment / credit error" in record.message for record in caplog.records
+        )
+
+    def test_missing_nous_credentials_are_quiet_and_not_unhealthy(self, caplog):
+        import agent.auxiliary_client as aux
+
+        aux._reset_aux_unhealthy_cache()
+        with patch("agent.auxiliary_client._read_nous_auth", return_value=None), patch(
+            "agent.auxiliary_client._resolve_nous_runtime_api", return_value=None
+        ), caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            client, model = aux._try_nous()
+
+        assert client is None
+        assert model is None
+        assert not aux._is_provider_unhealthy("nous")
+        assert caplog.records == []
+
 
 class TestOpenRouterPaidLaneGuard:
     """Issue #75803: auxiliary auto-chain OpenRouter fallback must be
