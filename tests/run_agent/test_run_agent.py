@@ -4434,16 +4434,9 @@ class TestRunConversation:
 
     def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must signal the dispatcher when its
-        iteration budget is exhausted, otherwise the task silently re-runs
-        forever without ever tripping the failure_limit circuit breaker
-        (issue #23216 / #29747 gap 2).
-
-        As of #29747, the exhaustion path routes through
-        ``kanban_db._record_task_failure(outcome="timed_out")`` so the
-        ``consecutive_failures`` counter increments and the dispatcher's
-        ``failure_limit`` breaker eventually trips. The legacy
-        ``kanban_block`` call was replaced because blocked-outcome runs
-        bypass the failure counter.
+        iteration budget is exhausted.  The fleet policy stops the card on the
+        first exhaustion and preserves the summary as a durable handoff rather
+        than retrying unchanged work until the failure breaker trips.
         """
         self._setup_agent(agent)
         agent.max_iterations = 2
@@ -4463,13 +4456,15 @@ class TestRunConversation:
             tool_resp, tool_resp, summary_resp,
         ]
 
-        mock_record_failure = MagicMock(return_value=False)
-        mock_connect = MagicMock(return_value=MagicMock())
+        mock_block = MagicMock(return_value=True)
+        mock_comment = MagicMock()
+        mock_conn = MagicMock()
+        mock_connect = MagicMock(return_value=mock_conn)
 
         with (
             patch("run_agent.handle_function_call", return_value="ok"),
-            patch("hermes_cli.kanban_db._record_task_failure",
-                  mock_record_failure),
+            patch("hermes_cli.kanban_db.block_task", mock_block),
+            patch("hermes_cli.kanban_db.add_comment", mock_comment),
             patch("hermes_cli.kanban_db.connect", mock_connect),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -4480,20 +4475,19 @@ class TestRunConversation:
         # The agent should have reported the task as not completed.
         assert result["completed"] is False
 
-        # _record_task_failure should have been called exactly once for
-        # the exhaustion event, with outcome="timed_out".
-        assert mock_record_failure.call_count == 1, (
-            f"Expected exactly 1 _record_task_failure call, "
-            f"got {mock_record_failure.call_count}. "
-            f"Calls: {mock_record_failure.call_args_list}"
-        )
-        call = mock_record_failure.call_args_list[0]
+        mock_block.assert_called_once()
+        call = mock_block.call_args
         # Positional: (conn, task_id, ...)
         assert call.args[1] == "t_test_task_123"
-        assert call.kwargs.get("outcome") == "timed_out"
-        assert call.kwargs.get("release_claim") is True
-        assert call.kwargs.get("end_run") is True
-        assert "Iteration budget exhausted" in call.kwargs.get("error", "")
+        assert call.kwargs.get("kind") == "needs_input"
+        assert "Iteration budget exhausted" in call.kwargs.get("reason", "")
+        assert call.kwargs.get("run_summary") == (
+            "Could not finish — budget exhausted."
+        )
+        assert call.kwargs.get("run_metadata", {}).get("stop_reason") == (
+            "iteration_budget_exhausted"
+        )
+        mock_comment.assert_called_once()
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
@@ -4514,21 +4508,18 @@ class TestRunConversation:
             tool_resp, tool_resp, summary_resp,
         ]
 
-        mock_record_failure = MagicMock(return_value=False)
+        mock_block = MagicMock(return_value=True)
 
         with (
             patch("run_agent.handle_function_call", return_value="ok"),
-            patch("hermes_cli.kanban_db._record_task_failure",
-                  mock_record_failure),
+            patch("hermes_cli.kanban_db.block_task", mock_block),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
             agent.run_conversation("do stuff")
 
-        assert mock_record_failure.call_count == 0, (
-            "_record_task_failure should not be called outside kanban mode"
-        )
+        mock_block.assert_not_called()
 
     # ── Output-cap retry: safe_out uses provider available_out + request estimate ──
 
