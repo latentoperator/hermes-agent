@@ -93,6 +93,7 @@ async def test_info_button_posts_plain_explanation_without_disabling(queue_db):
         default_action="Wait until tomorrow morning",
         fire_at="2026-07-03 07:00 CT",
         requested_by="Dante morning pulse",
+        originating_profile="dante",
         explanation="This is the plain explanation.",
     )
     view = DecisionCardView(card_id=card.id, allowed_user_ids={"42"})
@@ -121,3 +122,28 @@ async def test_unauthorized_click_is_rejected(queue_db):
     interaction.response.send_message.assert_awaited_once()
     kwargs = interaction.response.send_message.call_args.kwargs
     assert kwargs.get("ephemeral") is True
+
+
+def test_decision_card_requires_originating_profile(queue_db):
+    with pytest.raises(dc.DecisionCardError, match="originating_profile is required"):
+        dc.create_card(
+            question="Should Virgil continue with the smoke card?",
+            context="The card must be attributable to the asking agent.",
+            default_action="Do nothing",
+            fire_at="2026-07-04 22:00 CT",
+            requested_by="Virgil smoke test",
+        )
+
+
+def test_decision_card_text_leads_with_asking_agent(queue_db):
+    card = dc.create_card(
+        question="Should Virgil continue with the smoke card?",
+        context="The card must be visibly attributable.",
+        default_action="Do nothing",
+        fire_at="2026-07-04 22:00 CT",
+        requested_by="Virgil smoke test",
+        source_ref="kanban:t_demo",
+        originating_profile="virgil",
+    )
+
+    assert dc.format_card_text(card).splitlines()[0] == "**Virgil asks:**"

@@ -130,8 +130,23 @@ def _clean_lines(text: str) -> list[str]:
     return [line.strip() for line in str(text or "").splitlines() if line.strip()]
 
 
+def _display_profile_name(profile: str) -> str:
+    raw = str(profile or "").strip()
+    if not raw:
+        raise DecisionCardError("originating_profile is required for decision-card display")
+    return " ".join(
+        part.capitalize()
+        for part in raw.replace("_", " ").replace("-", " ").split()
+    )
+
+
 def validate_card(
-    question: str, context: str, default_action: str, fire_at: str, requested_by: str
+    question: str,
+    context: str,
+    default_action: str,
+    fire_at: str,
+    requested_by: str,
+    originating_profile: str = "",
 ) -> None:
     q = str(question or "").strip()
     if not q:
@@ -153,6 +168,7 @@ def validate_card(
         raise DecisionCardError("fire_at is required")
     if not str(requested_by or "").strip():
         raise DecisionCardError("requested_by is required")
+    _display_profile_name(originating_profile)
 
 
 def _row_to_card(row: sqlite3.Row | dict[str, Any]) -> DecisionCard:
@@ -192,7 +208,14 @@ def create_card(
     explanation: str = "",
     conn: Optional[sqlite3.Connection] = None,
 ) -> DecisionCard:
-    validate_card(question, context, default_action, fire_at, requested_by)
+    validate_card(
+        question,
+        context,
+        default_action,
+        fire_at,
+        requested_by,
+        originating_profile,
+    )
     owns_conn = conn is None
     if conn is None:
         conn = connect()
@@ -340,10 +363,12 @@ def record_delivery(
 
 
 def format_card_text(card: DecisionCard) -> str:
+    asker = _display_profile_name(card.originating_profile)
     context_lines = _clean_lines(card.context)
     context = "\n".join(f"• {line}" for line in context_lines)
     source = f" ({card.source_ref})" if card.source_ref else ""
     return (
+        f"**{asker} asks:**\n"
         f"Decision needed: {card.question}\n\n"
         f"Context:\n{context}\n\n"
         f"Default if you do nothing: {card.default_action}\n"
@@ -355,11 +380,12 @@ def format_card_text(card: DecisionCard) -> str:
 def info_text(card: DecisionCard) -> str:
     if card.explanation.strip():
         return card.explanation.strip()
+    asker = _display_profile_name(card.originating_profile)
     return (
         f"Plain-English version:\n\n"
-        f"Dante is asking: {card.question}\n\n"
+        f"{asker} is asking: {card.question}\n\n"
         f"Why it matters: {card.context}\n\n"
-        f"If you pick Yes, Dante records approval so the asking agent can run the next step and post a receipt. "
+        f"If you pick Yes, {asker} records approval so the asking agent can run the next step and post a receipt. "
         f"No means stand down. Wait snoozes it back to the next morning brief. "
         f"If you do nothing, the stated default applies at {card.fire_at}: {card.default_action}"
     )
