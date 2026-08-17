@@ -10,10 +10,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-
-
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
-    """When cache is fresh, check_for_updates should return cached value without calling git."""
+    """A fresh cache for this exact checkout skips the network update probe."""
     from hermes_cli.banner import check_for_updates
     from hermes_cli import __version__
 
@@ -24,20 +22,59 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
 
     cache_file = tmp_path / ".update_check"
     cache_file.write_text(
-        json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}),
-        encoding="utf-8",
+        json.dumps({
+            "ts": time.time(),
+            "behind": 3,
+            "rev": None,
+            "ver": __version__,
+            "source_rev": "new-head",
+            "source_path": str(repo_dir),
+        })
     )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
+    with (
+        patch("hermes_cli.banner._resolve_repo_dir", return_value=repo_dir),
+        patch("hermes_cli.banner._git_stdout", return_value="new-head"),
+        patch("hermes_cli.banner._check_via_local_git") as mock_check,
+    ):
         result = check_for_updates()
 
     assert result == 3
-    mock_run.assert_not_called()
+    mock_check.assert_not_called()
 
 
+def test_check_for_updates_invalidates_cache_after_same_version_rebase(
+    tmp_path, monkeypatch
+):
+    """A changed checkout HEAD cannot reuse a same-version behind count."""
+    from hermes_cli import __version__
+    from hermes_cli.banner import check_for_updates
 
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    (tmp_path / ".update_check").write_text(
+        json.dumps({
+            "ts": time.time(),
+            "behind": 7,
+            "rev": None,
+            "ver": __version__,
+            "source_rev": "old-head",
+            "source_path": str(repo_dir),
+        })
+    )
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with (
+        patch("hermes_cli.banner._resolve_repo_dir", return_value=repo_dir),
+        patch("hermes_cli.banner._git_stdout", return_value="new-head"),
+        patch("hermes_cli.banner._check_via_local_git", return_value=0) as mock_check,
+    ):
+        result = check_for_updates()
+
+    assert result == 0
+    mock_check.assert_called_once_with(repo_dir)
 
 
 def test_prefetch_non_blocking():
@@ -59,8 +96,6 @@ def test_prefetch_non_blocking():
         # Wait for the background thread to finish
         banner._update_check_done.wait(timeout=5)
         assert banner._update_result == 5
-
-
 def test_upstream_main_sha_disables_git_prompts(monkeypatch):
     """The passive HTTPS probe must never inherit the interactive terminal."""
     from hermes_cli import banner
@@ -269,7 +304,5 @@ def test_check_for_updates_does_not_cache_none(tmp_path, monkeypatch):
 
     # The cache file must NOT have been written with a None result
     assert not cache_file.exists(), "None result must not be cached"
-
-
 
 
