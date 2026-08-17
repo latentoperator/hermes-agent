@@ -48,7 +48,9 @@ def test_check_allows_profile_channel_and_thread(tmp_path, monkeypatch):
     assert check_discord_outbound_allowed("111", thread_id="222").allowed is True
 
 
-def test_check_denies_unlisted_thread_even_when_parent_channel_allowed(tmp_path, monkeypatch):
+def test_check_denies_unlisted_thread_even_when_parent_channel_allowed(
+    tmp_path, monkeypatch
+):
     cfg = _write_allowlist(tmp_path)
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
     monkeypatch.setenv("HERMES_PROFILE", "wren")
@@ -64,7 +66,9 @@ def test_check_allows_thread_under_allowlisted_parent_channel(tmp_path, monkeypa
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
     monkeypatch.setenv("HERMES_PROFILE", "wren")
 
-    decision = check_discord_outbound_allowed("555", thread_id="555", parent_channel_id="777")
+    decision = check_discord_outbound_allowed(
+        "555", thread_id="555", parent_channel_id="777"
+    )
 
     assert decision.allowed is True
     assert decision.reason == "thread parent channel allowlisted"
@@ -99,20 +103,39 @@ def test_shared_thread_is_limited_to_configured_profiles(tmp_path, monkeypatch):
     cfg = _write_allowlist(tmp_path)
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
 
-    assert check_discord_outbound_allowed("999", thread_id="444", profile="dante").allowed is True
-    assert check_discord_outbound_allowed("999", thread_id="444", profile="wren").allowed is False
+    assert (
+        check_discord_outbound_allowed("999", thread_id="444", profile="dante").allowed
+        is True
+    )
+    assert (
+        check_discord_outbound_allowed("999", thread_id="444", profile="wren").allowed
+        is False
+    )
 
 
 def test_wildcard_profile_allows_any_channel_or_thread(tmp_path, monkeypatch):
     cfg = _write_allowlist(tmp_path)
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
 
-    assert check_discord_outbound_allowed("random-channel", profile="wildcard").allowed is True
-    assert check_discord_outbound_allowed("random-channel", thread_id="random-thread", profile="wildcard").allowed is True
-    assert check_discord_outbound_allowed("direct-thread", profile="wildcard").allowed is True
+    assert (
+        check_discord_outbound_allowed("random-channel", profile="wildcard").allowed
+        is True
+    )
+    assert (
+        check_discord_outbound_allowed(
+            "random-channel", thread_id="random-thread", profile="wildcard"
+        ).allowed
+        is True
+    )
+    assert (
+        check_discord_outbound_allowed("direct-thread", profile="wildcard").allowed
+        is True
+    )
 
 
-def test_thread_parent_wildcard_allows_thread_without_known_parent(tmp_path, monkeypatch):
+def test_thread_parent_wildcard_allows_thread_without_known_parent(
+    tmp_path, monkeypatch
+):
     cfg = _write_allowlist(tmp_path)
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
 
@@ -131,14 +154,18 @@ def test_disabled_profile_is_exempt(tmp_path, monkeypatch):
     cfg = _write_allowlist(tmp_path)
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
 
-    decision = check_discord_outbound_allowed("anything", thread_id="anywhere", profile="rocket")
+    decision = check_discord_outbound_allowed(
+        "anything", thread_id="anywhere", profile="rocket"
+    )
 
     assert decision.allowed is True
     assert decision.reason == "profile exempt from allowlist"
 
 
 @pytest.mark.asyncio
-async def test_discord_adapter_returns_failed_send_on_allowlist_denial(tmp_path, monkeypatch):
+async def test_discord_adapter_returns_failed_send_on_allowlist_denial(
+    tmp_path, monkeypatch
+):
     cfg = _write_allowlist(tmp_path)
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
     monkeypatch.setenv("HERMES_PROFILE", "wren")
@@ -154,12 +181,33 @@ async def test_discord_adapter_returns_failed_send_on_allowlist_denial(tmp_path,
         discord_mod.DMChannel = type("DMChannel", (), {})
         discord_mod.Thread = type("Thread", (), {})
         discord_mod.ForumChannel = type("ForumChannel", (), {})
-        discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
-        discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, secondary=2, danger=3, green=1, grey=2, blurple=2, red=3)
-        discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4, purple=lambda: 5)
+        discord_mod.ui = SimpleNamespace(
+            View=object, button=lambda *a, **k: lambda fn: fn, Button=object
+        )
+        discord_mod.ButtonStyle = SimpleNamespace(
+            success=1,
+            primary=2,
+            secondary=2,
+            danger=3,
+            green=1,
+            grey=2,
+            blurple=2,
+            red=3,
+        )
+        discord_mod.Color = SimpleNamespace(
+            orange=lambda: 1,
+            green=lambda: 2,
+            blue=lambda: 3,
+            red=lambda: 4,
+            purple=lambda: 5,
+        )
         discord_mod.Interaction = object
         discord_mod.Embed = MagicMock
-        discord_mod.app_commands = SimpleNamespace(describe=lambda **kwargs: (lambda fn: fn), choices=lambda **kwargs: (lambda fn: fn), Choice=lambda **kwargs: SimpleNamespace(**kwargs))
+        discord_mod.app_commands = SimpleNamespace(
+            describe=lambda **kwargs: lambda fn: fn,
+            choices=lambda **kwargs: lambda fn: fn,
+            Choice=lambda **kwargs: SimpleNamespace(**kwargs),
+        )
         commands_mod = MagicMock()
         commands_mod.Bot = MagicMock
         ext_mod = ModuleType("discord.ext")
@@ -172,7 +220,9 @@ async def test_discord_adapter_returns_failed_send_on_allowlist_denial(tmp_path,
 
     channel = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(id=1234)))
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
-    adapter._client = SimpleNamespace(get_channel=lambda _id: channel, fetch_channel=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _id: channel, fetch_channel=AsyncMock()
+    )
 
     result = await adapter.send("111", "blocked", metadata={"thread_id": "555"})
 
@@ -183,7 +233,9 @@ async def test_discord_adapter_returns_failed_send_on_allowlist_denial(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_discord_adapter_allows_thread_under_allowlisted_parent(tmp_path, monkeypatch):
+async def test_discord_adapter_allows_thread_under_allowlisted_parent(
+    tmp_path, monkeypatch
+):
     cfg = _write_allowlist(tmp_path)
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
     monkeypatch.setenv("HERMES_PROFILE", "wren")
@@ -197,12 +249,33 @@ async def test_discord_adapter_allows_thread_under_allowlisted_parent(tmp_path, 
         discord_mod.DMChannel = type("DMChannel", (), {})
         discord_mod.Thread = type("Thread", (), {})
         discord_mod.ForumChannel = type("ForumChannel", (), {})
-        discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
-        discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, secondary=2, danger=3, green=1, grey=2, blurple=2, red=3)
-        discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4, purple=lambda: 5)
+        discord_mod.ui = SimpleNamespace(
+            View=object, button=lambda *a, **k: lambda fn: fn, Button=object
+        )
+        discord_mod.ButtonStyle = SimpleNamespace(
+            success=1,
+            primary=2,
+            secondary=2,
+            danger=3,
+            green=1,
+            grey=2,
+            blurple=2,
+            red=3,
+        )
+        discord_mod.Color = SimpleNamespace(
+            orange=lambda: 1,
+            green=lambda: 2,
+            blue=lambda: 3,
+            red=lambda: 4,
+            purple=lambda: 5,
+        )
         discord_mod.Interaction = object
         discord_mod.Embed = MagicMock
-        discord_mod.app_commands = SimpleNamespace(describe=lambda **kwargs: (lambda fn: fn), choices=lambda **kwargs: (lambda fn: fn), Choice=lambda **kwargs: SimpleNamespace(**kwargs))
+        discord_mod.app_commands = SimpleNamespace(
+            describe=lambda **kwargs: lambda fn: fn,
+            choices=lambda **kwargs: lambda fn: fn,
+            Choice=lambda **kwargs: SimpleNamespace(**kwargs),
+        )
         commands_mod = MagicMock()
         commands_mod.Bot = MagicMock
         ext_mod = ModuleType("discord.ext")
@@ -213,9 +286,13 @@ async def test_discord_adapter_allows_thread_under_allowlisted_parent(tmp_path, 
 
     from plugins.platforms.discord.adapter import DiscordAdapter
 
-    thread = SimpleNamespace(parent_id="777", send=AsyncMock(return_value=SimpleNamespace(id=1234)))
+    thread = SimpleNamespace(
+        parent_id="777", send=AsyncMock(return_value=SimpleNamespace(id=1234))
+    )
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
-    adapter._client = SimpleNamespace(get_channel=lambda _id: thread, fetch_channel=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _id: thread, fetch_channel=AsyncMock()
+    )
 
     result = await adapter.send("555", "allowed", metadata={"thread_id": "555"})
 

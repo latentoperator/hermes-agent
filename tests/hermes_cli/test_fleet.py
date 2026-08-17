@@ -37,7 +37,9 @@ def test_reset_profile_sessions_rotates_legacy_and_primary_routes(tmp_path: Path
     sessions_dir = profile_home / "sessions"
     sessions_dir.mkdir(parents=True)
     sessions_file = sessions_dir / "sessions.json"
-    sessions_file.write_text(json.dumps({SESSION_KEY: _legacy_entry()}), encoding="utf-8")
+    sessions_file.write_text(
+        json.dumps({SESSION_KEY: _legacy_entry()}), encoding="utf-8"
+    )
 
     result = reset_profile_sessions("test", profile_home)
 
