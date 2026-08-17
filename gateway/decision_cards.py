@@ -133,10 +133,11 @@ def _clean_lines(text: str) -> list[str]:
 def _display_profile_name(profile: str) -> str:
     raw = str(profile or "").strip()
     if not raw:
-        raise DecisionCardError("originating_profile is required for decision-card display")
+        raise DecisionCardError(
+            "originating_profile is required for decision-card display"
+        )
     return " ".join(
-        part.capitalize()
-        for part in raw.replace("_", " ").replace("-", " ").split()
+        part.capitalize() for part in raw.replace("_", " ").replace("-", " ").split()
     )
 
 

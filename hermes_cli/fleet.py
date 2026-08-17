@@ -81,8 +81,7 @@ def resolve_fleet_profiles(target: str) -> list[tuple[str, Path, bool]]:
     profile_rows = {row.name: row for row in list_profiles()}
     if target == "all":
         return [
-            (row.name, row.path, row.gateway_running)
-            for row in profile_rows.values()
+            (row.name, row.path, row.gateway_running) for row in profile_rows.values()
         ]
 
     resolved: list[tuple[str, Path, bool]] = []
@@ -97,13 +96,11 @@ def resolve_fleet_profiles(target: str) -> list[tuple[str, Path, bool]]:
         if not profile_exists(name):
             raise ValueError(f"profile '{name}' does not exist")
         row = profile_rows.get(name)
-        resolved.append(
-            (
-                name,
-                get_profile_dir(name),
-                bool(row and row.gateway_running),
-            )
-        )
+        resolved.append((
+            name,
+            get_profile_dir(name),
+            bool(row and row.gateway_running),
+        ))
         seen.add(name)
 
     if not resolved:
