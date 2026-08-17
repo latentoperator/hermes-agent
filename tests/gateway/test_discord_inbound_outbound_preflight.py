@@ -21,7 +21,7 @@ def _ensure_discord_mock():
     discord_mod.MessageType = SimpleNamespace(reply="reply")
     discord_mod.ui = SimpleNamespace(
         View=object,
-        button=lambda *a, **k: (lambda fn: fn),
+        button=lambda *a, **k: lambda fn: fn,
         Button=object,
     )
     discord_mod.ButtonStyle = SimpleNamespace(
@@ -44,8 +44,8 @@ def _ensure_discord_mock():
     discord_mod.Interaction = object
     discord_mod.Embed = MagicMock
     discord_mod.app_commands = SimpleNamespace(
-        describe=lambda **kwargs: (lambda fn: fn),
-        choices=lambda **kwargs: (lambda fn: fn),
+        describe=lambda **kwargs: lambda fn: fn,
+        choices=lambda **kwargs: lambda fn: fn,
         Choice=lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
@@ -93,12 +93,16 @@ class FakeThread:
     guild = SimpleNamespace(name="Hermes @ Hopebox")
     parent = None
 
-    async def history(self, *args, **kwargs):  # pragma: no cover - not reached in deny test
+    async def history(
+        self, *args, **kwargs
+    ):  # pragma: no cover - not reached in deny test
         return []
 
 
 @pytest.mark.asyncio
-async def test_inbound_discord_message_is_dropped_before_agent_when_outbound_denied(tmp_path, monkeypatch):
+async def test_inbound_discord_message_is_dropped_before_agent_when_outbound_denied(
+    tmp_path, monkeypatch
+):
     cfg = _write_allowlist(tmp_path)
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
     monkeypatch.setenv("HERMES_PROFILE", "zelda")
@@ -134,7 +138,9 @@ async def test_inbound_discord_message_is_dropped_before_agent_when_outbound_den
 
 
 @pytest.mark.asyncio
-async def test_inbound_discord_message_runs_when_parent_thread_allowed(tmp_path, monkeypatch):
+async def test_inbound_discord_message_runs_when_parent_thread_allowed(
+    tmp_path, monkeypatch
+):
     cfg = _write_allowlist(tmp_path)
     monkeypatch.setenv("HERMES_OUTBOUND_DISCORD_ALLOWLIST_CONFIG", str(cfg))
     monkeypatch.setenv("HERMES_PROFILE", "zelda")

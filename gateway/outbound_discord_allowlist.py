@@ -5,6 +5,7 @@ ask this module whether the active Hermes profile may post to a Discord channel
 or thread before hitting Discord's API.  Denials are loud (logged and returned
 as send failures) rather than silent drops.
 """
+
 from __future__ import annotations
 
 import logging
@@ -29,7 +30,9 @@ class DiscordOutboundDecision:
 
 
 def _profile_name() -> str:
-    explicit = (os.getenv("HERMES_PROFILE") or os.getenv("HERMES_ACTIVE_PROFILE") or "").strip()
+    explicit = (
+        os.getenv("HERMES_PROFILE") or os.getenv("HERMES_ACTIVE_PROFILE") or ""
+    ).strip()
     if explicit:
         return explicit
 
@@ -107,7 +110,9 @@ def _profile_block(cfg: Mapping[str, Any], profile: str) -> Mapping[str, Any]:
     return block if isinstance(block, dict) else {}
 
 
-def _shared_thread_allowed(cfg: Mapping[str, Any], profile: str, thread_id: str | None) -> bool:
+def _shared_thread_allowed(
+    cfg: Mapping[str, Any], profile: str, thread_id: str | None
+) -> bool:
     if not thread_id:
         return False
     shared = cfg.get("shared_threads")
@@ -119,7 +124,11 @@ def _shared_thread_allowed(cfg: Mapping[str, Any], profile: str, thread_id: str 
         if _normalize_id(block.get("thread_id")) != thread_id:
             continue
         allowed_profiles = _id_set(block.get("allowed_profiles"))
-        if not allowed_profiles or profile in allowed_profiles or "*" in allowed_profiles:
+        if (
+            not allowed_profiles
+            or profile in allowed_profiles
+            or "*" in allowed_profiles
+        ):
             return True
     return False
 
@@ -157,11 +166,19 @@ def check_discord_outbound_allowed(
 
     cfg = _load_allowlist_config()
     if not cfg or not bool(cfg.get("enabled", False)):
-        return DiscordOutboundDecision(True, "allowlist disabled", active_profile, target_chat_id, target_thread_id)
+        return DiscordOutboundDecision(
+            True, "allowlist disabled", active_profile, target_chat_id, target_thread_id
+        )
 
     disabled_profiles = _id_set(cfg.get("disabled_profiles"))
     if active_profile in disabled_profiles:
-        return DiscordOutboundDecision(True, "profile exempt from allowlist", active_profile, target_chat_id, target_thread_id)
+        return DiscordOutboundDecision(
+            True,
+            "profile exempt from allowlist",
+            active_profile,
+            target_chat_id,
+            target_thread_id,
+        )
 
     block = _profile_block(cfg, active_profile)
     channels = _id_set(block.get("channels"))
@@ -174,28 +191,67 @@ def check_discord_outbound_allowed(
             or target_thread_id in threads
             or _shared_thread_allowed(cfg, active_profile, target_thread_id)
         ):
-            return DiscordOutboundDecision(True, "thread allowlisted", active_profile, target_chat_id, target_thread_id, target_parent_channel_id)
+            return DiscordOutboundDecision(
+                True,
+                "thread allowlisted",
+                active_profile,
+                target_chat_id,
+                target_thread_id,
+                target_parent_channel_id,
+            )
         if "*" in thread_parent_channels or (
-            target_parent_channel_id and target_parent_channel_id in thread_parent_channels
+            target_parent_channel_id
+            and target_parent_channel_id in thread_parent_channels
         ):
-            return DiscordOutboundDecision(True, "thread parent channel allowlisted", active_profile, target_chat_id, target_thread_id, target_parent_channel_id)
-        return DiscordOutboundDecision(False, "thread not allowlisted", active_profile, target_chat_id, target_thread_id, target_parent_channel_id)
+            return DiscordOutboundDecision(
+                True,
+                "thread parent channel allowlisted",
+                active_profile,
+                target_chat_id,
+                target_thread_id,
+                target_parent_channel_id,
+            )
+        return DiscordOutboundDecision(
+            False,
+            "thread not allowlisted",
+            active_profile,
+            target_chat_id,
+            target_thread_id,
+            target_parent_channel_id,
+        )
 
     if "*" in channels or target_chat_id in channels:
-        return DiscordOutboundDecision(True, "channel allowlisted", active_profile, target_chat_id, None)
+        return DiscordOutboundDecision(
+            True, "channel allowlisted", active_profile, target_chat_id, None
+        )
 
     # Discord threads are channels at the API level.  Some send paths address a
     # thread directly as chat_id without separate metadata.thread_id, so honor
     # thread allowlist entries for the direct target ID as well.
-    if "*" in threads or target_chat_id in threads or _shared_thread_allowed(cfg, active_profile, target_chat_id):
-        return DiscordOutboundDecision(True, "thread allowlisted", active_profile, target_chat_id, None)
+    if (
+        "*" in threads
+        or target_chat_id in threads
+        or _shared_thread_allowed(cfg, active_profile, target_chat_id)
+    ):
+        return DiscordOutboundDecision(
+            True, "thread allowlisted", active_profile, target_chat_id, None
+        )
 
     if "*" in thread_parent_channels or (
         target_parent_channel_id and target_parent_channel_id in thread_parent_channels
     ):
-        return DiscordOutboundDecision(True, "thread parent channel allowlisted", active_profile, target_chat_id, None, target_parent_channel_id)
+        return DiscordOutboundDecision(
+            True,
+            "thread parent channel allowlisted",
+            active_profile,
+            target_chat_id,
+            None,
+            target_parent_channel_id,
+        )
 
-    return DiscordOutboundDecision(False, "channel not allowlisted", active_profile, target_chat_id, None)
+    return DiscordOutboundDecision(
+        False, "channel not allowlisted", active_profile, target_chat_id, None
+    )
 
 
 def deny_message(decision: DiscordOutboundDecision) -> str:
