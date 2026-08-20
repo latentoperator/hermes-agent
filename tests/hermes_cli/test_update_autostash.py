@@ -588,6 +588,7 @@ def _setup_keep_stash_test(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "hermes_cli.gateway.find_gateway_pids", lambda **kw: [], raising=False
     )
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     return restore_calls, discard_calls, park_calls
 
 
