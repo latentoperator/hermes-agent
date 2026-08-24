@@ -190,4 +190,3 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
 
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
 
-
