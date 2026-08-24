@@ -341,6 +341,11 @@ class SessionContext:
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    # Per-turn trusted metadata used only while binding tool context. Keep it
+    # out of ``to_dict()`` so it is never treated as prompt/session metadata.
+    message_id: str = ""
+    allow_action_approval: bool = True
     
     def to_dict(self) -> Dict[str, Any]:
         return {

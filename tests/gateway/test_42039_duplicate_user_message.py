@@ -208,4 +208,3 @@ async def test_transcript_read_failure_stops_turn_before_agent_or_append(
 
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
 
-

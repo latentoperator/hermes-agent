@@ -21415,14 +21415,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
-        # Set session context variables for tools (task-local, concurrency-safe).
-        # Bind the event's real inbound message id here; SessionSource is a
-        # routing object and historically did not carry the per-turn id.
-        _session_env_tokens = self._set_session_env(
-            context,
-            message_id=str(event.message_id) if event.message_id else "",
-            allow_action_approval=not bool(getattr(event, "internal", False)),
-        )
+        # Bind trusted per-turn values before setting tool context. Keeping the
+        # call shape stable matters because gateways and tests may override the
+        # context binder while still relying on SessionContext as the contract.
+        context.message_id = str(event.message_id) if event.message_id else ""
+        context.allow_action_approval = not bool(getattr(event, "internal", False))
+        _session_env_tokens = self._set_session_env(context)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -27573,7 +27571,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context: SessionContext,
         *,
         message_id: str | None = None,
-        allow_action_approval: bool = True,
+        allow_action_approval: bool | None = None,
     ) -> list:
         """Set session context variables for the current async task.
 
@@ -27597,7 +27595,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         effective_message_id = (
             str(message_id)
             if message_id is not None
-            else (str(context.source.message_id) if context.source.message_id else "")
+            else str(
+                context.message_id
+                or context.source.message_id
+                or ""
+            )
+        )
+        effective_action_approval = (
+            context.allow_action_approval
+            if allow_action_approval is None
+            else allow_action_approval
         )
         action_approval_source = (
             build_action_approval_source(
@@ -27609,7 +27616,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=effective_message_id,
                 session_id=context.session_id,
             )
-            if allow_action_approval
+            if effective_action_approval
             else ""
         )
         return set_session_vars(
