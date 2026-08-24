@@ -38,6 +38,7 @@ needs to replace the import + call site:
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import re
 from typing import Any, Iterator
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -100,6 +101,9 @@ _SESSION_UI_SESSION_ID: ContextVar = ContextVar("HERMES_UI_SESSION_ID", default=
 # so background-process notifications stay inside the originating Telegram
 # private-chat topic (those lanes route only with thread id + reply anchor).
 _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", default=_UNSET)
+# Exact server-derived provenance for approval-gated MCP actions. Unlike the
+# model-authored approval payload, this value is bound from live turn metadata.
+_ACTION_APPROVAL_SOURCE: ContextVar = ContextVar("HERMES_ACTION_APPROVAL_SOURCE", default=_UNSET)
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 _BROWSER_CONTROL_PRINCIPAL: ContextVar = ContextVar(
@@ -156,6 +160,7 @@ _VAR_MAP = {
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
+    "HERMES_ACTION_APPROVAL_SOURCE": _ACTION_APPROVAL_SOURCE,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
     "HERMES_BROWSER_CONTROL_PRINCIPAL": _BROWSER_CONTROL_PRINCIPAL,
     "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY": _BROWSER_CONTROL_TRANSPORT_FAMILY,
@@ -242,6 +247,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    action_approval_source: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -282,6 +288,7 @@ def set_session_vars(
         _SESSION_ID.set(session_id),
         _SESSION_UI_SESSION_ID.set(ui_session_id),
         _SESSION_MESSAGE_ID.set(message_id),
+        _ACTION_APPROVAL_SOURCE.set(action_approval_source),
         _SESSION_PROFILE.set(profile),
         _BROWSER_CONTROL_PRINCIPAL.set(browser_control_principal),
         _BROWSER_CONTROL_TRANSPORT_FAMILY.set(browser_control_transport_family),
@@ -323,6 +330,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_ID,
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
+        _ACTION_APPROVAL_SOURCE,
         _SESSION_PROFILE,
         _BROWSER_CONTROL_PRINCIPAL,
         _BROWSER_CONTROL_TRANSPORT_FAMILY,
@@ -414,6 +422,54 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+_ACTION_SOURCE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def build_action_approval_source(
+    *,
+    platform: str = "",
+    source: str = "",
+    user_id: str = "",
+    scope_id: str = "",
+    chat_id: str = "",
+    thread_id: str = "",
+    message_id: str = "",
+    session_id: str = "",
+    desktop_principal: str = "",
+) -> str:
+    """Build canonical approval provenance from trusted live-turn metadata.
+
+    Empty is fail-closed: callers must not fall back to model-authored
+    ``in_session:`` values when the current surface lacks required identity.
+    """
+    import os
+
+    surface = str(platform or source or "").strip().lower()
+    uid = str(user_id or "").strip()
+    message = str(message_id or "").strip()
+    if surface == "telegram":
+        if uid.isdigit() and uid != "0" and message.isdigit() and message != "0":
+            return f"in_session:telegram:{uid}:{message}"
+        return ""
+    if surface == "discord":
+        scope = str(scope_id or "").strip()
+        channel = str(thread_id or chat_id or "").strip()
+        if all(value.isdigit() and value != "0" for value in (uid, scope, channel, message)):
+            return f"in_session:discord:{uid}:{scope}:{channel}:{message}"
+        return ""
+    if surface == "desktop":
+        principal = str(
+            desktop_principal
+            or os.environ.get("HERMES_ACTION_APPROVAL_DESKTOP_PRINCIPAL")
+            or os.environ.get("USER")
+            or ""
+        ).strip()
+        sid = str(session_id or "").strip()
+        if _ACTION_SOURCE_TOKEN.fullmatch(principal) and _ACTION_SOURCE_TOKEN.fullmatch(sid):
+            return f"in_session:desktop:{principal}:{sid}"
+    return ""
 
 
 # Surfaces that are not a human chat channel. The gateway binds a platform
