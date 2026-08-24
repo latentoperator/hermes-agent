@@ -21415,8 +21415,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build session context
         context = build_session_context(source, self.config, session_entry)
         
-        # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        # Set session context variables for tools (task-local, concurrency-safe).
+        # Bind the event's real inbound message id here; SessionSource is a
+        # routing object and historically did not carry the per-turn id.
+        _session_env_tokens = self._set_session_env(
+            context,
+            message_id=str(event.message_id) if event.message_id else "",
+            allow_action_approval=not bool(getattr(event, "internal", False)),
+        )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -27562,7 +27568,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     exc,
                 )
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self,
+        context: SessionContext,
+        *,
+        message_id: str | None = None,
+        allow_action_approval: bool = True,
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -27571,7 +27583,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
-        from gateway.session_context import set_session_vars
+        from gateway.session_context import build_action_approval_source, set_session_vars
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
         # background=True) know whether this channel can wake a later turn.
@@ -27582,6 +27594,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        effective_message_id = (
+            str(message_id)
+            if message_id is not None
+            else (str(context.source.message_id) if context.source.message_id else "")
+        )
+        action_approval_source = (
+            build_action_approval_source(
+                platform=context.source.platform.value,
+                user_id=str(context.source.user_id or ""),
+                scope_id=str(getattr(context.source, "scope_id", "") or ""),
+                chat_id=str(context.source.chat_id or ""),
+                thread_id=str(context.source.thread_id or ""),
+                message_id=effective_message_id,
+                session_id=context.session_id,
+            )
+            if allow_action_approval
+            else ""
+        )
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -27595,7 +27625,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(context.source.user_name) if context.source.user_name else "",
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             session_key=context.session_key,
-            message_id=str(context.source.message_id) if context.source.message_id else "",
+            session_id=context.session_id,
+            message_id=effective_message_id,
+            action_approval_source=action_approval_source,
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",

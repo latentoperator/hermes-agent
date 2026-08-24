@@ -4796,9 +4796,13 @@ def _set_session_context(
     cwd: str | None = None,
     *,
     ui_session_id: str = "",
+    allow_action_approval: bool = False,
 ) -> list:
     try:
-        from gateway.session_context import set_session_vars
+        from gateway.session_context import (
+            build_action_approval_source,
+            set_session_vars,
+        )
 
         # Ephemeral task IDs (background, preview) aren't in `_sessions`, so the
         # reverse-map returns "" and would clear the cwd override. Callers that
@@ -4835,10 +4839,19 @@ def _set_session_context(
                             _methods_browser_control._CLOUD_TRANSPORT_FAMILY
                         )
                     break
+        action_approval_source = (
+            build_action_approval_source(
+                source=source,
+                session_id=session_id,
+            )
+            if allow_action_approval
+            else ""
+        )
         return set_session_vars(
             session_key=session_key,
             session_id=session_id,
             source=source,
+            action_approval_source=action_approval_source,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family,
             cwd=resolved,
@@ -13318,6 +13331,7 @@ def _run_prompt_submit(
             session_tokens = _set_session_context(
                 session["session_key"],
                 ui_session_id=sid,
+                allow_action_approval=True,
             )
             _profile_home_str = session.get("profile_home")
             if _profile_home_str:
