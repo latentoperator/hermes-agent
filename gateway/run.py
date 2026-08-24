@@ -29364,7 +29364,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
+    _HONCHO_CACHE_BUSTING_MEMO: dict[
+        tuple[str, int | None, int | None, int | None], dict[str, Any]
+    ] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -29372,16 +29374,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @classmethod
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
-        """Extract Honcho identity keys, memoized by honcho.json mtime."""
+        """Extract Honcho identity keys, memoized by honcho.json file identity."""
         try:
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
 
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                stat = path.stat()
+                mtime_ns = stat.st_mtime_ns
+                ctime_ns = stat.st_ctime_ns
+                size = stat.st_size
             except OSError:
                 mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                ctime_ns = None
+                size = None
+            # Some filesystems can preserve mtime across two immediate writes.
+            # Include ctime and size so a same-tick identity-config flip still
+            # rebuilds the cached agent instead of reusing the prior peer map.
+            memo_key = (str(path), mtime_ns, ctime_ns, size)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
