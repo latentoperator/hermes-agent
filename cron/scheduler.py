@@ -7594,9 +7594,12 @@ def _run_one_job_body(
         # fires from a ticker thread with no per-turn scope. Delivery adapters
         # can also resolve credentials, so resetting after run_job would leave
         # _deliver_result unscoped. Mirrors gateway/run.py's per-turn pattern.
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
 
+        _profile_home = _get_hermes_home()
+        hydrate_profile_secret_sources(_profile_home)
         _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
+            build_profile_secret_scope(_profile_home)
         )
         # Same isolation for terminal settings (third profile seam; see
         # gateway/run.py _profile_runtime_scope): installs the firing
