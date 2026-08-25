@@ -3659,6 +3659,44 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     return None
 
 
+def _deliver_result_in_profile_scope(
+    job: dict,
+    content: str,
+    *,
+    adapters=None,
+    loop=None,
+) -> Optional[str]:
+    """Deliver with the scheduled profile's credentials installed.
+
+    A desktop backend ticks every local profile without live adapters.  Its
+    process environment belongs to the backend's own profile, so standalone
+    delivery must not fall back to that environment after the job-body scope
+    has been reset.  Rebuild the scope from the currently selected cron home
+    for the complete delivery operation, including live-adapter fallback.
+    """
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+    profile_home = _get_hermes_home()
+    hydrate_profile_secret_sources(profile_home)
+    scope_token = set_secret_scope(
+        build_profile_secret_scope(profile_home)
+    )
+    try:
+        return _deliver_result(
+            job,
+            content,
+            adapters=adapters,
+            loop=loop,
+        )
+    finally:
+        reset_secret_scope(scope_token)
+
+
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
@@ -6791,9 +6829,12 @@ def _run_one_job_body(
             reset_secret_scope,
             set_secret_scope,
         )
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
 
+        _profile_home = _get_hermes_home()
+        hydrate_profile_secret_sources(_profile_home)
         _scope_token = set_secret_scope(
-            build_profile_secret_scope(_get_hermes_home())
+            build_profile_secret_scope(_profile_home)
         )
         # Defer the cron agent's async-resource teardown until AFTER delivery.
         # run_job normally closes the agent (and reaps stale async clients) in
@@ -6980,7 +7021,7 @@ def _run_one_job_body(
                         if not owns_delivery:
                             raise _FireClaimLostDuringSideEffect
                         delivery_attempted = True
-                        delivery_error = _deliver_result(
+                        delivery_error = _deliver_result_in_profile_scope(
                             job,
                             deliver_content,
                             adapters=adapters,
@@ -7119,7 +7160,7 @@ def _run_one_job_body(
             unresolved_origin = False
             try:
                 delivery_attempted = True
-                delivery_error = _deliver_result(
+                delivery_error = _deliver_result_in_profile_scope(
                     job,
                     # Composed exactly like the normal failure delivery above.
                     # mark_job_run below records THIS run in failure_streak
