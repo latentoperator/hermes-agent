@@ -943,6 +943,45 @@ def _request_protected_instruction_approval(
             "present to approve it.")
 
 
+def _claim_kanban_protected_write_grant(
+        paths: list[str], task_id: str = "default") -> bool:
+    """Consume an exact Decision Card grant for a headless Kanban write.
+
+    Interactive sessions keep the existing one-operation prompt. This bridge
+    runs only for dispatcher workers, where ``chat -q`` has no callback/stdin
+    and a durable Decision Card is the human approval transport.
+    """
+    kanban_task = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
+    if not kanban_task or not profile:
+        return False
+
+    resolved: list[str] = []
+    for path in paths:
+        try:
+            target = _resolve_path_for_task(path, task_id)
+        except (OSError, ValueError, RuntimeError):
+            target = Path(_expand_tilde(path))
+        resolved.append(os.path.realpath(str(target)))
+
+    try:
+        from gateway.decision_cards import claim_protected_instruction_write
+
+        return claim_protected_instruction_write(
+            task_id=kanban_task,
+            profile=profile,
+            paths=resolved,
+        ) is not None
+    except Exception as exc:
+        # The Decision Card bridge is an optional authorization source, never a
+        # reason to fail open. The normal prompt/fail-closed path runs below.
+        logger.warning(
+            "protected instruction Decision Card lookup failed closed: %s",
+            exc,
+        )
+        return False
+
+
 def _check_protected_instruction_write(paths: list[str],
                                        task_id: str = "default") -> str | None:
     """Gate a write/patch touching protected instruction files.
@@ -964,6 +1003,8 @@ def _check_protected_instruction_write(paths: list[str],
         if reason:
             reasons.append(reason)
     if not reasons:
+        return None
+    if _claim_kanban_protected_write_grant(paths, task_id):
         return None
     return _request_protected_instruction_approval(reasons, task_id)
 

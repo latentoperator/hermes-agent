@@ -7627,6 +7627,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     action,
                     actor=user_display,
                     actor_id=caller_id,
+                    actor_platform="telegram",
                 )
             except Exception as exc:
                 await query.answer(text=f"Could not record decision: {exc}"[:190])

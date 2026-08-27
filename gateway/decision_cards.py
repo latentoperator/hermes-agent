@@ -19,6 +19,8 @@ from typing import Any, Iterable, Optional
 
 ACTIONS = {"yes", "no", "wait", "info"}
 ACTIVE_STATUSES = {"pending", "waiting", "info_requested"}
+PROTECTED_INSTRUCTION_WRITE_ACTION_KIND = "protected_instruction_write"
+PROTECTED_INSTRUCTION_WRITE_ACTION = "write_protected_instruction_files"
 
 
 class DecisionCardError(ValueError):
@@ -194,6 +196,102 @@ def record_event(
     )
 
 
+def _canonical_approved_paths(value: Any) -> list[str] | None:
+    """Return a sorted exact path set for a protected-write approval payload."""
+    if not isinstance(value, list) or not value:
+        return None
+    canonical: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            return None
+        path = Path(item).expanduser()
+        if not path.is_absolute():
+            return None
+        canonical.append(str(path.resolve(strict=False)))
+    if len(canonical) != len(set(canonical)):
+        return None
+    return sorted(canonical)
+
+
+def _parse_protected_instruction_write_payload(
+    raw_payload: str,
+    question: str,
+    context: str,
+) -> dict[str, Any]:
+    try:
+        payload = json.loads(raw_payload)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise DecisionCardError(
+            "protected instruction write action_payload must be valid JSON"
+        ) from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "action",
+        "task_id",
+        "paths",
+        "yes_action",
+    }:
+        raise DecisionCardError(
+            "protected instruction write payload must contain exactly "
+            "action, task_id, paths, and yes_action"
+        )
+    if payload.get("action") != PROTECTED_INSTRUCTION_WRITE_ACTION:
+        raise DecisionCardError("protected instruction write action is invalid")
+    if not str(payload.get("task_id") or "").strip():
+        raise DecisionCardError("protected instruction write task_id is required")
+    if not str(payload.get("yes_action") or "").strip():
+        raise DecisionCardError("protected instruction write yes_action is required")
+    paths = _canonical_approved_paths(payload.get("paths"))
+    if paths is None:
+        raise DecisionCardError(
+            "protected instruction write paths must be unique absolute paths"
+        )
+    visible_lines = {
+        line.strip() for line in f"{question}\n{context}".splitlines() if line.strip()
+    }
+    if any(path not in visible_lines for path in paths):
+        raise DecisionCardError(
+            "each protected instruction write exact absolute path must be a "
+            "standalone Decision Card question/context line"
+        )
+    task_id = str(payload["task_id"]).strip()
+    yes_action = str(payload["yes_action"]).strip()
+    if f"Task {task_id} — Yes: {yes_action}" not in visible_lines:
+        raise DecisionCardError(
+            "protected instruction write task_id and yes_action must be visible "
+            "as an exact 'Task <id> — Yes: <action>' line"
+        )
+    return {
+        "task_id": task_id,
+        "paths": paths,
+        "yes_action": yes_action,
+    }
+
+
+def _allowed_decision_card_actor_ids(platform: str) -> set[str]:
+    """Return explicit user ids allowed to answer cards on *platform*.
+
+    This intentionally ignores ``*``/allow-all and role-only authorization:
+    an executable approval must bind to an explicit user identity that the
+    gateway already trusts on that platform.
+    """
+    platform_key = str(platform or "").strip().lower()
+    platform_env = {
+        "discord": "DISCORD_ALLOWED_USERS",
+        "telegram": "TELEGRAM_ALLOWED_USERS",
+        "slack": "SLACK_ALLOWED_USERS",
+    }.get(platform_key)
+    if platform_env is None:
+        return set()
+    allowed: set[str] = set()
+    for key in (platform_env, "GATEWAY_ALLOWED_USERS"):
+        allowed.update(
+            value.strip()
+            for value in str(os.environ.get(key) or "").split(",")
+            if value.strip() and value.strip() != "*"
+        )
+    return allowed
+
+
 def create_card(
     *,
     question: str,
@@ -227,6 +325,8 @@ def create_card(
             if isinstance(action_payload, str)
             else json.dumps(action_payload, sort_keys=True)
         )
+        if action_kind.strip() == PROTECTED_INSTRUCTION_WRITE_ACTION_KIND:
+            _parse_protected_instruction_write_payload(payload, question, context)
         conn.execute(
             """
             INSERT INTO decision_cards(
@@ -281,6 +381,141 @@ def get_card(
         if row is None:
             raise DecisionCardError(f"decision card not found: {card_id}")
         return _row_to_card(row)
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+def claim_protected_instruction_write(
+    *,
+    task_id: str,
+    profile: str,
+    paths: Iterable[str],
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[DecisionCard]:
+    """Consume one exact answered-Yes grant for a headless Kanban file write.
+
+    The guard deliberately accepts no free text. A matching card must use the
+    dedicated action kind and an exact JSON payload containing only
+    ``action``, ``task_id``, ``paths``, and ``yes_action``. The card body must
+    show every absolute path Chris approved, and its Yes must have arrived via
+    a recorded button event with a non-empty actor id. The first matching call
+    records ``protected_write_claimed`` under ``BEGIN IMMEDIATE``; later calls
+    cannot reuse that card.
+
+    ``None`` means there is no valid, unused grant. Callers then keep their
+    normal interactive approval/fail-closed behaviour.
+    """
+    task = str(task_id or "").strip()
+    owner = str(profile or "").strip()
+    requested = _canonical_approved_paths(list(paths))
+    if not task or not owner or requested is None:
+        return None
+
+    owns_conn = conn is None
+    if conn is None:
+        conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT * FROM decision_cards
+             WHERE status='answered_yes' AND answer='yes'
+               AND action_kind=? AND originating_profile=?
+             ORDER BY answered_at DESC, created_at DESC
+            """,
+            (PROTECTED_INSTRUCTION_WRITE_ACTION_KIND, owner),
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = _parse_protected_instruction_write_payload(
+                    str(row["action_payload"] or ""),
+                    str(row["question"] or ""),
+                    str(row["context"] or ""),
+                )
+            except DecisionCardError:
+                continue
+            if payload["task_id"] != task or payload["paths"] != requested:
+                continue
+
+            answered_by = str(row["answered_by"] or "").strip()
+            button = conn.execute(
+                """
+                SELECT actor, details_json FROM decision_card_events
+                 WHERE card_id=? AND event_type='button_yes'
+                 ORDER BY id DESC LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            if (
+                not answered_by
+                or button is None
+                or str(button["actor"] or "").strip() != answered_by
+            ):
+                continue
+            try:
+                button_details = json.loads(str(button["details_json"] or "{}"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(button_details, dict):
+                continue
+            actor_id = str(button_details.get("actor_id") or "").strip()
+            actor_platform = (
+                str(button_details.get("actor_platform") or "").strip().lower()
+            )
+            if not actor_platform:
+                delivery = conn.execute(
+                    """
+                    SELECT details_json FROM decision_card_events
+                     WHERE card_id=? AND event_type='delivered'
+                     ORDER BY id DESC LIMIT 1
+                    """,
+                    (row["id"],),
+                ).fetchone()
+                try:
+                    delivery_details = (
+                        json.loads(str(delivery["details_json"] or "{}"))
+                        if delivery is not None
+                        else {}
+                    )
+                except json.JSONDecodeError:
+                    delivery_details = {}
+                if isinstance(delivery_details, dict):
+                    actor_platform = (
+                        str(delivery_details.get("platform") or "").strip().lower()
+                    )
+            if actor_id not in _allowed_decision_card_actor_ids(actor_platform):
+                continue
+
+            already_claimed = conn.execute(
+                """
+                SELECT 1 FROM decision_card_events
+                 WHERE card_id=? AND event_type='protected_write_claimed'
+                 LIMIT 1
+                """,
+                (row["id"],),
+            ).fetchone()
+            if already_claimed:
+                continue
+
+            record_event(
+                conn,
+                str(row["id"]),
+                "protected_write_claimed",
+                actor="file-tools",
+                details={
+                    "task_id": task,
+                    "profile": owner,
+                    "paths": requested,
+                },
+            )
+            conn.commit()
+            return _row_to_card(row)
+        conn.commit()
+        return None
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         if owns_conn:
             conn.close()
@@ -397,6 +632,7 @@ def handle_action(
     *,
     actor: str = "",
     actor_id: str = "",
+    actor_platform: str = "",
     message_id: str = "",
     channel_id: str = "",
     thread_id: str = "",
@@ -472,6 +708,7 @@ def handle_action(
             actor=display_actor,
             details={
                 "actor_id": actor_id,
+                "actor_platform": str(actor_platform or "").strip().lower(),
                 "message_id": message_id,
                 "channel_id": channel_id,
                 "thread_id": thread_id,
@@ -496,6 +733,9 @@ __all__ = [
     "DecisionCardError",
     "ACTIONS",
     "ACTIVE_STATUSES",
+    "PROTECTED_INSTRUCTION_WRITE_ACTION",
+    "PROTECTED_INSTRUCTION_WRITE_ACTION_KIND",
+    "claim_protected_instruction_write",
     "connect",
     "create_card",
     "default_db_path",
