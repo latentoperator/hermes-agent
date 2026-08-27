@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -80,6 +81,13 @@ async def test_yes_button_updates_queue_and_disables_card(queue_db):
     assert updated.status == "answered_yes"
     assert updated.answer == "yes"
     assert updated.answered_by == "Chris"
+    with dc.connect() as conn:
+        event = conn.execute(
+            "SELECT details_json FROM decision_card_events "
+            "WHERE card_id=? AND event_type='button_yes'",
+            (card.id,),
+        ).fetchone()
+    assert json.loads(event["details_json"])["actor_platform"] == "discord"
     assert all(getattr(child, "disabled") for child in view.children)
     interaction.response.edit_message.assert_awaited_once()
     interaction.response.send_message.assert_not_awaited()
