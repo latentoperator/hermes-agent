@@ -8641,6 +8641,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
+        # A branch alignment can replace the working tree with different code
+        # before the normal HEAD..origin/<branch> comparison below.  Preserve
+        # that command-boundary baseline: once checkout lands directly on the
+        # remote tip, rev-list quite correctly reports zero even though this
+        # updater invocation changed the live source tree.
+        pre_branch_alignment_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
 
         # Parked-branch guard (2026-08-17 live incident): the checkout can be
         # left parked on a stale feature branch by earlier tooling. Blindly
@@ -8782,6 +8788,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         else:
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
 
+        post_branch_alignment_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        branch_alignment_changed_head = bool(
+            pre_branch_alignment_sha
+            and post_branch_alignment_sha
+            and pre_branch_alignment_sha != post_branch_alignment_sha
+        )
+
         prompt_for_restore = (
             auto_stash_ref is not None
             and not assume_yes
@@ -8802,6 +8815,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         commit_count = int(result.stdout.strip())
+
+        # Switching from a parked/custom branch can land directly on an
+        # already-current target branch.  There are then no remote commits to
+        # merge, but dependencies, generated assets, and the running fleet
+        # still need the same post-update treatment as a pull.
+        if commit_count == 0 and branch_alignment_changed_head:
+            commit_count = 1
 
         apply_is_shallow = (
             subprocess.run(
@@ -9067,7 +9087,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 sys.exit(1)
             return
 
-        if commit_count > 0:
+        if branch_alignment_changed_head and commit_count == 1:
+            print("→ Branch switch changed the active code checkout")
+        elif commit_count > 0:
             print(f"→ Found {commit_count} new commit(s)")
         else:
             # Shallow checkout, exact count unrecoverable (offline/rate-limited
@@ -9316,7 +9338,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # and post-pull HEAD; if they match, surface the no-op instead of
         # claiming success.
         post_pull_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_pull_sha and post_pull_sha == pre_pull_sha:
+        if (
+            pre_pull_sha
+            and post_pull_sha == pre_pull_sha
+            and not branch_alignment_changed_head
+        ):
             print()
             print("✗ Code did not move — update was a no-op.")
             print(
@@ -9411,8 +9437,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # via ``_recover_from_interrupted_install``. Cleared after the core
         # ``.[all]`` install completes — lazy refresh uses a separate marker.
         _write_update_incomplete_marker()
+        dependency_baseline_sha = (
+            pre_branch_alignment_sha
+            if branch_alignment_changed_head
+            else pre_pull_sha
+        )
         deps_current = _editable_install_is_current(
-            git_cmd, _m().PROJECT_ROOT, pre_pull_sha
+            git_cmd, _m().PROJECT_ROOT, dependency_baseline_sha
         )
         if deps_current:
             print("→ Python dependencies unchanged — skipping reinstall")

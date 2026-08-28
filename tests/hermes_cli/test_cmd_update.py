@@ -851,6 +851,68 @@ class TestCmdUpdateBranchFlag:
         merge_cmds = [c for c in commands if "merge --ff-only" in c]
         assert any("origin/bb/gui" in c and "origin/main" not in c for c in merge_cmds), merge_cmds
 
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_branch_switch_to_current_remote_tip_runs_post_update_steps(
+        self, mock_run, _mock_which, capsys
+    ):
+        """A branch checkout that changes HEAD is an update even at remote tip.
+
+        Regression for a production rollout where ``--branch`` switched from
+        a custom branch to an already-current target.  ``HEAD..origin/target``
+        was zero after checkout, so the updater returned before dependency
+        sync and fleet restart despite having replaced the active code.
+        """
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        target = "hopebox/prod"
+        branch_state = {"name": "hopebox/old-prod"}
+
+        def side_effect(cmd, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "rev-parse" in joined and "--abbrev-ref" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout=f"{branch_state['name']}\n", stderr=""
+                )
+            if " checkout " in f" {joined} ":
+                branch_state["name"] = target
+            if "rev-list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+            if "--is-shallow-repository" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="false\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        mock_run.side_effect = side_effect
+        shas = iter(["oldsha", "newsha", "newsha", "newsha"])
+
+        with patch.object(
+            hm,
+            "_assess_parked_branch_switch",
+            return_value=(True, "fully merged"),
+        ), patch.object(
+            update_cmd,
+            "_capture_head_sha",
+            side_effect=lambda *_args, **_kwargs: next(shas, "newsha"),
+        ), patch.object(
+            update_cmd,
+            "_validate_critical_files_syntax",
+            return_value=(True, None, None),
+        ), patch.object(
+            update_cmd,
+            "_write_fleet_restart_pending_marker",
+            side_effect=SystemExit(0),
+        ) as restart_marker:
+            with pytest.raises(SystemExit) as exit_info:
+                cmd_update(SimpleNamespace(branch=target, yes=True))
+
+        assert exit_info.value.code == 0
+        restart_marker.assert_called_once_with(expected_sha="newsha")
+        out = capsys.readouterr().out
+        assert "Branch switch changed the active code checkout" in out
+        assert "Already up to date!" not in out
+        assert "Code did not move" not in out
+
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
