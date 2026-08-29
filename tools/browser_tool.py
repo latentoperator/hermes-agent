@@ -377,8 +377,11 @@ def get_browser_snapshot_threshold() -> int:
 
     result = DEFAULT_SNAPSHOT_THRESHOLD
     try:
-        from hermes_cli.config import read_raw_config
-        cfg = read_raw_config()
+        # This setting has its own browser-lifecycle cache below.  Read the
+        # file uncached when that lifecycle cache is cold so cleanup reliably
+        # observes same-size rewrites that can retain an identical stat key.
+        from hermes_cli.config import read_user_config_raw
+        cfg = read_user_config_raw()
         val = cfg_get(cfg, "browser", "snapshot_threshold")
         if val is not None:
             result = max(int(val), MIN_SNAPSHOT_THRESHOLD)
