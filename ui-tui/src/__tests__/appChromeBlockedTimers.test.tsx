@@ -295,11 +295,10 @@ describe('status-chrome timers under an occluding overlay', () => {
     nowSpy.mockReturnValue(T0 + 300_000)
     rule.clear()
     resetOverlayState()
-    await flush()
-
-    const resumed = rule.output()
+    await vi.waitFor(() => expect(rule.output()).toContain('6m 0s'), { timeout: 2000 })
 
     // Caught up to real elapsed time, not stuck on the pre-overlay values.
+    const resumed = rule.output()
     expect(resumed).toContain('6m 0s')
     expect(resumed).toContain('✓ 5m 5s')
     expect(resumed).not.toContain('1m 0s')

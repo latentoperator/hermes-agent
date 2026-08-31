@@ -66,7 +66,8 @@ function Harness({
   generation = 0,
   initialHeights,
   items,
-  maxMounted = 16
+  maxMounted = 16,
+  omitKey
 }: {
   columns?: number
   expose: React.MutableRefObject<Exposed | null>
@@ -75,6 +76,7 @@ function Harness({
   initialHeights?: ReadonlyMap<string, number>
   items: readonly Item[]
   maxMounted?: number
+  omitKey?: string
 }) {
   const scrollRef = useRef<ScrollBoxHandle | null>(null)
 
@@ -98,17 +100,20 @@ function Harness({
       Box,
       { flexDirection: 'column', width: '100%' },
       virtualHistory.topSpacer > 0 ? React.createElement(Box, { height: virtualHistory.topSpacer }) : null,
-      ...items.slice(virtualHistory.start, virtualHistory.end).map(item =>
-        React.createElement(
-          Box,
-          {
-            height: itemHeightForColumns(item, columns),
-            key: item.key,
-            ref: virtualHistory.measureRef(item.key)
-          },
-          React.createElement(Text, null, item.text ?? item.key)
-        )
-      ),
+      ...items
+        .slice(virtualHistory.start, virtualHistory.end)
+        .filter(item => item.key !== omitKey)
+        .map(item =>
+          React.createElement(
+            Box,
+            {
+              height: itemHeightForColumns(item, columns),
+              key: item.key,
+              ref: virtualHistory.measureRef(item.key)
+            },
+            React.createElement(Text, null, item.text ?? item.key)
+          )
+        ),
       virtualHistory.bottomSpacer > 0 ? React.createElement(Box, { height: virtualHistory.bottomSpacer }) : null
     )
   )
@@ -528,24 +533,37 @@ describe('useVirtualHistory offset cache reuse', () => {
     })
 
     try {
-      await delay(20)
+      await vi.waitFor(() => expect(expose.current!.virtualHistory.offsets[items.length]).toBe(40), {
+        timeout: 2000
+      })
       const scroll = expose.current!.scroll!
 
       scroll.scrollTo(0)
-      await delay(20)
-      scroll.scrollTo(5)
+      await vi.waitFor(() => expect(scroll.isSticky()).toBe(false), { timeout: 2000 })
+      // Keep item 0 mounted but wholly above the viewport. The rerender below
+      // then forces its ref(null) in the same commit that installs stale cache
+      // data, avoiding a race with the virtual scroll subscription.
+      scroll.scrollTo(3)
+      await vi.waitFor(() => {
+        expect(scroll.getScrollTop()).toBe(3)
+        expect(expose.current!.virtualHistory.start).toBe(0)
+      }, { timeout: 2000 })
       const adjustScrollTop = vi.spyOn(scroll, 'adjustScrollTop')
       const staleHeights = new Map(initialHeights)
 
       staleHeights.set(items[0]!.key, 1)
-      instance.rerender(React.createElement(Harness, { expose, initialHeights: staleHeights, items }))
-      await delay(40)
-
-      expect(adjustScrollTop).toHaveBeenCalledOnce()
+      instance.rerender(
+        React.createElement(Harness, {
+          expose,
+          initialHeights: staleHeights,
+          items,
+          omitKey: items[0]!.key
+        })
+      )
+      await vi.waitFor(() => expect(adjustScrollTop).toHaveBeenCalledOnce(), { timeout: 2000 })
       expect(adjustScrollTop).toHaveBeenCalledWith(1)
-      expect(scroll.getScrollTop()).toBe(6)
+      expect(scroll.getScrollTop()).toBe(4)
       expect(scroll.isSticky()).toBe(false)
-      expect(expose.current!.virtualHistory.start).toBeGreaterThan(0)
       expect(expose.current!.virtualHistory.offsets[1]).toBe(2)
     } finally {
       instance.unmount()

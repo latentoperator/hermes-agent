@@ -1,4 +1,4 @@
-// Run every workspace check at the same time and report all failures.
+// Run every workspace check with bounded parallelism and report all failures.
 //
 // The unit of work is a CHECK, and not a workspace. A package that declares
 // `check:*` sub-scripts gives one unit for each sub-script. A package with a
@@ -21,6 +21,10 @@ import { availableParallelism } from 'node:os'
 
 const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
 const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
+// Each check may start its own worker pool (Vitest, TypeScript, bundlers).
+// Leave CPUs available for those children instead of multiplying full-size
+// pools until timer-driven tests starve under scheduler load.
+const DEFAULT_CONCURRENCY = Math.max(1, Math.min(4, Math.floor(availableParallelism() / 2)))
 
 /** @returns {{pkg: string, script: string}[]} */
 function discoverUnits() {
@@ -93,7 +97,7 @@ async function main() {
   const flagIdx = argv.indexOf('--concurrency')
   const concurrency = Math.max(
     1,
-    flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, availableParallelism()),
+    flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, DEFAULT_CONCURRENCY),
   )
 
   console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)
