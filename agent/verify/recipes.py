@@ -229,7 +229,10 @@ def _detect_node_recipe(root: Path, pkg: dict[str, Any]) -> Recipe:
         # Astro may bind ``localhost`` to IPv6 only while readiness is polled
         # on IPv4 loopback. Detected recipes own their launch command, so make
         # the two endpoints deterministic without rewriting saved manifests.
-        start = f"{start} -- --host 127.0.0.1"
+        # The npm/default runner needs ``--`` before script arguments; pnpm,
+        # yarn, and Bun forward arguments placed directly after the script name.
+        separator = " --" if package_manager not in {"pnpm", "yarn", "bun"} else ""
+        start = f"{start}{separator} --host 127.0.0.1"
     port = _infer_port_from_command(start_body) or default_port if start else None
 
     build = _dedupe(
