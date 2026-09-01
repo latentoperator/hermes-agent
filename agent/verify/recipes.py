@@ -225,6 +225,11 @@ def _detect_node_recipe(root: Path, pkg: dict[str, Any]) -> Recipe:
     start_script = "dev" if scripts.get("dev") else ("start" if scripts.get("start") else None)
     start_body = scripts.get(start_script) if start_script else None
     start = _script_runner(package_manager, start_script) if start_script else None
+    if kind == "astro" and start:
+        # Astro may bind ``localhost`` to IPv6 only while readiness is polled
+        # on IPv4 loopback. Detected recipes own their launch command, so make
+        # the two endpoints deterministic without rewriting saved manifests.
+        start = f"{start} -- --host 127.0.0.1"
     port = _infer_port_from_command(start_body) or default_port if start else None
 
     build = _dedupe(

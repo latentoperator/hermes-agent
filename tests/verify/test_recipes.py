@@ -70,6 +70,23 @@ class TestNodeDetection:
         assert recipe.start == "yarn dev"
         assert recipe.port == 5173
 
+    def test_astro_binds_to_readiness_loopback_host(self, tmp_path):
+        write_pkg(
+            tmp_path,
+            {
+                "devDependencies": {"astro": "5.0.0"},
+                "scripts": {"dev": "astro dev", "build": "astro build"},
+            },
+        )
+        (tmp_path / "package-lock.json").touch()
+
+        recipe = detect_recipe(tmp_path)
+
+        assert recipe is not None
+        assert recipe.kind == "astro"
+        assert recipe.start == "npm run dev -- --host 127.0.0.1"
+        assert recipe.port == 4321
+
     def test_bun_runner(self, tmp_path):
         write_pkg(tmp_path, {"scripts": {"start": "node server.js", "build": "tsc"}})
         (tmp_path / "bun.lockb").touch()

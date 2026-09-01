@@ -159,6 +159,36 @@ def _poll_readiness(url: str, timeout: float, interval: float = 1.0) -> tuple[bo
     return False, None, last_error
 
 
+def _wait_for_process_group_exit(
+    proc: subprocess.Popen,
+    killpg: Callable[[int, int], None],
+    pgid: int,
+    timeout: float,
+) -> bool:
+    """Wait until both the direct child and its process group are gone."""
+    deadline = time.monotonic() + timeout
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        pass
+
+    while time.monotonic() < deadline:
+        try:
+            killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        time.sleep(0.05)
+    try:
+        killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        pass
+    return False
+
+
 def _terminate_process_group(proc: subprocess.Popen) -> None:
     """Terminate the started app and its whole process group cleanly.
 
@@ -166,31 +196,38 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
     signal the whole group; on Windows (no ``os.killpg``) we fall back to
     terminating just the direct child.
     """
+    killpg = getattr(os, "killpg", None)
+    if killpg is not None:
+        # ``start_new_session=True`` makes the spawned PID the process-group
+        # ID. Keep using that stable ID after the shell/package-manager leader
+        # exits; querying the dead leader with getpgid() loses its descendants.
+        pgid = proc.pid
+        try:
+            killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only branch (killpg checked above)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            return
+        if _wait_for_process_group_exit(proc, killpg, pgid, timeout=10):
+            return
+        try:
+            killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only branch (killpg checked above)
+        except (ProcessLookupError, PermissionError):
+            return
+        _wait_for_process_group_exit(proc, killpg, pgid, timeout=5)
+        return
+
     if proc.poll() is not None:
         return
-    killpg = getattr(os, "killpg", None)
-    getpgid = getattr(os, "getpgid", None)
-    pgid = None
-    if killpg is not None and getpgid is not None:
-        try:
-            pgid = getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
     try:
-        if pgid is not None and killpg is not None:
-            killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX-only branch (killpg checked above)
-        else:
-            proc.terminate()
+        proc.terminate()
     except (ProcessLookupError, PermissionError):
         return
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         try:
-            if pgid is not None and killpg is not None:
-                killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX-only branch (killpg checked above)
-            else:
-                proc.kill()
+            proc.kill()
         except (ProcessLookupError, PermissionError):
             pass
         try:
