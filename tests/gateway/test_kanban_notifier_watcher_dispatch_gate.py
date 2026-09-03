@@ -16,8 +16,9 @@ def _make_runner(with_adapter=False):
 
 
 def test_notifier_watcher_polls_without_dispatch_ownership():
-    """A profile gateway still polls its profile-owned subscriptions."""
+    """A non-pinned profile still polls its profile-owned subscriptions."""
     runner = _make_runner(with_adapter=True)
+    runner._active_profile_name = lambda: "code-reviewer"
     past_gate = []
     sleep_calls = []
 
@@ -33,13 +34,23 @@ def test_notifier_watcher_polls_without_dispatch_ownership():
 
     import hermes_cli.kanban_db as _kb
 
-    with patch.object(
-        _kb, "list_boards",
-        side_effect=lambda *a, **kw: past_gate.append(True) or [],
+    cfg = {
+        "kanban": {
+            "dispatch_in_gateway": True,
+            "dispatcher_profile": "wren",
+        }
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch.object(
+            _kb,
+            "list_boards",
+            side_effect=lambda *a, **kw: past_gate.append(True) or [],
+        ),
+        patch("asyncio.sleep", side_effect=fake_sleep),
+        patch("asyncio.to_thread", side_effect=fake_to_thread),
     ):
-        with patch("asyncio.sleep", side_effect=fake_sleep):
-            with patch("asyncio.to_thread", side_effect=fake_to_thread):
-                asyncio.run(runner._kanban_notifier_watcher())
+        asyncio.run(runner._kanban_notifier_watcher())
 
     assert past_gate, (
         "gateways without the dispatch lock must still poll owned subscriptions"
