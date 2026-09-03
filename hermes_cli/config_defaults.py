@@ -2836,11 +2836,6 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
-        # Optional owner for the machine-global embedded dispatcher. A
-        # nonmatching gateway still runs its profile-local notifier watcher but
-        # never attempts the dispatcher lock. Empty preserves the historical
-        # any-enabled-gateway behavior.
-        "dispatcher_profile": "",
         # Automatically claim tasks in the first-class review column and spawn
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.

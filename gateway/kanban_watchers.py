@@ -170,23 +170,6 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
-def _profile_matches_dispatcher_pin(
-    active_profile: Any,
-    dispatcher_profile: Any,
-) -> bool:
-    """Return whether a gateway profile may host the embedded dispatcher.
-
-    An empty pin preserves the historical any-enabled-gateway behavior. The
-    default profile is represented as both ``"default"`` and an empty value
-    across startup paths, so normalize both before comparing case-insensitively.
-    """
-    pinned = str(dispatcher_profile or "").strip()
-    if not pinned:
-        return True
-    active = str(active_profile or "").strip() or "default"
-    return active.casefold() == pinned.casefold()
-
-
 def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     """Return the tenant scope (Slack workspace) a subscription's wake keys to.
 
@@ -1284,9 +1267,9 @@ class GatewayKanbanWatchersMixin:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
 
         Gated by `kanban.dispatch_in_gateway` in config.yaml (default True).
-        An optional `kanban.dispatcher_profile` pin selects the only gateway
-        allowed to acquire the machine-global dispatcher lock. When disabled,
-        the loop exits immediately and an external daemon is expected.
+        When true, the gateway hosts the single dispatcher for this profile:
+        no separate `hermes kanban daemon` process needed. When false, the
+        loop exits immediately and an external daemon is expected.
 
         Each tick calls :func:`kanban_db.dispatch_once` inside
         ``asyncio.to_thread`` so the SQLite WAL lock never blocks the
@@ -1324,25 +1307,36 @@ class GatewayKanbanWatchersMixin:
             )
             return
 
-        active_profile_fn = getattr(self, "_active_profile_name", None)
-        active_profile = (
-            active_profile_fn() if callable(active_profile_fn) else "default"
-        )
-        dispatcher_profile = kanban_cfg.get("dispatcher_profile")
-        if not _profile_matches_dispatcher_pin(active_profile, dispatcher_profile):
-            logger.info(
-                "kanban dispatcher: active profile %r does not match "
-                "kanban.dispatcher_profile=%r; dispatcher disabled for this gateway",
-                active_profile,
-                dispatcher_profile,
-            )
-            return
-
         try:
             from hermes_cli import kanban_db as _kb
         except Exception:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
             return
+
+        # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
+        # new profile gateway (or a same-profile restart race) can silently
+        # start a second dispatcher; concurrent dispatchers double reclaim
+        # frequency, double claim-attempt events, and — with
+        # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
+        # index pages. The lock lives at the machine-global kanban root
+        # (shared across profiles by design), so it serialises ALL gateways.
+        self._kanban_dispatcher_lock_handle = None
+        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
+        _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
+        if _lock_state == "contended":
+            logger.info(
+                "kanban dispatcher: another gateway already holds the dispatcher "
+                "lock (%s); this gateway will NOT dispatch.", _lock_path,
+            )
+            return
+        if _lock_state == "held":
+            self._kanban_dispatcher_lock_handle = _lock_handle  # hold for process lifetime
+            logger.info("kanban dispatcher: holding singleton dispatcher lock (%s)", _lock_path)
+        else:
+            logger.warning(
+                "kanban dispatcher: advisory lock unavailable at %s; proceeding "
+                "on config control alone.", _lock_path,
+            )
 
         try:
             interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
@@ -1353,58 +1347,6 @@ class GatewayKanbanWatchersMixin:
             )
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
-
-        # Single-dispatcher backstop. Nonmatching profiles returned above, so
-        # only the configured owner (or any gateway under the legacy empty-pin
-        # mode) reaches this lock. Contention is recoverable: a pinned gateway
-        # can start behind an old incumbent and take over after that process
-        # releases the lock. Cap retries at five seconds even when dispatch
-        # ticks are configured minutes apart, and sleep in one-second slices so
-        # shutdown remains prompt. The advisory-lock-unavailable fallback stays
-        # backward-compatible and relies on the config pin alone.
-        self._kanban_dispatcher_lock_handle = None
-        _lock_path = _kb.kanban_home() / "kanban" / ".dispatcher.lock"
-        _lock_retry_interval = min(interval, 5.0)
-        _contention_logged = False
-        while self._running:
-            _lock_handle, _lock_state = _acquire_singleton_lock(_lock_path)
-            if _lock_state == "held":
-                self._kanban_dispatcher_lock_handle = _lock_handle
-                logger.info(
-                    "kanban dispatcher: holding singleton dispatcher lock (%s)",
-                    _lock_path,
-                )
-                break
-            if _lock_state == "unavailable":
-                logger.warning(
-                    "kanban dispatcher: advisory lock unavailable at %s; proceeding "
-                    "on config control alone.",
-                    _lock_path,
-                )
-                break
-            if not str(dispatcher_profile or "").strip():
-                logger.info(
-                    "kanban dispatcher: another gateway already holds the dispatcher "
-                    "lock (%s); this gateway will NOT dispatch.",
-                    _lock_path,
-                )
-                return
-            if not _contention_logged:
-                logger.info(
-                    "kanban dispatcher: another process holds dispatcher lock (%s); "
-                    "profile %r will retry every %.1fs",
-                    _lock_path,
-                    str(active_profile or "").strip() or "default",
-                    _lock_retry_interval,
-                )
-                _contention_logged = True
-            slept = 0.0
-            while slept < _lock_retry_interval and self._running:
-                delay = min(1.0, _lock_retry_interval - slept)
-                await asyncio.sleep(delay)
-                slept += delay
-        if not self._running:
-            return
 
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
@@ -1532,11 +1474,7 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
-        try:
-            await asyncio.sleep(5)
-        except asyncio.CancelledError:
-            self._release_kanban_dispatcher_lock()
-            raise
+        await asyncio.sleep(5)
 
         # Health telemetry mirrored from `_cmd_daemon`: warn when ready
         # queue is non-empty but spawns are 0 for N consecutive ticks —

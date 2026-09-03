@@ -13,10 +13,9 @@ unblocks, requeues, or otherwise mutates a task.
 
 ## Single-dispatcher posture
 
-Only one gateway owns the kanban dispatcher. Set `kanban.dispatcher_profile`
-to that profile on every gateway that shares the board. Nonmatching gateways
-skip dispatcher lock acquisition while continuing their profile-local notifier
-watchers.
+Only one gateway owns the kanban dispatcher. The owning gateway keeps
+`kanban.dispatch_in_gateway: true` (the default); every other gateway sets it
+to `false`.
 
 **Why this matters:** dispatching is single-owner so multiple gateways do not
 race to spawn the same work. Notification delivery is profile-owned instead:
@@ -26,30 +25,22 @@ processes.
 
 ## Configuration
 
-Use the same owner pin on every profile gateway (for example, `wren`):
+On the dispatch-owning gateway (typically the `default` profile), no change is
+needed. On every other profile gateway, add to `~/.hermes/config.yaml`:
 
 ```yaml
 kanban:
-  dispatch_in_gateway: true
-  dispatcher_profile: wren
+  dispatch_in_gateway: false
 ```
 
-The pinned gateway retries a contended singleton lock at least every five
-seconds and acquires it after an old incumbent releases it. An empty or omitted
-`dispatcher_profile` preserves the historical behavior where any
-dispatch-enabled gateway may acquire the lock and a contended gateway opts out.
-
-To disable embedded dispatch entirely for a gateway or use the standalone
-daemon, set `dispatch_in_gateway: false` (or
-`HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`). Its notifier watcher remains active.
+Or set the env var: `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`
 
 ## What each gateway does
 
-| Gateway role | dispatch_in_gateway | dispatcher_profile | Dispatcher | Notifier |
+| Gateway role | dispatch_in_gateway | Opens subscribed board DBs? | Dispatcher | Notifier |
 |---|---|---|---|---|
-| pinned owner | true | matches active profile | yes | owned profiles + legacy unstamped subscriptions |
-| other profile gateways | true | does not match | no | that gateway's owned profiles |
-| explicitly disabled gateway | false | any | no | that gateway's owned profiles |
+| default (confirmed dispatch-lock owner) | true (default) | yes | yes | owned profiles + legacy unstamped subscriptions |
+| writer, admin, coder, etc. | false | yes, when the profile has subscriptions | no | that gateway's owned profiles |
 
 Non-dispatch gateways still deliver messages for their own platform adapters
 (Telegram, Discord, etc.). They do not dispatch tasks, and they skip boards
