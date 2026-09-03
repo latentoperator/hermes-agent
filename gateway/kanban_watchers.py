@@ -1897,7 +1897,11 @@ class GatewayKanbanWatchersMixin:
             # waits up to `interval` seconds for the current sleep to finish.
             slept = 0.0
             while slept < interval and self._running:
-                await asyncio.sleep(min(1.0, interval - slept))
+                try:
+                    await asyncio.sleep(min(1.0, interval - slept))
+                except asyncio.CancelledError:
+                    self._release_kanban_dispatcher_lock()
+                    raise
                 slept += 1.0
 
         self._release_kanban_dispatcher_lock()
