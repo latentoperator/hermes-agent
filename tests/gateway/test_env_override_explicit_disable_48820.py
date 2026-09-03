@@ -35,7 +35,11 @@ CRED_ENV = {
         "EMAIL_IMAP_HOST": "imap.example.com",
         "EMAIL_SMTP_HOST": "smtp.example.com",
     },
-    "sms": {"TWILIO_ACCOUNT_SID": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"},
+    "sms": {
+        "TWILIO_ACCOUNT_SID": "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "TWILIO_AUTH_TOKEN": "twilio-test-auth-token",
+        "TWILIO_PHONE_NUMBER": "+15555550123",
+    },
     "dingtalk": {"DINGTALK_CLIENT_ID": "ding-id", "DINGTALK_CLIENT_SECRET": "ding-secret"},
     "feishu": {"FEISHU_APP_ID": "cli_feishu", "FEISHU_APP_SECRET": "feishu-secret"},
     "wecom": {"WECOM_BOT_ID": "wecom-bot", "WECOM_SECRET": "wecom-secret"},
