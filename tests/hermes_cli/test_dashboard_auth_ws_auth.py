@@ -421,6 +421,35 @@ class TestWsHostOriginGuardOrigins:
         ws = self._ws(origin="https://evil.test", host="fly-app.fly.dev")
         assert web_server._ws_host_origin_is_allowed(ws) is False
 
+    def test_explicit_reverse_proxy_origin_allowed_on_loopback(self, loopback_app):
+        """An operator-declared proxy origin may reach the token-auth backend."""
+        previous = getattr(web_server.app.state, "trusted_proxy_origins", None)
+        web_server.app.state.trusted_proxy_origins = frozenset(
+            {"https://dashboard.example.test"}
+        )
+        try:
+            ws = self._ws(
+                origin="https://dashboard.example.test",
+                host="127.0.0.1:8080",
+            )
+            assert web_server._ws_host_origin_is_allowed(ws) is True
+        finally:
+            web_server.app.state.trusted_proxy_origins = previous
+
+    def test_untrusted_reverse_proxy_origin_remains_blocked(self, loopback_app):
+        previous = getattr(web_server.app.state, "trusted_proxy_origins", None)
+        web_server.app.state.trusted_proxy_origins = frozenset(
+            {"https://dashboard.example.test"}
+        )
+        try:
+            ws = self._ws(
+                origin="https://evil.example.test",
+                host="127.0.0.1:8080",
+            )
+            assert web_server._ws_host_origin_is_allowed(ws) is False
+        finally:
+            web_server.app.state.trusted_proxy_origins = previous
+
 
 
 class TestSidecarUrl:
@@ -472,4 +501,3 @@ class TestGatewayWsUrl:
         gw_cred = gw.split("internal=")[1].split("&")[0]
         sc_cred = sc.split("internal=")[1].split("&")[0]
         assert gw_cred == sc_cred
-
