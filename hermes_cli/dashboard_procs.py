@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from hermes_constants import get_default_hermes_root
+
 
 def _m():
     """Lazy ``hermes_cli.main`` reference (call-time; keeps patches working)."""
@@ -832,14 +834,6 @@ _HEX32 = set("0123456789abcdef")
 _HEX16 = _HEX32
 
 
-def _hermes_home_dir() -> Path:
-    """Resolved Hermes home (HERMES_HOME override or ~/.hermes)."""
-    override = os.environ.get("HERMES_HOME", "").strip()
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".hermes"
-
-
 def _valid_lockfile_payload(parsed: object, ownership_id: str) -> bool:
     """Validate a parsed ``backend.lock.json`` body, mirroring readLockfile().
 
@@ -888,8 +882,9 @@ def _valid_lockfile_payload(parsed: object, ownership_id: str) -> bool:
 def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
     """PIDs claimed as owners by valid ``backend.lock.json`` records on this host.
 
-    Scans ``{hermes_home}/desktop-ssh/<ownershipId>/backend.lock.json`` (the
-    same directory the Desktop SSH runtime writes to). Any PID a valid lock
+    Scans ``{hermes_root}/desktop-ssh/<ownershipId>/backend.lock.json`` (the
+    shared root the Desktop SSH runtime writes to, even when HERMES_HOME
+    selects a named profile). Any PID a valid lock
     names is a legitimately-owned backend — including backends another client
     or machine started over SSH — and must be spared by the orphan reap.
 
@@ -898,8 +893,11 @@ def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
     """
     import json
 
+    # Profile startup rewrites HERMES_HOME to <root>/profiles/<name>, but
+    # ownership records are shared across profiles. Looking in the profile
+    # directory would misclassify live sibling SSH backends as orphans.
     root = base_dir if base_dir is not None else (
-        _hermes_home_dir() / _REMOTE_LOCK_SUBDIR
+        get_default_hermes_root() / _REMOTE_LOCK_SUBDIR
     )
     owned: set[int] = set()
     if not root.is_dir():
