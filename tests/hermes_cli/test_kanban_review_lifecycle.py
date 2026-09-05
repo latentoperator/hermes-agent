@@ -478,6 +478,70 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_changes_requested_allows_one_rework_claim_with_existing_pr(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A review handoff must not strand rework behind the active-PR guard."""
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    pr_comment = "Opened https://github.com/example/repo/pull/456 for review."
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="revise PR", assignee="builder")
+        implementation = kb.claim_task(conn, task_id)
+        assert implementation is not None
+        kb.add_comment(conn, task_id, author="builder", body=pr_comment)
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="PR ready",
+            reviewer="reviewer",
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, task_id)
+        assert review is not None
+        assert kb.request_changes(
+            conn,
+            task_id,
+            reason="Please revise the fallback.",
+            expected_run_id=review.current_run_id,
+        ) == (True, "builder")
+
+        # The PR predates changes_requested, so it is the object of the
+        # requested rework rather than duplicate-work evidence.
+        assert kbd.check_respawn_guard(conn, task_id) is None
+        result = kbd.dispatch_once(conn, dry_run=True)
+        assert task_id in [item[0] for item in result.spawned]
+
+        # A fresh PR-bearing comment after the review handoff re-arms the
+        # guard immediately.
+        kb.add_comment(
+            conn,
+            task_id,
+            author="reviewer",
+            body="New candidate https://github.com/example/repo/pull/457",
+        )
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+        # Without fresh evidence, the bypass is consumed by one real claim.
+        with kb.write_txn(conn):
+            conn.execute(
+                "DELETE FROM task_comments WHERE task_id = ? AND body LIKE ?",
+                (task_id, "%pull/457%"),
+            )
+        claimed = kb.claim_task(conn, task_id, claimer="builder:rework")
+        assert claimed is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+                "WHERE id = ?",
+                (task_id,),
+            )
+        assert kbd.check_respawn_guard(conn, task_id) == "active_pr"
+
+
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

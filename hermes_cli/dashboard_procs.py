@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from hermes_constants import get_default_hermes_root
+
 # Cmdline substrings identifying the long-lived server (``serve`` = the headless name Desktop
 # spawns; reaped on update for the same reason).
 _DASHBOARD_PATTERNS = tuple(
@@ -523,10 +525,7 @@ _REMOTE_LOCK_SUBDIR = "desktop-ssh"
 _HEX32 = set("0123456789abcdef")
 
 
-def _hermes_home_dir() -> Path:
-    """Resolved Hermes home (HERMES_HOME override or ~/.hermes)."""
-    override = os.environ.get("HERMES_HOME", "").strip()
-    return Path(override).expanduser() if override else Path.home() / ".hermes"
+
 
 
 def _is_hex(value: object, length: int) -> bool:
@@ -559,7 +558,7 @@ def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
     """PIDs claimed by valid ``{hermes_home}/desktop-ssh/<ownershipId>/backend.lock.json`` records
     (best-effort: a bad record contributes no PID; never raises)."""
     import json
-    root = base_dir if base_dir is not None else _hermes_home_dir() / _REMOTE_LOCK_SUBDIR
+    root = base_dir if base_dir is not None else get_default_hermes_root() / _REMOTE_LOCK_SUBDIR
     owned: set[int] = set()
     try:
         entries = list(root.iterdir()) if root.is_dir() else []

@@ -269,6 +269,22 @@ async def test_running_agent_fastpath_allows_admin_command():
     assert "⛔" not in (result or "")
 
 
+@pytest.mark.asyncio
+async def test_fleet_command_dispatches_on_cold_and_busy_paths():
+    """The registry entry must be wired to both gateway dispatch lanes."""
+    runner = _make_runner()
+    runner._handle_fleet_command = AsyncMock(return_value="fleet-handled")
+    event = _make_event("/fleet reset-session all", _make_source())
+
+    assert await runner._handle_message(event) == "fleet-handled"
+
+    session_key = build_session_key(event.source)
+    runner._running_agents[session_key] = MagicMock()
+    runner._running_agents_ts[session_key] = 0
+    assert await runner._handle_message(event) == "fleet-handled"
+    assert runner._handle_fleet_command.await_count == 2
+
+
 # ---------------------------------------------------------------------------
 # Alias resolution — /h aliases to /help; the gate must canonicalize before
 # checking access. /hist (history alias) is a real one to exercise.

@@ -1019,14 +1019,65 @@ _container_detected: bool | None = None
 
 
 def is_container() -> bool:
-    """True inside a container (Docker/Podman/LXC/Kubernetes markers); cached per process.
+    """Return True when running inside a container.
+
+    Recognizes Docker (``/.dockerenv``), Podman (``/run/.containerenv``),
+    and — via ``/proc/1/cgroup`` — the docker/podman/lxc cgroup-v1 markers.
+
+    cgroup v2 collapses ``/proc/1/cgroup`` to a single ``0::/`` line with no
+    runtime marker, so containerd/CRI-O runtimes (the common case on
+    Kubernetes/k3s) were previously missed. To cover those, also check:
+      * ``KUBERNETES_SERVICE_HOST`` env var — set in every Kubernetes pod.
+      * ``kubepods`` / ``containerd`` / ``crio`` markers in ``/proc/1/cgroup``.
+      * the same markers in ``/proc/self/mountinfo`` (cgroup-v2 fallback).
+
+    Result is cached for the process lifetime.  Import-safe — no heavy deps.
 
     See: NousResearch/hermes-agent#47111
     """
     global _container_detected
-    if _container_detected is None:
-        _container_detected = _detect_container()
-    return _container_detected
+    if _container_detected is not None:
+        return _container_detected
+    if os.path.exists("/.dockerenv"):
+        _container_detected = True
+        return True
+    if os.path.exists("/run/.containerenv"):
+        _container_detected = True
+        return True
+    # Kubernetes always injects this into pod containers; absent on hosts.
+    if os.environ.get("KUBERNETES_SERVICE_HOST"):
+        _container_detected = True
+        return True
+    _CGROUP_MARKERS = ("docker", "podman", "/lxc/", "kubepods", "containerd", "crio")
+    try:
+        with open("/proc/1/cgroup", "r", encoding="utf-8") as f:
+            cgroup = f.read()
+            if any(marker in cgroup for marker in _CGROUP_MARKERS):
+                _container_detected = True
+                return True
+    except OSError:
+        pass
+    # cgroup v2: /proc/1/cgroup is just "0::/" with no marker. The container
+    # runtime still shows up in the root mount (overlay rootfs, runtime mount
+    # paths), so inspect that mount as a last resort. A Docker/containerd host
+    # naturally exposes child container mounts in its table; those unrelated
+    # entries must not classify the host itself as a container.
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) >= 6 and fields[4] == "/":
+                    if any(
+                        marker in line
+                        for marker in ("kubepods", "containerd", "crio")
+                    ):
+                        _container_detected = True
+                        return True
+                    break
+    except OSError:
+        pass
+    _container_detected = False
+    return False
 
 
 def _proc_file_has_marker(path: str, markers: tuple[str, ...]) -> bool:

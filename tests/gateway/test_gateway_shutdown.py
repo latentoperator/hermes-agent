@@ -248,6 +248,43 @@ async def test_in_chat_restart_skips_home_shutdown_even_with_active_session():
 
 
 @pytest.mark.asyncio
+async def test_discord_shutdown_warning_is_marked_nonconversational():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="555")
+    source.platform = Platform.DISCORD
+    session_key = build_session_key(source)
+    runner._running_agents = {session_key: MagicMock()}
+    runner._cache_session_source(session_key, source)
+    runner.config.platforms[Platform.DISCORD] = runner.config.platforms.pop(
+        Platform.TELEGRAM
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+    assert adapter.sent_calls[0][2]["non_conversational"] is True
+
+
+@pytest.mark.asyncio
+async def test_discord_home_shutdown_warning_is_marked_nonconversational():
+    runner, adapter = make_restart_runner()
+    discord_config = runner.config.platforms.pop(Platform.TELEGRAM)
+    discord_config.home_channel = HomeChannel(
+        platform=Platform.DISCORD,
+        chat_id="home-555",
+        name="Discord Home",
+    )
+    runner.config.platforms[Platform.DISCORD] = discord_config
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent_calls) == 1
+    assert adapter.sent_calls[0][2]["non_conversational"] is True
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_kills_tool_subprocesses_before_adapter_disconnect_on_timeout(monkeypatch):
     """On drain timeout, tool subprocesses must be killed BEFORE adapter
     disconnect so systemd's TimeoutStopSec doesn't SIGKILL the cgroup with
@@ -397,9 +434,6 @@ def test_pid_exists_zombie_via_psutil_returns_false(monkeypatch):
     monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
 
     assert status._pid_exists(4242) is False
-
-
-
 
 @pytest.mark.asyncio
 async def test_shutdown_mcp_servers_nonblocking_keeps_loop_responsive():

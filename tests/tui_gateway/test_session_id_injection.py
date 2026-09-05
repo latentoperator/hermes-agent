@@ -70,3 +70,30 @@ def test_set_session_context_falls_back_to_session_key(monkeypatch):
     assert get_session_env("HERMES_SESSION_ID") == "skey-xyz"
 
 
+def test_desktop_session_binds_canonical_action_approval_source(monkeypatch):
+    _install_session(
+        monkeypatch,
+        session_key="desktop-key",
+        agent_session_id="20260823_210208_45d0c7",
+        source="desktop",
+    )
+    monkeypatch.setenv("HERMES_ACTION_APPROVAL_DESKTOP_PRINCIPAL", "hopewell")
+
+    server._set_session_context("desktop-key", allow_action_approval=True)
+
+    assert get_session_env("HERMES_ACTION_APPROVAL_SOURCE") == (
+        "in_session:desktop:hopewell:20260823_210208_45d0c7"
+    )
+
+
+def test_non_turn_desktop_context_does_not_bind_action_approval(monkeypatch):
+    _install_session(
+        monkeypatch,
+        session_key="desktop-key",
+        agent_session_id="20260823_210208_45d0c7",
+        source="desktop",
+    )
+
+    server._set_session_context("desktop-key")
+
+    assert get_session_env("HERMES_ACTION_APPROVAL_SOURCE") == ""

@@ -8,6 +8,9 @@ test without a live gateway.
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import pytest
 
 from gateway.scale_to_zero import (
@@ -122,9 +125,16 @@ from gateway.scale_to_zero import (  # noqa: E402 - grouped with their section
 _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891234f"}
 
 
-def _fake_flaps(tmp_path, status_line, capture):
+@pytest.fixture
+def short_socket_dir():
+    """Keep AF_UNIX paths below Linux's 108-byte sockaddr limit."""
+    with tempfile.TemporaryDirectory(prefix="hermes-sock-") as path:
+        yield Path(path)
+
+
+def _fake_flaps(socket_dir, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""
-    sock_path = str(tmp_path / "fly-api.sock")
+    sock_path = str(socket_dir / "fly-api.sock")
     server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen(1)
@@ -150,9 +160,9 @@ def _fake_flaps(tmp_path, status_line, capture):
     return sock_path, t
 
 
-def test_suspend_self_posts_suspend_for_this_machine(tmp_path):
+def test_suspend_self_posts_suspend_for_this_machine(short_socket_dir):
     captured: list[bytes] = []
-    sock_path, t = _fake_flaps(tmp_path, "200 OK", captured)
+    sock_path, t = _fake_flaps(short_socket_dir, "200 OK", captured)
     assert suspend_self(_FLY_ENV, socket_path=sock_path) is True
     t.join(timeout=5)
     request = captured[0].decode()
@@ -164,9 +174,9 @@ def test_suspend_self_posts_suspend_for_this_machine(tmp_path):
     assert "Host: flaps\r\n" in request
 
 
-def test_suspend_self_non_2xx_is_false_not_raise(tmp_path):
+def test_suspend_self_non_2xx_is_false_not_raise(short_socket_dir):
     captured: list[bytes] = []
-    sock_path, t = _fake_flaps(tmp_path, "412 Precondition Failed", captured)
+    sock_path, t = _fake_flaps(short_socket_dir, "412 Precondition Failed", captured)
     assert suspend_self(_FLY_ENV, socket_path=sock_path) is False
     t.join(timeout=5)
 

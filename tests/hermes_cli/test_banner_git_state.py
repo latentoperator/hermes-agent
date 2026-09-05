@@ -17,16 +17,21 @@ def test_format_banner_version_label_on_upstream_main():
     assert "local" not in value
 
 
-def test_get_git_banner_state_reads_origin_and_head(tmp_path):
+def test_get_git_banner_state_prefers_official_upstream_and_head(tmp_path):
     from hermes_cli import banner
 
     repo_dir = tmp_path / "repo"
     (repo_dir / ".git").mkdir(parents=True)
 
     results = {
+        ("git", "remote", "get-url", "upstream"): MagicMock(
+            returncode=0,
+            stdout="https://github.com/NousResearch/hermes-agent.git\n",
+        ),
+        ("git", "rev-parse", "--short=8", "upstream/main"): MagicMock(returncode=0, stdout="b2f477a3\n"),
         ("git", "rev-parse", "--short=8", "origin/main"): MagicMock(returncode=0, stdout="b2f477a3\n"),
         ("git", "rev-parse", "--short=8", "HEAD"): MagicMock(returncode=0, stdout="af8aad31\n"),
-        ("git", "rev-list", "--count", "origin/main..HEAD"): MagicMock(returncode=0, stdout="3\n"),
+        ("git", "rev-list", "--count", "upstream/main..HEAD"): MagicMock(returncode=0, stdout="3\n"),
     }
 
     def fake_run(cmd, **kwargs):
@@ -56,6 +61,8 @@ def test_check_via_local_git_ssh_fastpath_ahead_not_behind(tmp_path):
     (repo_dir / ".git").mkdir(parents=True)
 
     def fake_git_stdout(args, *, cwd, timeout=5):
+        if args == ["remote", "get-url", "upstream"]:
+            return None
         if args == ["remote", "get-url", "origin"]:
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
@@ -83,6 +90,8 @@ def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
     (repo_dir / ".git").mkdir(parents=True)
 
     def fake_git_stdout(args, *, cwd, timeout=5):
+        if args == ["remote", "get-url", "upstream"]:
+            return None
         if args == ["remote", "get-url", "origin"]:
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
@@ -111,6 +120,8 @@ def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
     (repo_dir / ".git").mkdir(parents=True)
 
     def fake_git_stdout(args, *, cwd, timeout=5):
+        if args == ["remote", "get-url", "upstream"]:
+            return None
         if args == ["remote", "get-url", "origin"]:
             return "git@github.com:NousResearch/hermes-agent.git"
         if args == ["rev-parse", "HEAD"]:
@@ -126,3 +137,28 @@ def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
         behind = banner._check_via_local_git(repo_dir)
 
     assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
+
+
+def test_local_update_check_fetches_official_upstream_for_fork(tmp_path):
+    from hermes_cli import banner
+
+    def fake_stdout(args, **_kwargs):
+        values = {
+            ("remote", "get-url", "upstream"): (
+                "https://github.com/NousResearch/hermes-agent.git"
+            ),
+            ("rev-parse", "--is-shallow-repository"): "false",
+        }
+        return values.get(tuple(args))
+
+    def fake_run(cmd, **_kwargs):
+        if cmd[:4] == ["git", "fetch", "upstream", "main"]:
+            return MagicMock(returncode=0, stdout="")
+        if cmd == ["git", "rev-list", "--count", "HEAD..upstream/main"]:
+            return MagicMock(returncode=0, stdout="7\n")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    with patch.object(banner, "_git_stdout", side_effect=fake_stdout), patch(
+        "hermes_cli.banner.subprocess.run", side_effect=fake_run
+    ):
+        assert banner._check_via_local_git(tmp_path) == 7

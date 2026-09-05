@@ -2893,7 +2893,10 @@ def _run_one_job_body(
 
         # get_secret() fails closed outside a scope; the ticker thread has none. Delivery adapters
         # resolve credentials, so the scope must span delivery too (reset in the outer finally).
-        _scope_token = set_secret_scope(build_profile_secret_scope(_get_hermes_home()))
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
+        profile_home = _get_hermes_home()
+        hydrate_profile_secret_sources(profile_home)
+        _scope_token = set_secret_scope(build_profile_secret_scope(profile_home))
         # Same for terminal policy (gateway/run.py _profile_runtime_scope): else the ticker reads
         # process-global TERMINAL_* env a concurrent profile pinned. Resolution failure installs a
         # refusal scope — terminal execution raises instead of using the launch process's policy.

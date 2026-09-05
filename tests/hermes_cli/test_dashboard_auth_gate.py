@@ -168,6 +168,35 @@ def test_start_server_loopback_sets_auth_required_false(monkeypatch):
     assert web_server.app.state.auth_required is False
 
 
+def test_allowed_proxy_origin_does_not_enable_public_url_auth_gate(monkeypatch):
+    """The proxy-origin seam preserves loopback session-token mode."""
+    monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_ALLOWED_ORIGINS",
+        "https://dashboard.example.test:443, invalid, http://localhost:8080/",
+    )
+    _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+        "trusted_proxy_origins",
+    )
+
+    web_server.start_server(
+        host="127.0.0.1", port=9119,
+        open_browser=False, allow_public=False,
+    )
+
+    assert web_server.app.state.auth_required is False
+    assert web_server.app.state.trusted_public_hosts == frozenset()
+    assert web_server.app.state.trusted_proxy_origins == frozenset(
+        {"https://dashboard.example.test", "http://localhost:8080"}
+    )
+
+
 def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
     """``--insecure`` (allow_public=True) on a public host: gate now ENGAGES.
 

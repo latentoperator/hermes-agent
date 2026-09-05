@@ -156,6 +156,55 @@ def _assert_cloud_client_lazy_installed_before_import(tmp_path, monkeypatch, mod
     }
 
 
+def test_get_client_first_use_is_single_owner_across_threads(tmp_path, monkeypatch):
+    provider = _provider_for_mode(tmp_path, monkeypatch, "local_external")
+    first_constructor_entered = threading.Event()
+    second_constructor_entered = threading.Event()
+    second_call_started = threading.Event()
+    release_first_constructor = threading.Event()
+    constructor_calls = []
+
+    client = object()
+
+    def fake_create_client():
+        constructor_calls.append(True)
+        if len(constructor_calls) == 1:
+            first_constructor_entered.set()
+            assert release_first_constructor.wait(timeout=2)
+        else:
+            second_constructor_entered.set()
+        return client
+
+    monkeypatch.setattr(provider, "_new_cloud_client", fake_create_client)
+    results = []
+
+    def get_client(*, started=None):
+        if started is not None:
+            started.set()
+        results.append(provider._get_client())
+
+    first = threading.Thread(target=get_client)
+    second = threading.Thread(
+        target=get_client,
+        kwargs={"started": second_call_started},
+    )
+    first.start()
+    assert first_constructor_entered.wait(timeout=1)
+    second.start()
+    assert second_call_started.wait(timeout=1)
+
+    second_constructor_entered.wait(timeout=0.2)
+    release_first_constructor.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(constructor_calls) == 1
+    assert len(results) == 2
+    assert results[0] is results[1] is provider._client
+
+
 class _FakeSessionDB:
     def __init__(self, messages=None):
         self._messages = list(messages or [])

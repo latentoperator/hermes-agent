@@ -70,6 +70,32 @@ class TestNodeDetection:
         assert recipe.start == "yarn dev"
         assert recipe.port == 5173
 
+    @pytest.mark.parametrize(
+        ("lockfile", "expected_start"),
+        [
+            ("package-lock.json", "npm run dev -- --host 127.0.0.1"),
+            ("pnpm-lock.yaml", "pnpm dev --host 127.0.0.1"),
+            ("yarn.lock", "yarn dev --host 127.0.0.1"),
+            ("bun.lock", "bun run dev --host 127.0.0.1"),
+        ],
+    )
+    def test_astro_binds_to_readiness_loopback_host(self, tmp_path, lockfile, expected_start):
+        write_pkg(
+            tmp_path,
+            {
+                "devDependencies": {"astro": "5.0.0"},
+                "scripts": {"dev": "astro dev", "build": "astro build"},
+            },
+        )
+        (tmp_path / lockfile).touch()
+
+        recipe = detect_recipe(tmp_path)
+
+        assert recipe is not None
+        assert recipe.kind == "astro"
+        assert recipe.start == expected_start
+        assert recipe.port == 4321
+
     def test_bun_runner(self, tmp_path):
         write_pkg(tmp_path, {"scripts": {"start": "node server.js", "build": "tsc"}})
         (tmp_path / "bun.lockb").touch()

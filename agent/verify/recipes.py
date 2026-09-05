@@ -156,8 +156,12 @@ def _detect_node_recipe(root: Path, pkg: dict[str, Any]) -> Recipe:
         return _dedupe([_script_runner(package_manager, s) for s in names if scripts.get(s)])
 
     start_script = next((s for s in ("dev", "start") if scripts.get(s)), None)
+    start = runners(start_script)[0] if start_script else None
+    if kind == "astro" and start:
+        separator = " --" if package_manager not in {"pnpm", "yarn", "bun"} else ""
+        start = f"{start}{separator} --host 127.0.0.1"
     return Recipe(
-        name=label, kind=kind, start=runners(start_script)[0] if start_script else None,
+        name=label, kind=kind, start=start,
         port=(_infer_port_from_command(scripts[start_script]) or default_port) if start_script else None,
         bootstrap=[_NODE_INSTALL.get(package_manager or "", "npm install")],
         build=runners("build", "typecheck"), test=runners("test", "check", "lint"),

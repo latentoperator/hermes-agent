@@ -160,7 +160,9 @@ def _browser_cfg(key: str, default, parse, log_label: str):
     leak into tool JSON); ``default`` when absent, not a mapping, or on any error."""
     try:
         from hermes_cli.config import read_raw_config
-        browser_cfg = read_raw_config().get("browser", {})
+        from hermes_cli.config import read_user_config_raw
+        read = read_user_config_raw if key == "snapshot_threshold" else read_raw_config
+        browser_cfg = read().get("browser", {})
         if isinstance(browser_cfg, dict) and key in browser_cfg:
             return parse(browser_cfg[key])
     except Exception as e:

@@ -151,6 +151,64 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
     assert send_calls[2]["reference"] is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_text", "expected_kind"),
+    [
+        ("403 Forbidden (error code: 50001): Missing Access", "forbidden"),
+        ("404 Not Found (error code: 10003): Unknown Channel", "not_found"),
+    ],
+)
+async def test_nonconversational_unavailable_target_send_fails_quietly(
+    caplog, error_text, expected_kind
+):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(send=AsyncMock(side_effect=RuntimeError(error_text)))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    caplog.set_level("DEBUG", logger="plugins.platforms.discord.adapter")
+    result = await adapter.send(
+        "555",
+        "Gateway shutting down",
+        metadata={"non_conversational": True},
+    )
+
+    assert result.success is False
+    assert result.error_kind == expected_kind
+    assert not [record for record in caplog.records if record.levelname == "ERROR"]
+    assert "unavailable target" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_nonconversational_missing_permissions_still_logs_error(caplog):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(
+        send=AsyncMock(
+            side_effect=RuntimeError(
+                "403 Forbidden (error code: 50013): Missing Permissions"
+            )
+        )
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    caplog.set_level("DEBUG", logger="plugins.platforms.discord.adapter")
+    result = await adapter.send(
+        "555",
+        "Gateway shutting down",
+        metadata={"non_conversational": True},
+    )
+
+    assert result.success is False
+    assert result.error_kind == "forbidden"
+    assert [record for record in caplog.records if record.levelname == "ERROR"]
+
+
 # ---------------------------------------------------------------------------
 # Forum channel tests
 # ---------------------------------------------------------------------------
@@ -416,5 +474,3 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     thread_kwargs = forum_channel.create_thread.await_args.kwargs
     assert thread_kwargs.get("file") is None
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
-
-

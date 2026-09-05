@@ -362,6 +362,59 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[-1][2]["success"] is True
 
 
+def test_run_one_job_delivery_uses_profile_secret_scope(monkeypatch, tmp_path):
+    """Standalone delivery must resolve the scheduled profile's credentials.
+
+    Desktop's built-in ticker multiplexes every local profile without live
+    adapters.  The job body already ran under the target profile's secret
+    scope, but that scope used to be reset before delivery, so a desktop
+    backend could send a Syren job with the backend owner's Telegram token.
+    """
+    import agent.secret_scope as secret_scope
+    import cron.scheduler as scheduler
+
+    profile_home = tmp_path / "syren"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "TELEGRAM_BOT_TOKEN=syren-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(scheduler, "_hermes_home", profile_home)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_args: {})
+    monkeypatch.setattr(scheduler, "finish_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda job, *, defer_agent_teardown=None, **_kw: (
+            True,
+            "output",
+            "profile-scoped response",
+            None,
+        ),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: True)
+
+    seen = {}
+
+    def _capture_delivery(*_args, **_kwargs):
+        seen["token"] = secret_scope.get_secret("TELEGRAM_BOT_TOKEN")
+        return None
+
+    monkeypatch.setattr(scheduler, "_deliver_result", _capture_delivery)
+
+    assert scheduler.run_one_job(
+        {
+            "id": "job-profile-delivery",
+            "execution_id": "exec-profile-delivery",
+            "deliver": "telegram",
+        }
+    ) is True
+    assert seen["token"] == "syren-token"
+    assert secret_scope.current_secret_scope() is None
+
+
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
     import cron.scheduler_provider as provider
 

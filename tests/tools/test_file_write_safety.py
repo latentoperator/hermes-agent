@@ -635,6 +635,149 @@ class TestProtectedInstructionFiles:
         assert not res.get("error"), res
         assert agents.read_text(encoding="utf-8") == "updated rules\n"
 
+    def _approved_kanban_write_card(
+        self, monkeypatch, db_path, *, task_id, profile, paths
+    ):
+        from gateway import decision_cards as dc
+
+        monkeypatch.setenv("HERMES_DECISION_QUEUE_DB", str(db_path))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_PROFILE", profile)
+        monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
+        canonical = [str(path.resolve()) for path in paths]
+        yes_action = "write exactly the listed repo-instruction files once"
+        card = dc.create_card(
+            question="Approve the exact protected repo-instruction write?",
+            context="\n".join([
+                f"Task {task_id} — Yes: {yes_action}",
+                *canonical,
+            ]),
+            default_action="Do not write the files.",
+            fire_at="after approval",
+            requested_by=f"{profile} kanban worker",
+            source_ref=f"{task_id}:protected-instruction-write",
+            originating_profile=profile,
+            action_kind="protected_instruction_write",
+            action_payload={
+                "action": "write_protected_instruction_files",
+                "task_id": task_id,
+                "paths": canonical,
+                "yes_action": yes_action,
+            },
+        )
+        dc.handle_action(
+            card.id,
+            "yes",
+            actor="Chris",
+            actor_id="42",
+            actor_platform="discord",
+        )
+        return card
+
+    def test_answered_decision_card_allows_exact_atomic_kanban_patch(
+        self, tmp_path, monkeypatch
+    ):
+        from gateway import decision_cards as dc
+        from tools.file_tools import patch_tool
+        import json
+
+        agents = tmp_path / "AGENTS.md"
+        claude = tmp_path / "CLAUDE.md"
+        card = self._approved_kanban_write_card(
+            monkeypatch,
+            tmp_path / "decision_cards.db",
+            task_id="t_authorized",
+            profile="dante",
+            paths=[agents, claude],
+        )
+        patch = (
+            "*** Begin Patch\n"
+            f"*** Add File: {agents}\n"
+            "+agent rules\n"
+            f"*** Add File: {claude}\n"
+            "+claude rules\n"
+            "*** End Patch"
+        )
+
+        res = json.loads(patch_tool(mode="patch", patch=patch))
+
+        assert not res.get("error"), res
+        assert agents.read_text(encoding="utf-8") == "agent rules"
+        assert claude.read_text(encoding="utf-8") == "claude rules"
+        with dc.connect() as conn:
+            events = conn.execute(
+                "SELECT event_type, actor, details_json FROM decision_card_events "
+                "WHERE card_id=? ORDER BY id",
+                (card.id,),
+            ).fetchall()
+        assert [row["event_type"] for row in events] == [
+            "created",
+            "button_yes",
+            "protected_write_claimed",
+        ]
+        claim = json.loads(events[-1]["details_json"])
+        assert claim["task_id"] == "t_authorized"
+        assert claim["profile"] == "dante"
+        assert claim["paths"] == sorted([str(agents.resolve()), str(claude.resolve())])
+
+    def test_decision_card_grant_is_exact_path_and_one_shot(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.file_tools import patch_tool
+        import json
+
+        agents = tmp_path / "AGENTS.md"
+        claude = tmp_path / "CLAUDE.md"
+        other = tmp_path / "nested" / "AGENTS.md"
+        other.parent.mkdir()
+        self._approved_kanban_write_card(
+            monkeypatch,
+            tmp_path / "decision_cards.db",
+            task_id="t_authorized",
+            profile="dante",
+            paths=[agents, claude],
+        )
+
+        exact_patch = (
+            "*** Begin Patch\n"
+            f"*** Add File: {agents}\n"
+            "+agent rules\n"
+            f"*** Add File: {claude}\n"
+            "+claude rules\n"
+            "*** End Patch"
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_other")
+        wrong_task = json.loads(patch_tool(mode="patch", patch=exact_patch))
+        assert wrong_task.get("error") and "BLOCKED" in wrong_task["error"]
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_authorized")
+        monkeypatch.setenv("HERMES_PROFILE", "wren")
+        wrong_profile = json.loads(patch_tool(mode="patch", patch=exact_patch))
+        assert wrong_profile.get("error") and "BLOCKED" in wrong_profile["error"]
+        monkeypatch.setenv("HERMES_PROFILE", "dante")
+        assert not agents.exists()
+        assert not claude.exists()
+
+        wrong_patch = (
+            "*** Begin Patch\n"
+            f"*** Add File: {agents}\n"
+            "+agent rules\n"
+            f"*** Add File: {other}\n"
+            "+other rules\n"
+            "*** End Patch"
+        )
+        wrong = json.loads(patch_tool(mode="patch", patch=wrong_patch))
+        assert wrong.get("error") and "BLOCKED" in wrong["error"]
+        assert not agents.exists()
+        assert not other.exists()
+
+        first = json.loads(patch_tool(mode="patch", patch=exact_patch))
+        assert not first.get("error"), first
+
+        replay = json.loads(patch_tool(mode="patch", patch=exact_patch))
+        assert replay.get("error") and "BLOCKED" in replay["error"]
+        assert agents.read_text(encoding="utf-8") == "agent rules"
+        assert claude.read_text(encoding="utf-8") == "claude rules"
+
     # ---- gateway round-trip ----------------------------------------------
 
     def test_gateway_notify_resolve_once_allows(self, tmp_path):

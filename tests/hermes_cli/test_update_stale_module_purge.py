@@ -23,6 +23,7 @@ import pytest
 
 from hermes_cli import main as cli_main
 from hermes_cli import update_cmd
+from hermes_cli import update_receipt
 
 
 @pytest.fixture(autouse=True)
@@ -75,11 +76,22 @@ def test_purge_evicts_hermes_prefixed_modules():
 
 
 def test_purge_protects_executing_modules():
-    # The updater's own modules must survive — they're running this code.
+    # The updater's own modules and its in-flight receipt must survive. If the
+    # receipt module is evicted after a pull, the fresh module imported during
+    # finalization has ``_current = None`` and the successful update leaves no
+    # receipt (or leaves an older failed receipt looking current).
+    receipt = object()
+    original = update_receipt._current
+    update_receipt._current = receipt
     cli_main._purge_stale_hermes_modules()
-    assert sys.modules.get("hermes_cli.update_cmd") is update_cmd
-    assert sys.modules.get("hermes_cli.main") is cli_main
-    assert "hermes_cli" in sys.modules
+    try:
+        assert sys.modules.get("hermes_cli.update_cmd") is update_cmd
+        assert sys.modules.get("hermes_cli.update_receipt") is update_receipt
+        assert update_receipt._current is receipt
+        assert sys.modules.get("hermes_cli.main") is cli_main
+        assert "hermes_cli" in sys.modules
+    finally:
+        update_receipt._current = original
 
 
 def test_purge_leaves_prefix_lookalikes_alone():

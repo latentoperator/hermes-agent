@@ -272,6 +272,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                execute="gateway_help", args_hint="[skills|<filter>]"),
     CommandDef("palette", "Open the fuzzy command palette (also Ctrl+P)", "Info",
                cli_only=True, busy_policy="dispatch"),
+    CommandDef("fleet", "Reset authoritative profile sessions", "Session",
+               gateway_only=True, args_hint="reset-session <all|profile[,profile]>", subcommands=("reset-session",), busy_policy="dispatch"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True, busy_policy="dispatch", desktop="terminal"),
     CommandDef("usage", "Show token usage and rate limits; `reset` redeems a banked Codex limit reset", "Info",

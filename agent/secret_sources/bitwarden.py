@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import platform
+import random
 import re
 import shutil
 import subprocess
@@ -46,6 +47,8 @@ _BWS_RELEASE_BASE = f"https://github.com/bitwarden/sdk-sm/releases/download/bws-
 _BWS_CHECKSUM_NAME = f"bws-sha256-checksums-{_BWS_VERSION}.txt"
 _BWS_DOWNLOAD_TIMEOUT = 60
 _BWS_RUN_TIMEOUT = 30
+_BWS_RATE_LIMIT_MAX_ATTEMPTS = 5
+_BWS_RATE_LIMIT_BASE_DELAY = 1.0
 
 # <hermes_home>/cache/bws_cache.json holds only secret VALUES (never the access
 # token); kept out of .env so users editing .env don't commit BSM-sourced secrets.
@@ -407,12 +410,15 @@ def _run_bws_list(bws: Path, access_token: str, project_id: str, server_url: str
     if server_url:  # empty keeps whatever BWS_SERVER_URL the shell already had
         env["BWS_SERVER_URL"] = server_url
 
-    proc = run_cli(cmd, env=env, timeout=_BWS_RUN_TIMEOUT, label="bws",
-                   timeout_message=f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets")
-
-    if proc.returncode != 0:
+    for attempt in range(1, _BWS_RATE_LIMIT_MAX_ATTEMPTS + 1):
+        proc = run_cli(cmd, env=env, timeout=_BWS_RUN_TIMEOUT, label="bws",
+                       timeout_message=f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets")
+        if proc.returncode == 0:
+            break
         err = _summarize_bws_stderr(proc.stderr or proc.stdout or "")
-        raise RuntimeError(f"bws exited {proc.returncode}: {err[:200]}")
+        if not _is_bws_rate_limited(err) or attempt >= _BWS_RATE_LIMIT_MAX_ATTEMPTS:
+            raise RuntimeError(f"bws exited {proc.returncode}: {err[:200]}")
+        time.sleep(_bws_rate_limit_delay(attempt, err))
 
     raw = proc.stdout.strip()
     if not raw:
@@ -471,6 +477,8 @@ class BitwardenSource(SecretSource):
             "override_existing": {"description": "BSM values overwrite .env/shell values", "default": True},
             "auto_install": {"description": "Auto-download the pinned bws binary", "default": True},
             "server_url": {"description": "Region / self-hosted endpoint (empty = US Cloud)", "default": ""},
+            "aliases": {"description": "Map BSM source keys to target env var names", "default": {}},
+            "include_keys": {"description": "Optional allowlist of BSM source keys to import", "default": []},
         }
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
@@ -511,9 +519,16 @@ class BitwardenSource(SecretSource):
                                 f"or belongs to another region.  ({result.error})")
             return result
 
-        result.secrets = secrets
+        result.secrets, skipped, alias_warnings = _filter_and_alias_secrets(
+            secrets,
+            aliases=_normalize_aliases(cfg.get("aliases")),
+            include_keys=_normalize_string_list(cfg.get("include_keys")),
+        )
+        result.skipped.extend(skipped)
         result.warnings.extend(warnings)
+        result.warnings.extend(alias_warnings)
         return result
+
 
 
 def clear_caches(home_path: Optional[Path] = None) -> None:
@@ -623,6 +638,7 @@ def apply_bitwarden_secrets(
     return result
 
 
+
 _PLUGIN_COMPAT_LAZY = {
     'DiskCache': ('agent.secret_sources._cache', 'DiskCache'),
 }
@@ -637,3 +653,80 @@ def __getattr__(name):  # PEP 562 — lazy so no import cycles
     warn_once(__name__, name, *target)
     return getattr(importlib.import_module(target[0]), target[1])
 # ---- END PLUGIN-COMPAT ----
+
+
+def _bws_rate_limit_delay(attempt: int, message: str) -> float:
+    """Return bounded exponential backoff for BWS fleet-start throttling."""
+    retry_after = _BWS_RATE_LIMIT_BASE_DELAY
+    marker = "try again in "
+    lowered = message.lower()
+    if marker in lowered:
+        tail = lowered.split(marker, 1)[1]
+        token = tail.split()[0].rstrip("s.,")
+        try:
+            retry_after = max(retry_after, float(token))
+        except ValueError:
+            pass
+    exponential = _BWS_RATE_LIMIT_BASE_DELAY * (2 ** (attempt - 1))
+    return min(max(retry_after, exponential) + random.uniform(0.0, 0.75), 8.0)
+
+
+
+
+def _filter_and_alias_secrets(
+    secrets: Dict[str, str],
+    *,
+    aliases: Optional[Dict[str, str]] = None,
+    include_keys: Optional[List[str]] = None,
+) -> tuple[Dict[str, str], List[str], List[str]]:
+    """Apply source-key allowlisting and aliases before env application."""
+    include_set = set(include_keys or [])
+    alias_map = aliases or {}
+    filtered: Dict[str, str] = {}
+    skipped: List[str] = []
+    warnings: List[str] = []
+    for key, value in secrets.items():
+        if include_set and key not in include_set:
+            skipped.append(key)
+            continue
+        target_key = alias_map.get(key, key)
+        if not _is_valid_env_name(target_key):
+            warnings.append(
+                f"Skipping alias target {target_key!r} for {key!r}: "
+                "not a valid env-var name"
+            )
+            continue
+        filtered[target_key] = value
+    return filtered, skipped, warnings
+
+
+
+
+def _is_bws_rate_limited(message: str) -> bool:
+    lowered = message.lower()
+    return (
+        "429" in lowered
+        or "too many requests" in lowered
+        or "slow down" in lowered
+    )
+
+
+
+
+def _normalize_aliases(raw: object) -> dict[str, str]:
+    """Return valid string-to-string BSM alias mappings from config."""
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        source: target
+        for source, target in raw.items()
+        if isinstance(source, str) and isinstance(target, str)
+    }
+
+
+
+
+def _normalize_string_list(raw: object) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, str)]

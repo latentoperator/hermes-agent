@@ -533,7 +533,7 @@ class _KanbanNotification:
         try:
             self.plat = self.platform_cls(self.platform_str)
         except ValueError:
-            await self.advance()
+            # The claim already advanced this cursor.
             return
         # Same chokepoint as authorization: a stamped profile is served by ITS
         # same-platform adapter and never falls back to the default profile's
@@ -569,8 +569,7 @@ class _KanbanNotification:
                 )
                 return
 
-        # Delivery complete: advance the cursor (the dedup mechanism).
-        await self.advance()
+        # Claim already advanced the cursor; a late completion must not regress it.
         if not is_push:
             self.clear_failures()
         if is_push and self.send_passive and wake_kinds:

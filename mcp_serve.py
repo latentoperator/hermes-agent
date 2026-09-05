@@ -49,11 +49,11 @@ def _get_sessions_dir() -> Path:
     return _hermes_home() / "sessions"
 
 
-def _read_state_db_mtime() -> float:
+def _read_state_db_mtime() -> int:
     try:
-        return (_hermes_home() / "state.db").stat().st_mtime
+        return (_hermes_home() / "state.db").stat().st_mtime_ns
     except OSError:  # missing file included
-        return 0.0
+        return 0
 
 
 def _read_json(path: Path):
@@ -275,7 +275,7 @@ class EventBridge:
         self._thread: Optional[threading.Thread] = None
         self._last_poll_timestamps: Dict[str, float] = {}  # session_key -> unix timestamp
         self._pending_approvals: Dict[str, dict] = {}  # populated from events
-        self._state_db_mtime: float = 0.0  # skip polling work when state.db is unchanged
+        self._state_db_mtime: int = 0  # skip polling work when state.db is unchanged
         self._cached_sessions_index: dict = {}
 
     def start(self):

@@ -49,10 +49,11 @@ class GatewayAgentCacheMixin:
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                stat = path.stat()
+                identity = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                identity = (None, None, None)
+            memo_key = (str(path), *identity)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)

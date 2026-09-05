@@ -170,6 +170,8 @@ class SessionContext:
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    message_id: str = ""
+    allow_action_approval: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -742,7 +744,7 @@ class SessionStore(
 ):
     """Session routing index + transcripts: SQLite (SessionDB), legacy JSONL fallback."""
 
-    def __init__(self, sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=None):
+    def __init__(self, sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=None, session_db=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
@@ -786,7 +788,7 @@ class SessionStore(
         # write. See #88532. Priming the handle for the current scope here keeps the startup diagnostics
         # exactly where they were: the live-DB isolation guard still raises during construction, and the
         # JSONL-fallback warning is still printed once at startup rather than on first use.
-        self._db_pinned = _DB_UNPINNED
+        self._db_pinned = session_db if session_db is not None else _DB_UNPINNED
         self._db_handles: Dict[Path, Any] = {}
         self._db_handles_lock = threading.Lock()
         self._profile_home_cache: Dict[str, Optional[Path]] = {}  # profile -> HERMES_HOME (hits)
@@ -806,7 +808,8 @@ class SessionStore(
             self._routing_home: Optional[Path] = Path(get_hermes_home())
         except Exception:
             self._routing_home = None
-        self._open_session_db_for_active_scope()
+        if session_db is None:
+            self._open_session_db_for_active_scope()
 
     def _lazy(self, name: str, factory):
         """``self.<name>``, created via *factory* when missing/None (suites build bare stores via
