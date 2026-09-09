@@ -43,6 +43,10 @@ class WorkflowContinuationError(RuntimeError):
     """The recorded workflow cannot be resumed safely."""
 
 
+class _WorkflowReconciliationRequired(RuntimeError):
+    """A cross-store side effect may have committed and must be reconciled."""
+
+
 @dataclass(frozen=True)
 class WorkflowContinuationResult:
     status: str
@@ -153,9 +157,22 @@ def _validate_source_stop(
             raise WorkflowContinuationError("source task stop kind does not match its status")
 
 
-def _failure(conn: sqlite3.Connection, card, message: str, details: dict[str, Any]) -> WorkflowContinuationResult:
+def _failure(
+    conn: sqlite3.Connection,
+    card,
+    message: str,
+    details: dict[str, Any],
+    *,
+    reconciliation_required: bool = False,
+) -> WorkflowContinuationResult:
     receipt = f"Approval recorded, but the exact parked workflow was not resumed: {message}. No client action was executed."
-    payload = {**details, "reason": message, "external_action_executed": False, "worker_claimed": False}
+    payload = {
+        **details,
+        "reason": message,
+        "reconciliation_required": reconciliation_required,
+        "external_action_executed": False,
+        "worker_claimed": False,
+    }
     _record(conn, card.id, "workflow_resume_failed", payload)
     conn.execute("UPDATE decision_cards SET receipt=?, updated_at=? WHERE id=?", (receipt, datetime.now(timezone.utc).isoformat(timespec="seconds"), card.id))
     conn.commit()
@@ -216,12 +233,22 @@ def continue_answered_workflow(
         ).fetchone()
         if prior is not None:
             details = json.loads(str(prior["details_json"] or "{}"))
-            decision_conn.commit()
-            return WorkflowContinuationResult(
-                "succeeded" if prior["event_type"] == "workflow_resume_succeeded" else "failed",
-                card.receipt,
-                details if isinstance(details, dict) else {},
-            )
+            details = details if isinstance(details, dict) else {}
+            # Replaying the same terminal Yes is reconciliation, not new authority:
+            # immutable failures stay final, while uncertain cross-store effects
+            # are inspected again until task and supervisor converge.
+            if (
+                prior["event_type"] == "workflow_resume_succeeded"
+                or details.get("reconciliation_required") is not True
+            ):
+                decision_conn.commit()
+                return WorkflowContinuationResult(
+                    "succeeded"
+                    if prior["event_type"] == "workflow_resume_succeeded"
+                    else "failed",
+                    card.receipt,
+                    details,
+                )
         claimed = decision_conn.execute(
             "SELECT 1 FROM decision_card_events WHERE card_id=? "
             "AND event_type='workflow_resume_claimed' LIMIT 1",
@@ -234,6 +261,7 @@ def continue_answered_workflow(
                 "workflow_resume_claimed",
                 {"approved_by": card.answered_by, "approved_at": card.answered_at},
             )
+        reconciliation_started = False
         try:
             action = validate_workflow_resume_card(card)
             if card.status != "answered_yes" or card.answer != "yes":
@@ -296,6 +324,7 @@ def continue_answered_workflow(
                         raise WorkflowContinuationError("source task still has an unfinished parent")
 
             profile_home = _supervisor_profile_home(action["supervisor_profile"])
+            reconciliation_started = True
             with cron_jobs.use_cron_store(profile_home):
                 supervisor = cron_jobs.get_job(action["supervisor_job_id"])
                 if supervisor is None:
@@ -320,7 +349,9 @@ def continue_answered_workflow(
                 if supervisor_changed:
                     supervisor = cron_jobs.resume_job(action["supervisor_job_id"])
                     if supervisor is None or not cron_jobs.is_job_runnable(supervisor):
-                        raise WorkflowContinuationError("supervisor resume readback failed")
+                        raise _WorkflowReconciliationRequired(
+                            "supervisor resume readback failed"
+                        )
 
             try:
                 with kbc.connect_closing(board=action["board"]) as board_conn:
@@ -334,19 +365,31 @@ def continue_answered_workflow(
                         source_event_id=action["source_event_id"],
                     )
                     if current.status in {"blocked", "triage"}:
-                        resumed, reason = kb.resume_task_from_decision(
-                            board_conn,
-                            current.id,
-                            decision_card_id=card.id,
-                            source_event_id=action["source_event_id"],
-                            approved_by=card.answered_by,
-                            approved_at=card.answered_at,
-                        )
+                        try:
+                            resumed, reason = kb.resume_task_from_decision(
+                                board_conn,
+                                current.id,
+                                decision_card_id=card.id,
+                                source_event_id=action["source_event_id"],
+                                approved_by=card.answered_by,
+                                approved_at=card.answered_at,
+                            )
+                        except Exception as exc:
+                            raise _WorkflowReconciliationRequired(
+                                str(exc).strip() or type(exc).__name__
+                            ) from exc
                         if not resumed:
                             raise WorkflowContinuationError(reason or "source task continuation failed")
-                    current = kb.get_task(board_conn, current.id)
+                    try:
+                        current = kb.get_task(board_conn, current.id)
+                    except Exception as exc:
+                        raise _WorkflowReconciliationRequired(
+                            str(exc).strip() or type(exc).__name__
+                        ) from exc
                     if current is None or current.status not in {"ready", "running"}:
-                        raise WorkflowContinuationError("source task transition readback failed")
+                        raise _WorkflowReconciliationRequired(
+                            "source task transition readback failed"
+                        )
                     task_after = current.status
             except Exception:
                 if supervisor_changed:
@@ -358,7 +401,7 @@ def continue_answered_workflow(
                             rolled_back.get(key) != value
                             for key, value in supervisor_snapshot.items()
                         ):
-                            raise WorkflowContinuationError(
+                            raise _WorkflowReconciliationRequired(
                                 "source task transition failed and supervisor rollback readback failed"
                             )
                 raise
@@ -390,6 +433,29 @@ def continue_answered_workflow(
             decision_conn.execute("UPDATE decision_cards SET receipt=?, updated_at=? WHERE id=?", (receipt, datetime.now(timezone.utc).isoformat(timespec="seconds"), card.id))
             decision_conn.commit()
             return WorkflowContinuationResult("succeeded", receipt, details)
+        except _WorkflowReconciliationRequired as exc:
+            message = str(exc).strip() or type(exc).__name__
+            return _failure(
+                decision_conn,
+                card,
+                message,
+                {"approved_by": card.answered_by, "approved_at": card.answered_at},
+                reconciliation_required=True,
+            )
+        except WorkflowContinuationError as exc:
+            message = str(exc).strip() or type(exc).__name__
+            return _failure(
+                decision_conn,
+                card,
+                message,
+                {"approved_by": card.answered_by, "approved_at": card.answered_at},
+            )
         except Exception as exc:  # durable fail-closed receipt for every post-approval fault
             message = str(exc).strip() or type(exc).__name__
-            return _failure(decision_conn, card, message, {"approved_by": card.answered_by, "approved_at": card.answered_at})
+            return _failure(
+                decision_conn,
+                card,
+                message,
+                {"approved_by": card.answered_by, "approved_at": card.answered_at},
+                reconciliation_required=reconciliation_started,
+            )

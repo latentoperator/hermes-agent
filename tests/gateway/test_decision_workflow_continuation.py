@@ -451,6 +451,70 @@ def test_retry_reconciles_termination_after_task_transition(tmp_path, monkeypatc
     assert result.status == "succeeded"
 
 
+def test_duplicate_yes_reconciles_transient_failure_after_committed_task_transition(
+    tmp_path, monkeypatch
+):
+    root, profile_home, task_id, job_id, card, initial_runs = _setup_parked_workflow(
+        tmp_path, monkeypatch
+    )
+    original_get_task = continuation.kb.get_task
+    calls = 0
+
+    def fail_first_post_transition_readback(conn, requested_task_id):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise RuntimeError("injected post-transition readback outage")
+        return original_get_task(conn, requested_task_id)
+
+    monkeypatch.setattr(
+        continuation.kb, "get_task", fail_first_post_transition_readback
+    )
+    _, first_receipt = dc.handle_action(
+        card.id,
+        "yes",
+        actor="Chris",
+        actor_id="42",
+        actor_platform="telegram",
+    )
+    monkeypatch.setattr(continuation.kb, "get_task", original_get_task)
+
+    with kbc.connect_closing(board="default") as conn:
+        first_task = kb.get_task(conn, task_id)
+        assert first_task is not None and first_task.status == "ready"
+    with cron_jobs.use_cron_store(profile_home):
+        first_supervisor = cron_jobs.get_job(job_id)
+        assert first_supervisor is not None and first_supervisor["state"] == "paused"
+    assert "injected post-transition readback outage" in first_receipt
+
+    _, retry_receipt = dc.handle_action(
+        card.id,
+        "yes",
+        actor="Chris",
+        actor_id="42",
+        actor_platform="telegram",
+    )
+
+    with kbc.connect_closing(board="default") as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert task.current_run_id is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='decision_resumed'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == initial_runs
+    with cron_jobs.use_cron_store(profile_home):
+        supervisor = cron_jobs.get_job(job_id)
+        assert supervisor is not None and supervisor["state"] == "scheduled"
+    assert "no worker was claimed" in retry_receipt.lower()
+    assert "no client action was executed" in retry_receipt.lower()
+    assert _workflow_event_count(root, card.id, "workflow_resume_failed") == 1
+    assert _workflow_event_count(root, card.id, "workflow_resume_succeeded") == 1
+
+
 @pytest.mark.parametrize(
     "termination_stage",
     ["after_claim", "after_supervisor_resume", "after_task_transition"],
@@ -543,6 +607,9 @@ def test_expired_or_stale_approval_fails_closed(tmp_path, monkeypatch):
     answered, receipt = dc.handle_action(
         card.id, "yes", actor="Chris", actor_id="42", actor_platform="telegram"
     )
+    _, retry_receipt = dc.handle_action(
+        card.id, "yes", actor="Chris", actor_id="42", actor_platform="telegram"
+    )
 
     with kbc.connect_closing(board="default") as conn:
         assert kb.get_task(conn, task_id).status == "blocked"
@@ -550,7 +617,9 @@ def test_expired_or_stale_approval_fails_closed(tmp_path, monkeypatch):
         assert cron_jobs.get_job(job_id)["state"] == "paused"
     assert answered.answered_by == "Chris" and answered.answered_at
     assert "expired" in receipt.lower()
+    assert retry_receipt == receipt
     assert _workflow_event_count(root, card.id, "workflow_resume_failed") == 1
+    assert _workflow_event_count(root, card.id, "workflow_resume_succeeded") == 0
 
 
 def test_scope_mismatch_fails_closed(tmp_path, monkeypatch):
