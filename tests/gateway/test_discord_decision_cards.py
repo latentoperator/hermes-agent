@@ -9,7 +9,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway import decision_cards as dc
-from plugins.platforms.discord.adapter import DecisionCardView
+from plugins.platforms.discord import adapter as discord_adapter
+from plugins.platforms.discord.adapter import DecisionCardView, DiscordAdapter
 
 
 def _make_interaction(*, user_id: str = "42", display_name: str = "Chris"):
@@ -155,3 +156,61 @@ def test_decision_card_text_leads_with_asking_agent(queue_db):
     )
 
     assert dc.format_card_text(card).splitlines()[0] == "**Virgil asks:**"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("receipt", "expected_color"),
+    [
+        ("Exact parked workflow resumed. No client action was executed.", "green"),
+        (
+            "Approval recorded, but the exact parked workflow was not resumed: supervisor missing.",
+            "red",
+        ),
+    ],
+)
+async def test_persistent_view_surfaces_workflow_continuation_outcome(
+    queue_db, monkeypatch, receipt, expected_color
+):
+    card = SimpleNamespace(action_kind=dc.WORKFLOW_RESUME_ACTION_KIND)
+    monkeypatch.setattr(dc, "handle_action", lambda *args, **kwargs: (card, receipt))
+    view = DecisionCardView(card_id="dc_workflow", allowed_user_ids={"42"})
+    interaction = _make_interaction()
+
+    await view._resolve_action(interaction, "yes")
+
+    embed = interaction.message.embeds[0]
+    assert receipt in embed.footer["text"]
+    assert embed.color == getattr(discord_adapter.discord.Color, expected_color)()
+    interaction.response.edit_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("receipt", "expected_color"),
+    [
+        ("Exact parked workflow resumed. No client action was executed.", "green"),
+        (
+            "Approval recorded, but the exact parked workflow was not resumed: supervisor missing.",
+            "red",
+        ),
+    ],
+)
+async def test_raw_interaction_surfaces_workflow_continuation_outcome(
+    queue_db, monkeypatch, receipt, expected_color
+):
+    card = SimpleNamespace(action_kind=dc.WORKFLOW_RESUME_ACTION_KIND)
+    monkeypatch.setattr(dc, "handle_action", lambda *args, **kwargs: (card, receipt))
+    adapter = object.__new__(DiscordAdapter)
+    adapter._allowed_user_ids = {"42"}
+    adapter._allowed_role_ids = set()
+    interaction = _make_interaction()
+
+    await adapter._handle_decision_card_interaction(
+        interaction, "decision:dc_workflow:yes"
+    )
+
+    embed = interaction.message.embeds[0]
+    assert receipt in embed.footer["text"]
+    assert embed.color == getattr(discord_adapter.discord.Color, expected_color)()
+    interaction.response.edit_message.assert_awaited_once()

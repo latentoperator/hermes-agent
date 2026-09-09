@@ -6319,18 +6319,11 @@ class DiscordAdapter(BasePlatformAdapter):
 
         embed = message.embeds[0] if (message and getattr(message, "embeds", None)) else None
         if embed:
-            if action == "yes":
-                embed.color = discord.Color.green()
-                embed.set_footer(text=f"Yes by {display_name}")
-            elif action == "no":
-                embed.color = discord.Color.red()
-                embed.set_footer(text=f"No by {display_name}")
-            elif action == "wait":
-                embed.color = discord.Color.greyple()
-                embed.set_footer(text=f"Snoozed by {display_name}")
-            else:
-                embed.color = discord.Color.blue()
-                embed.set_footer(text=f"More info requested by {display_name}")
+            color, footer = _decision_card_resolution_style(
+                card, action, display_name, receipt
+            )
+            embed.color = color
+            embed.set_footer(text=footer)
 
         if action in {"yes", "no", "wait"}:
             # For adapter-sent cards, discord.py supplies the actual View via
@@ -6396,6 +6389,27 @@ class DiscordAdapter(BasePlatformAdapter):
 
 
 
+
+
+def _decision_card_resolution_style(card, action: str, display_name: str, receipt: str):
+    """Return the visible terminal style, including executable continuation outcome."""
+    styles = {
+        "yes": (discord.Color.green(), f"Yes by {display_name}"),
+        "no": (discord.Color.red(), f"No by {display_name}"),
+        "wait": (discord.Color.greyple(), f"Snoozed by {display_name}"),
+        "info": (discord.Color.blue(), f"More info requested by {display_name}"),
+    }
+    color, footer = styles[action]
+    if (
+        action == "yes"
+        and getattr(card, "action_kind", "") == "kanban_workflow_resume"
+    ):
+        if receipt.startswith(
+            "Approval recorded, but the exact parked workflow was not resumed:"
+        ):
+            color = discord.Color.red()
+        footer = f"Yes by {display_name} — {receipt}"[:2048]
+    return color, footer
 
 
 # ---------------------------------------------------------------------------
@@ -7010,18 +7024,11 @@ def _define_discord_view_classes() -> None:
 
             embed = message.embeds[0] if (message and getattr(message, "embeds", None)) else None
             if embed:
-                if action == "yes":
-                    embed.color = discord.Color.green()
-                    embed.set_footer(text=f"Yes by {display_name}")
-                elif action == "no":
-                    embed.color = discord.Color.red()
-                    embed.set_footer(text=f"No by {display_name}")
-                elif action == "wait":
-                    embed.color = discord.Color.greyple()
-                    embed.set_footer(text=f"Snoozed by {display_name}")
-                else:
-                    embed.color = discord.Color.blue()
-                    embed.set_footer(text=f"More info requested by {display_name}")
+                color, footer = _decision_card_resolution_style(
+                    _card, action, display_name, receipt
+                )
+                embed.color = color
+                embed.set_footer(text=footer)
 
             if action in {"yes", "no", "wait"}:
                 for child in self.children:

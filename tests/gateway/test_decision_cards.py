@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import sqlite3
+import threading
 from typing import Any
 
 import pytest
@@ -181,6 +183,58 @@ def test_handle_action_updates_audit_trail(queue_db):
             (card.id,),
         ).fetchall()
     assert events == [("created", "Dante morning pulse"), ("button_yes", "Chris")]
+
+
+@pytest.mark.parametrize("actions", [("yes", "no"), ("yes", "yes")])
+def test_first_concurrent_terminal_answer_is_atomically_single_use(
+    queue_db, monkeypatch, actions
+):
+    card = dc.create_card(**_card())
+    barrier = threading.Barrier(2)
+    original = dc._row_to_card
+    synchronized_threads: set[int] = set()
+    synchronization_lock = threading.Lock()
+
+    def synchronize_active_reads(row):
+        parsed = original(row)
+        thread_id = threading.get_ident()
+        should_wait = False
+        if parsed.status in dc.ACTIVE_STATUSES:
+            with synchronization_lock:
+                if thread_id not in synchronized_threads:
+                    synchronized_threads.add(thread_id)
+                    should_wait = True
+        if should_wait:
+            try:
+                barrier.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+        return parsed
+
+    monkeypatch.setattr(dc, "_row_to_card", synchronize_active_reads)
+
+    def answer(action: str) -> tuple[str, str]:
+        answered, receipt = dc.handle_action(
+            card.id,
+            action,
+            actor=f"actor-{action}",
+            actor_id=f"id-{action}",
+            actor_platform="discord",
+        )
+        return answered.answer, receipt
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(answer, actions))
+
+    with sqlite3.connect(queue_db) as conn:
+        terminal_events = conn.execute(
+            "SELECT event_type FROM decision_card_events "
+            "WHERE card_id=? AND event_type IN ('button_yes','button_no')",
+            (card.id,),
+        ).fetchall()
+    assert len(terminal_events) == 1
+    assert sum("already closed" in receipt.lower() for _, receipt in results) == 1
+    assert dc.get_card(card.id).answer in actions
 
 
 def test_info_action_keeps_card_explainable(queue_db):

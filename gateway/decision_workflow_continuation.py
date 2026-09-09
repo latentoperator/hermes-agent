@@ -126,7 +126,31 @@ def _record(conn: sqlite3.Connection, card_id: str, event_type: str, details: di
     from gateway.decision_cards import record_event
 
     record_event(conn, card_id, event_type, actor="decision-workflow-continuation", details=details)
-    conn.commit()
+
+
+def _supervisor_profile_home(profile: str) -> Path:
+    root = get_default_hermes_root()
+    return root if profile in {"default", "hermes"} else root / "profiles" / profile
+
+
+def _validate_source_stop(
+    board_conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    task_status: str,
+    source_event_id: int,
+) -> None:
+    latest = board_conn.execute(
+        "SELECT id,kind FROM task_events WHERE task_id=? "
+        "AND kind IN ('blocked','block_loop_detected') ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is None or int(latest["id"]) != source_event_id:
+        raise WorkflowContinuationError("source task stop event is stale or mismatched")
+    if task_status in {"blocked", "triage"}:
+        expected_kind = "block_loop_detected" if task_status == "triage" else "blocked"
+        if latest["kind"] != expected_kind:
+            raise WorkflowContinuationError("source task stop kind does not match its status")
 
 
 def _failure(conn: sqlite3.Connection, card, message: str, details: dict[str, Any]) -> WorkflowContinuationResult:
@@ -183,6 +207,7 @@ def continue_answered_workflow(
                 {"worker_claimed": False, "external_action_executed": False},
             )
         decision_conn.execute("BEGIN IMMEDIATE")
+        card = dc.get_card(card_id, conn=decision_conn)
         prior = decision_conn.execute(
             "SELECT event_type,details_json FROM decision_card_events "
             "WHERE card_id=? AND event_type IN ('workflow_resume_succeeded','workflow_resume_failed') "
@@ -202,19 +227,13 @@ def continue_answered_workflow(
             "AND event_type='workflow_resume_claimed' LIMIT 1",
             (card_id,),
         ).fetchone()
-        if claimed is not None:
-            decision_conn.commit()
-            return WorkflowContinuationResult(
-                "claimed",
-                "The exact workflow continuation is already in progress; no duplicate action was taken.",
-                {"worker_claimed": False, "external_action_executed": False},
+        if claimed is None:
+            _record(
+                decision_conn,
+                card_id,
+                "workflow_resume_claimed",
+                {"approved_by": card.answered_by, "approved_at": card.answered_at},
             )
-        _record(
-            decision_conn,
-            card_id,
-            "workflow_resume_claimed",
-            {"approved_by": card.answered_by, "approved_at": card.answered_at},
-        )
         try:
             action = validate_workflow_resume_card(card)
             if card.status != "answered_yes" or card.answer != "yes":
@@ -233,6 +252,23 @@ def continue_answered_workflow(
                 if task.tenant != action["tenant"] or task.assignee != card.originating_profile:
                     raise WorkflowContinuationError("source task tenant or assignee does not match the card")
                 task_before = task.status
+                if task_before not in {
+                    "blocked",
+                    "triage",
+                    "ready",
+                    "running",
+                    "done",
+                    "archived",
+                }:
+                    raise WorkflowContinuationError(
+                        f"source task status {task_before!r} is not resumable"
+                    )
+                _validate_source_stop(
+                    board_conn,
+                    task_id=task.id,
+                    task_status=task_before,
+                    source_event_id=action["source_event_id"],
+                )
                 if task_before in {"done", "archived"}:
                     details = {
                         "task_id": task.id,
@@ -250,23 +286,7 @@ def continue_answered_workflow(
                     decision_conn.execute("UPDATE decision_cards SET receipt=? WHERE id=?", (receipt, card.id))
                     decision_conn.commit()
                     return WorkflowContinuationResult("succeeded", receipt, details)
-                if task_before not in {"blocked", "triage", "ready", "running"}:
-                    raise WorkflowContinuationError(f"source task status {task_before!r} is not resumable")
                 if task_before in {"blocked", "triage"}:
-                    latest = board_conn.execute(
-                        "SELECT id FROM task_events WHERE task_id=? AND kind IN ('blocked','block_loop_detected') "
-                        "ORDER BY id DESC LIMIT 1",
-                        (task.id,),
-                    ).fetchone()
-                    if latest is None or int(latest["id"]) != action["source_event_id"]:
-                        raise WorkflowContinuationError("source task stop event is stale or mismatched")
-                    expected_kind = "block_loop_detected" if task_before == "triage" else "blocked"
-                    kind = board_conn.execute(
-                        "SELECT kind FROM task_events WHERE id=? AND task_id=?",
-                        (action["source_event_id"], task.id),
-                    ).fetchone()
-                    if kind is None or kind["kind"] != expected_kind:
-                        raise WorkflowContinuationError("source task stop kind does not match its status")
                     unsatisfied = board_conn.execute(
                         "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
                         "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1",
@@ -275,7 +295,7 @@ def continue_answered_workflow(
                     if unsatisfied:
                         raise WorkflowContinuationError("source task still has an unfinished parent")
 
-            profile_home = get_default_hermes_root() / "profiles" / action["supervisor_profile"]
+            profile_home = _supervisor_profile_home(action["supervisor_profile"])
             with cron_jobs.use_cron_store(profile_home):
                 supervisor = cron_jobs.get_job(action["supervisor_job_id"])
                 if supervisor is None:
@@ -307,6 +327,12 @@ def continue_answered_workflow(
                     current = kb.get_task(board_conn, action["task_id"])
                     if current is None:
                         raise WorkflowContinuationError("source task disappeared before continuation")
+                    _validate_source_stop(
+                        board_conn,
+                        task_id=current.id,
+                        task_status=current.status,
+                        source_event_id=action["source_event_id"],
+                    )
                     if current.status in {"blocked", "triage"}:
                         resumed, reason = kb.resume_task_from_decision(
                             board_conn,

@@ -283,11 +283,13 @@ def _allowed_decision_card_actor_ids(platform: str) -> set[str]:
     }.get(platform_key)
     if platform_env is None:
         return set()
+    from agent.secret_scope import get_secret
+
     allowed: set[str] = set()
     for key in (platform_env, "GATEWAY_ALLOWED_USERS"):
         allowed.update(
             value.strip()
-            for value in str(os.environ.get(key) or "").split(",")
+            for value in str(get_secret(key, "") or "").split(",")
             if value.strip() and value.strip() != "*"
         )
     return allowed
@@ -664,6 +666,7 @@ def handle_action(
     if conn is None:
         conn = connect()
     try:
+        conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
             "SELECT * FROM decision_cards WHERE id = ?", (card_id,)
         ).fetchone()
@@ -673,6 +676,17 @@ def handle_action(
         display_actor = actor or actor_id or "user"
 
         if card.status not in ACTIVE_STATUSES:
+            conn.commit()
+            if (
+                action == "yes"
+                and card.status == "answered_yes"
+                and card.answer == "yes"
+                and card.action_kind == WORKFLOW_RESUME_ACTION_KIND
+            ):
+                from gateway.decision_workflow_continuation import continue_answered_workflow
+
+                continuation = continue_answered_workflow(card_id, decision_conn=conn)
+                return get_card(card_id, conn=conn), continuation.receipt
             return (
                 card,
                 f"This decision is already closed as `{card.answer or card.status}`. No new action was taken.",
@@ -697,14 +711,14 @@ def handle_action(
             status = "info_requested"
             receipt = info_text(card)
 
-        conn.execute(
+        changed = conn.execute(
             """
             UPDATE decision_cards
                SET status = ?, updated_at = ?, answered_at = ?, answered_by = ?,
                    answer = ?, receipt = ?, message_id = COALESCE(NULLIF(?, ''), message_id),
                    target_chat_id = COALESCE(NULLIF(?, ''), target_chat_id),
                    target_thread_id = COALESCE(NULLIF(?, ''), target_thread_id)
-             WHERE id = ?
+             WHERE id = ? AND status IN ('pending', 'waiting', 'info_requested')
             """,
             (
                 status,
@@ -718,7 +732,14 @@ def handle_action(
                 thread_id,
                 card_id,
             ),
-        )
+        ).rowcount
+        if changed != 1:
+            current = get_card(card_id, conn=conn)
+            conn.commit()
+            return (
+                current,
+                f"This decision is already closed as `{current.answer or current.status}`. No new action was taken.",
+            )
         record_event(
             conn,
             card_id,
@@ -740,6 +761,9 @@ def handle_action(
             continuation = continue_answered_workflow(card_id, decision_conn=conn)
             return get_card(card_id, conn=conn), continuation.receipt
         return answered, receipt
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         if owns_conn:
             conn.close()
