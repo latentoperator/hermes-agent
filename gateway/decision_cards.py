@@ -21,6 +21,7 @@ ACTIONS = {"yes", "no", "wait", "info"}
 ACTIVE_STATUSES = {"pending", "waiting", "info_requested"}
 PROTECTED_INSTRUCTION_WRITE_ACTION_KIND = "protected_instruction_write"
 PROTECTED_INSTRUCTION_WRITE_ACTION = "write_protected_instruction_files"
+WORKFLOW_RESUME_ACTION_KIND = "kanban_workflow_resume"
 
 
 class DecisionCardError(ValueError):
@@ -327,6 +328,23 @@ def create_card(
         )
         if action_kind.strip() == PROTECTED_INSTRUCTION_WRITE_ACTION_KIND:
             _parse_protected_instruction_write_payload(payload, question, context)
+        elif action_kind.strip() == WORKFLOW_RESUME_ACTION_KIND:
+            from gateway.decision_workflow_continuation import (
+                WorkflowContinuationError,
+                validate_workflow_resume_candidate,
+            )
+
+            try:
+                validate_workflow_resume_candidate(
+                    action_payload=payload,
+                    question=question,
+                    context=context,
+                    fire_at=fire_at,
+                    source_ref=source_ref,
+                    originating_profile=originating_profile,
+                )
+            except WorkflowContinuationError as exc:
+                raise DecisionCardError(str(exc)) from exc
         conn.execute(
             """
             INSERT INTO decision_cards(
@@ -715,7 +733,13 @@ def handle_action(
             },
         )
         conn.commit()
-        return get_card(card_id, conn=conn), receipt
+        answered = get_card(card_id, conn=conn)
+        if action == "yes" and answered.action_kind == WORKFLOW_RESUME_ACTION_KIND:
+            from gateway.decision_workflow_continuation import continue_answered_workflow
+
+            continuation = continue_answered_workflow(card_id, decision_conn=conn)
+            return get_card(card_id, conn=conn), continuation.receipt
+        return answered, receipt
     finally:
         if owns_conn:
             conn.close()
@@ -735,6 +759,7 @@ __all__ = [
     "ACTIVE_STATUSES",
     "PROTECTED_INSTRUCTION_WRITE_ACTION",
     "PROTECTED_INSTRUCTION_WRITE_ACTION_KIND",
+    "WORKFLOW_RESUME_ACTION_KIND",
     "claim_protected_instruction_write",
     "connect",
     "create_card",

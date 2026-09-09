@@ -3311,6 +3311,76 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def resume_task_from_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision_card_id: str,
+    source_event_id: int,
+    approved_by: str,
+    approved_at: str,
+) -> tuple[bool, Optional[str]]:
+    """Resume one exact approval stop without claiming or executing the task.
+
+    Unlike the general operator unblock, this accepts ``triage`` only when the
+    exact current stop is a ``block_loop_detected`` event. The event id makes an
+    approval from an older block cycle fail closed, and parents remain gated.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute("SELECT status FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if task is None:
+            return False, f"task {task_id} not found"
+        status = str(task["status"])
+        if status not in {"blocked", "triage"}:
+            return False, f"task {task_id} is {status!r}, not an approval-gated stop"
+        stop = conn.execute(
+            "SELECT id,kind FROM task_events WHERE task_id=? "
+            "AND kind IN ('blocked','block_loop_detected') ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if stop is None or int(stop["id"]) != int(source_event_id):
+            return False, "source stop event is stale or mismatched"
+        expected_kind = "block_loop_detected" if status == "triage" else "blocked"
+        if stop["kind"] != expected_kind:
+            return False, f"source stop kind does not match task status {status!r}"
+        if not _parents_satisfied(conn, task_id):
+            return False, "source task still has an unfinished parent"
+
+        _reclaim_dangling_run(
+            conn,
+            task_id,
+            statuses=(status,),
+            now=now,
+            note="invariant recovery on Decision Card continuation",
+        )
+        changed = conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "consecutive_failures=0, last_failure_error=NULL "
+            "WHERE id=? AND status=?",
+            (task_id, status),
+        ).rowcount
+        if changed != 1:
+            return False, "source task status changed during Decision Card continuation"
+        _append_event(
+            conn,
+            task_id,
+            "decision_resumed",
+            {
+                "decision_card_id": decision_card_id,
+                "source_event_id": int(source_event_id),
+                "source_status": status,
+                "status": "ready",
+                "approved_by": approved_by,
+                "approved_at": approved_at,
+                "worker_claimed": False,
+                "external_action_executed": False,
+            },
+        )
+        return True, None
+
+
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
