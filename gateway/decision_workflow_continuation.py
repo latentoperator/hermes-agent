@@ -379,7 +379,21 @@ def continue_answered_workflow(
                                 str(exc).strip() or type(exc).__name__
                             ) from exc
                         if not resumed:
-                            raise WorkflowContinuationError(reason or "source task continuation failed")
+                            raced = kb.get_task(board_conn, current.id)
+                            if raced is None:
+                                raise WorkflowContinuationError(
+                                    "source task disappeared during continuation"
+                                )
+                            _validate_source_stop(
+                                board_conn,
+                                task_id=raced.id,
+                                task_status=raced.status,
+                                source_event_id=action["source_event_id"],
+                            )
+                            if raced.status not in {"ready", "running"}:
+                                raise WorkflowContinuationError(
+                                    reason or "source task continuation failed"
+                                )
                     try:
                         current = kb.get_task(board_conn, current.id)
                     except Exception as exc:

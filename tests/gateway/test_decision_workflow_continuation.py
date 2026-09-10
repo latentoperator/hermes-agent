@@ -515,6 +515,67 @@ def test_duplicate_yes_reconciles_transient_failure_after_committed_task_transit
     assert _workflow_event_count(root, card.id, "workflow_resume_succeeded") == 1
 
 
+def test_status_race_before_transition_reconciles_same_lifecycle_without_new_authority(
+    tmp_path, monkeypatch
+):
+    root, profile_home, task_id, job_id, card, initial_runs = _setup_parked_workflow(
+        tmp_path, monkeypatch
+    )
+    original_resume = continuation.kb.resume_task_from_decision
+    injected = False
+
+    def unblock_then_attempt_resume(conn, requested_task_id, **kwargs):
+        nonlocal injected
+        if not injected:
+            injected = True
+            with kbc.connect_closing(board="default") as racing_conn:
+                assert kb.unblock_task(racing_conn, requested_task_id)
+        return original_resume(conn, requested_task_id, **kwargs)
+
+    monkeypatch.setattr(
+        continuation.kb, "resume_task_from_decision", unblock_then_attempt_resume
+    )
+    _, first_receipt = dc.handle_action(
+        card.id,
+        "yes",
+        actor="Chris",
+        actor_id="42",
+        actor_platform="telegram",
+    )
+    monkeypatch.setattr(
+        continuation.kb, "resume_task_from_decision", original_resume
+    )
+
+    _, duplicate_receipt = dc.handle_action(
+        card.id,
+        "yes",
+        actor="Chris",
+        actor_id="42",
+        actor_platform="telegram",
+    )
+
+    with kbc.connect_closing(board="default") as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "ready"
+        assert task.current_run_id is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == initial_runs
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='decision_resumed'",
+            (task_id,),
+        ).fetchone()[0] == 0
+    with cron_jobs.use_cron_store(profile_home):
+        supervisor = cron_jobs.get_job(job_id)
+        assert supervisor is not None and supervisor["state"] == "scheduled"
+    assert first_receipt == duplicate_receipt
+    assert "no worker was claimed" in first_receipt.lower()
+    assert "no client action was executed" in first_receipt.lower()
+    assert _workflow_event_count(root, card.id, "button_yes") == 1
+    assert _workflow_event_count(root, card.id, "workflow_resume_failed") == 0
+    assert _workflow_event_count(root, card.id, "workflow_resume_succeeded") == 1
+
+
 @pytest.mark.parametrize(
     "termination_stage",
     ["after_claim", "after_supervisor_resume", "after_task_transition"],
