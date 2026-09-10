@@ -36,6 +36,8 @@ DEFAULT_JUDGE_TIMEOUT = 30.0
 DEFAULT_JUDGE_MAX_TOKENS = 4096
 # Cap how much of the last response we send to the judge.
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
+# Preserve both the original objective and late amendments within the bounded goal field.
+_JUDGE_GOAL_SNIPPET_CHARS = 2000
 # Consecutive judge *parse* failures (empty / non-JSON) before the loop auto-pauses and points at
 # the goal_judge config. API/transport errors do NOT count — those are tracked separately below.
 # Guards against small models that cannot follow the strict JSON contract burning the whole budget.
@@ -672,6 +674,17 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "… [truncated]"
 
 
+def _represent_goal_for_judge(goal: str) -> str:
+    """Bound a goal without silently dropping acceptance amendments appended at the tail."""
+    if len(goal) <= _JUDGE_GOAL_SNIPPET_CHARS:
+        return goal
+    marker = "\n… [middle omitted from bounded goal-judge prompt] …\n"
+    retained = _JUDGE_GOAL_SNIPPET_CHARS - len(marker)
+    head = (retained + 1) // 2
+    tail = retained - head
+    return f"{goal[:head]}{marker}{goal[-tail:]}"
+
+
 def _pid_alive(pid: int) -> bool:
     """Liveness via ``gateway.status._pid_exists`` (psutil + ctypes/POSIX fallback). Never uses
     ``os.kill(pid, 0)``: on Windows that routes to CTRL_C_EVENT and hard-kills the target's console
@@ -881,7 +894,7 @@ def judge_goal(
     # block as extra criteria so the judge sees a single source of truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     common = dict(
-        goal=_truncate(goal, 2000),
+        goal=_represent_goal_for_judge(goal),
         response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
         background_block=_render_background_block(background_processes),
         current_time=datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),

@@ -220,6 +220,64 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
         conn2.close()
 
 
+def test_completion_tool_and_goal_loop_share_tail_preserving_goal_prompt(monkeypatch, tmp_path):
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli.goals import run_kanban_goal_loop
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    title = "Prepare the bounded report"
+    amendment = "LATE AMENDMENT: one verified pair is sufficient."
+    body = ("superseded detail\n" * 180) + amendment
+    goal_text = f"{title}\n\n{body}".strip()
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title=title, assignee="test-worker", body=body, goal_mode=True)
+        kb.claim_task(conn, task_id)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setattr(kt, "_goal_judge_available", lambda: True)
+
+    represented_goals = []
+
+    def fake_call_llm(**kwargs):
+        prompt = kwargs["messages"][1]["content"]
+        represented_goals.append(prompt.split("Goal:\n", 1)[1].split(
+            "\n\nAgent's most recent response:", 1)[0])
+        class Response:
+            choices = [type("Choice", (), {"message": type(
+                "Message", (), {"content": '{"done": true, "reason": "achieved"}'})()})()]
+        return Response()
+
+    statuses = iter(["running", "done"])
+    with monkeypatch.context() as context:
+        context.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+        complete_result = json.loads(kt._handle_complete({"summary": "done with evidence"}))
+        loop_result = run_kanban_goal_loop(
+            task_id="loop-task",
+            goal_text=goal_text,
+            run_turn=lambda _prompt: "finalized",
+            task_status_fn=lambda: next(statuses),
+            block_fn=lambda _reason: None,
+            first_response="done with evidence",
+        )
+
+    assert complete_result["ok"] is True
+    assert loop_result["outcome"] == "completed_by_worker"
+    assert represented_goals[0] == represented_goals[1]
+    assert amendment in represented_goals[0]
+    assert len(represented_goals[0]) <= 2000
+
+
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_block({"reason": "need clarification"})

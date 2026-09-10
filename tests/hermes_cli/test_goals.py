@@ -96,6 +96,36 @@ class TestJudgeGoal:
         assert verdict == "done"
         assert reason == "achieved"
 
+    def test_goal_prompt_is_bounded_without_losing_late_amendments(self):
+        from hermes_cli import goals
+
+        prompts = []
+
+        def fake_call_llm(**kwargs):
+            prompts.append(kwargs["messages"][1]["content"])
+            return MagicMock(
+                choices=[MagicMock(message=MagicMock(
+                    content='{"done": true, "reason": "achieved"}'))]
+            )
+
+        amendment = "LATE AMENDMENT: one verified pair is sufficient."
+        long_goal = "Original acceptance criteria.\n" + ("superseded detail\n" * 180) + amendment
+        short_goal = "Ship the report with its verification receipt."
+        with patch("agent.auxiliary_client.call_llm", side_effect=fake_call_llm):
+            goals.judge_goal(long_goal, "done with evidence")
+            goals.judge_goal(short_goal, "done with evidence")
+
+        def represented_goal(prompt):
+            return prompt.split("Goal:\n", 1)[1].split(
+                "\n\nAgent's most recent response:", 1)[0]
+
+        long_representation, short_representation = map(represented_goal, prompts)
+        assert long_representation.startswith("Original acceptance criteria.")
+        assert amendment in long_representation
+        assert "omitted" in long_representation
+        assert len(long_representation) <= 2000
+        assert short_representation == short_goal
+
 
 # ──────────────────────────────────────────────────────────────────────
 # GoalManager lifecycle + persistence
