@@ -39,6 +39,9 @@ def work_dir(tmp_path):
     d.mkdir()
     (d / "main.py").write_text("print('hello')\n")
     (d / "README.md").write_text("# Project\n")
+    # Keep ledger ownership local even when an ancestor of pytest's temp root
+    # has a project marker (for example an unrelated /tmp/package.json).
+    (d / "pyproject.toml").write_text("[project]\nname = 'checkpoint-test'\n")
     return d
 
 
