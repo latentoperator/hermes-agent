@@ -42,7 +42,7 @@ def _base_job(**overrides):
 
 
 def _run(job, tmp_path, *, current_provider="openrouter", current_model=None, cron_model=None,
-         cron_model_provider=None):
+         cron_model_provider=None, follow_profile_defaults=None):
     """Drive run_job against a temp config.yaml whose ``model.default`` / ``model.provider`` are
     the CURRENT global defaults. Returns ``(success, error, agent_kwargs, resolve_kwargs)`` where
     the last two are the kwargs AIAgent / resolve_runtime_provider were called with (None when
@@ -59,6 +59,8 @@ def _run(job, tmp_path, *, current_provider="openrouter", current_model=None, cr
         cron_lines.append(f"  model: {cron_model}")
     if cron_model_provider is not None:
         cron_lines.append(f"  model_provider: {cron_model_provider}")
+    if follow_profile_defaults is not None:
+        cron_lines.append(f"  follow_profile_defaults: {str(follow_profile_defaults).lower()}")
     if cron_lines:
         config_yaml += "cron:\n" + "\n".join(cron_lines) + "\n"
     (tmp_path / "config.yaml").write_text(config_yaml)
@@ -220,3 +222,38 @@ class TestRuntimeResolutionTargetModel:
         assert success is True, error
         assert resolve_kwargs["target_model"] == "my-pinned-model"
         assert resolve_kwargs["requested"] == "openrouter"
+
+
+def test_profile_inheritance_tracks_both_axes_without_overriding_explicit_pins(tmp_path):
+    job = _base_job(provider_snapshot="old-provider", model_snapshot="old-model")
+    for provider, model in [("provider-a", "model-a"), ("provider-b", "model-b")]:
+        success, error, agent, resolved = _run(
+            job, tmp_path, current_provider=provider, current_model=model,
+            follow_profile_defaults=True)
+        assert success, error
+        assert agent["model"] == model
+        assert resolved["requested"] is None
+        assert resolved["target_model"] == model
+    job.update(provider="explicit-provider", model="explicit-model")
+    success, error, agent, resolved = _run(
+        job, tmp_path, current_provider="provider-c", current_model="model-c",
+        follow_profile_defaults=True)
+    assert success, error
+    assert agent["model"] == "explicit-model"
+    assert resolved["requested"] == "explicit-provider"
+
+
+def test_drift_migration_preserves_explicit_inheritance(tmp_path, monkeypatch):
+    import yaml
+    from hermes_cli import config_migrations
+
+    path = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_migrations, "read_raw_config", lambda: yaml.safe_load(path.read_text()))
+    monkeypatch.setattr(config_migrations, "_persist_migration", lambda cfg: path.write_text(yaml.safe_dump(cfg)))
+    for guard in (False, True):
+        path.write_text(yaml.safe_dump({"cron": {"model_drift_guard": guard, "model": "explicit"}}))
+        config_migrations._migrate_to_42({"config_added": []}, True)
+        migrated = yaml.safe_load(path.read_text())["cron"]
+        assert "model_drift_guard" not in migrated
+        assert migrated.get("follow_profile_defaults", False) is (not guard)
+        assert migrated["model"] == "explicit"

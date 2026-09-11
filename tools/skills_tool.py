@@ -38,22 +38,54 @@ _SKILLS_CACHE_TTL_SECONDS = 30.0
 
 
 def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
-    """O(#dirs + #categories) stat-based change signature; platform is read via
-    ``agent.skill_utils.sys`` so test patches are honored."""
+    """Cheap change-signature for the skill scan inputs.
+
+    O(#dirs + #categories + #skills) directory entries, not a file walk. Includes the
+    platform the scan's ``skill_matches_platform`` filter will use (read
+    from ``agent.skill_utils``'s ``sys`` so test patches of that module
+    are honored) — the scan result is platform-dependent.
+    """
     from agent import skill_utils as _skill_utils
+
     platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
     sig = []
     for d in dirs_to_scan:
         try:
-            m = d.stat().st_mtime
+            root_stat = d.stat()
         except OSError:
             continue
-        with suppress(OSError), os.scandir(d) as it:
-            for entry in it:
-                with suppress(OSError):
-                    if entry.is_dir(follow_symlinks=False):
-                        m = max(m, entry.stat(follow_symlinks=False).st_mtime)
-        sig.append((str(d), m))
+        children = []
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            entry_stat = entry.stat(follow_symlinks=False)
+                            try:
+                                with os.scandir(entry.path) as child_it:
+                                    child_names = tuple(
+                                        sorted(child.name for child in child_it)
+                                    )
+                            except OSError:
+                                child_names = ()
+                            children.append(
+                                (
+                                    entry.name,
+                                    entry_stat.st_mtime_ns,
+                                    child_names,
+                                )
+                            )
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+        sig.append(
+            (
+                str(d),
+                root_stat.st_mtime_ns,
+                tuple(sorted(children)),
+            )
+        )
     return (tuple(sig), frozenset(disabled), platform)
 
 

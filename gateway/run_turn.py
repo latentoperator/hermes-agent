@@ -1841,6 +1841,8 @@ class GatewayTurnMixin:
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         context = build_session_context(source, self.config, session_entry)
         # Session context variables for tools (task-local, concurrency-safe)
+        context.message_id = str(event.message_id) if event.message_id else ""
+        context.allow_action_approval = not bool(getattr(event, "internal", False))
         _session_env_tokens = self._set_session_env(context)
         # Self-injected turns (MessageEvent(internal=True)) persist with a DB-only display_kind so
         # UIs render timeline notices, not user bubbles; role/content untouched.

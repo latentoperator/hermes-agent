@@ -210,6 +210,38 @@ def test_fetch_server_url_sets_env(monkeypatch, tmp_path):
     assert captured_env.get("BWS_SERVER_URL") == "https://vault.bitwarden.eu"
 
 
+def test_fetch_retries_explicit_bws_rate_limit(monkeypatch, tmp_path):
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload([{"key": "K", "value": "v"}])
+    responses = iter(
+        [
+            mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr="Error:\n  0: 429 Too Many Requests; try again in 1s",
+            ),
+            mock.Mock(returncode=0, stdout=payload, stderr=""),
+        ]
+    )
+    sleeps = []
+
+    monkeypatch.setattr(bw.subprocess, "run", lambda *_a, **_kw: next(responses))
+    monkeypatch.setattr(bw.time, "sleep", sleeps.append)
+    monkeypatch.setattr(bw.random, "uniform", lambda *_a: 0.0)
+
+    secrets, warnings = bw.fetch_bitwarden_secrets(
+        access_token="0.t",
+        project_id="p",
+        binary=fake_binary,
+        use_cache=False,
+    )
+
+    assert secrets == {"K": "v"}
+    assert warnings == []
+    assert sleeps == [1.0]
+
+
 
 
 
@@ -217,8 +249,54 @@ def test_fetch_server_url_sets_env(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# apply_bitwarden_secrets — the public entry point used by env_loader
+# BitwardenSource.fetch — filtering before registry-managed environment application
 # ---------------------------------------------------------------------------
+
+
+def test_source_filters_source_keys_and_aliases_target_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    fake_binary = tmp_path / "bws"
+    fake_binary.write_text("")
+    payload = _fake_bws_payload(
+        [
+            {"key": "DANTE_TELEGRAM_BOT_TOKEN", "value": "dante-token"},
+            {"key": "WREN_TELEGRAM_BOT_TOKEN", "value": "wren-token"},
+        ]
+    )
+    monkeypatch.setattr(
+        bw.subprocess,
+        "run",
+        lambda *_a, **_kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
+    )
+    monkeypatch.setattr(bw, "find_bws", lambda **_kw: fake_binary)
+
+    result = bw.BitwardenSource().fetch({
+        "enabled": True,
+        "project_id": "p",
+        "aliases": {"DANTE_TELEGRAM_BOT_TOKEN": "TELEGRAM_BOT_TOKEN"},
+        "include_keys": ["DANTE_TELEGRAM_BOT_TOKEN"],
+        "auto_install": False,
+    }, tmp_path)
+
+    assert result.ok
+    assert result.secrets == {"TELEGRAM_BOT_TOKEN": "dante-token"}
+    assert result.skipped == ["WREN_TELEGRAM_BOT_TOKEN"]
+    assert "DANTE_TELEGRAM_BOT_TOKEN" not in os.environ
+
+
+def test_filter_rejects_invalid_alias_target():
+    filtered, skipped, warnings = bw._filter_and_alias_secrets(
+        {"VALID_SOURCE": "value"},
+        aliases={"VALID_SOURCE": "not-valid"},
+    )
+
+    assert filtered == {}
+    assert skipped == []
+    assert warnings == [
+        "Skipping alias target 'not-valid' for 'VALID_SOURCE': "
+        "not a valid env-var name"
+    ]
 
 
 
@@ -254,17 +332,25 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
         "    cache_ttl_seconds: 0\n"
         "    override_existing: false\n"
         "    auto_install: false\n"
+        "    aliases:\n"
+        "      MY_BSM_KEY: RUNTIME_BSM_KEY\n"
+        "    include_keys:\n"
+        "      - MY_BSM_KEY\n"
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "0.t")
     monkeypatch.delenv("MY_BSM_KEY", raising=False)
+    monkeypatch.delenv("RUNTIME_BSM_KEY", raising=False)
 
     called = {"n": 0}
 
     def fake_fetch(**kwargs):
         called["n"] += 1
         assert kwargs["project_id"] == "proj-1"
-        return {"MY_BSM_KEY": "from-bsm"}, []
+        return {
+            "MY_BSM_KEY": "from-bsm",
+            "UNLISTED_BSM_KEY": "must-not-leak",
+        }, []
 
     monkeypatch.setattr(
         "agent.secret_sources.bitwarden.find_bws",
@@ -282,7 +368,9 @@ def test_env_loader_calls_bsm_when_enabled(tmp_path, monkeypatch):
     _apply_external_secret_sources(home)
 
     assert called["n"] == 1
-    assert os.environ.get("MY_BSM_KEY") == "from-bsm"
+    assert os.environ.get("RUNTIME_BSM_KEY") == "from-bsm"
+    assert "MY_BSM_KEY" not in os.environ
+    assert "UNLISTED_BSM_KEY" not in os.environ
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +605,3 @@ def test_stale_fallback_skipped_on_auth_failure(monkeypatch, tmp_path):
             access_token="0.t", project_id="proj-1", binary=fake_binary,
             cache_ttl_seconds=300, home_path=home,
         )
-
-
-
-

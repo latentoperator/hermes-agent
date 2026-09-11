@@ -122,6 +122,9 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     )
     monkeypatch.setattr(hermes_main, "_build_web_ui", lambda *a, **k: None)
     monkeypatch.setattr(main_web_build, "_build_web_ui", lambda *a, **k: None)
+    # Keep the update's module-purge phase from discarding the gateway mocks
+    # below and rediscovering this host's live production fleet mid-test.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(
         update_cmd, "_venv_core_imports_healthy", lambda: (True, "")
     )

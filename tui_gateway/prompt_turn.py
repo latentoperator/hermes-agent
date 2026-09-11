@@ -443,7 +443,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     from tools.approval_context import set_current_session_key
     scopes = st.scopes
     scopes.approval = set_current_session_key(session["session_key"])
-    scopes.session_tokens = _set_session_context(session["session_key"], ui_session_id=sid)
+    scopes.session_tokens = _set_session_context(session["session_key"], ui_session_id=sid, allow_action_approval=True)
     profile_home = session.get("profile_home")
     if profile_home:
         scopes.home = set_hermes_home_override(profile_home)

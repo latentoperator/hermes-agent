@@ -9,6 +9,7 @@ hermes_cli/profiles.py::_count_skills) plus the disabled-set, with a short
 TTL bounding in-place SKILL.md edit staleness.
 """
 
+import os
 import time
 
 import pytest
@@ -66,3 +67,19 @@ def test_disabled_and_full_views_cached_separately(tmp_path, monkeypatch):
     everything = sorted(s["name"] for s in st._find_all_skills(skip_disabled=True))
     assert filtered == ["skill-one"]
     assert everything == ["skill-one", "skill-two"]
+
+
+def test_signature_detects_added_skill_when_directory_mtimes_are_preserved(tmp_path):
+    root = tmp_path / "skills"
+    first_skill = _write_skill(tmp_path, "cat-a", "skill-one")
+    category = first_skill.parent
+    root_stat = root.stat()
+    category_stat = category.stat()
+    before = st._skills_scan_signature([root], set())
+
+    _write_skill(tmp_path, "cat-a", "skill-two")
+    os.utime(root, ns=(root_stat.st_atime_ns, root_stat.st_mtime_ns))
+    os.utime(category, ns=(category_stat.st_atime_ns, category_stat.st_mtime_ns))
+
+    after = st._skills_scan_signature([root], set())
+    assert after != before

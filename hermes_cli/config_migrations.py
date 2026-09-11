@@ -542,6 +542,20 @@ def _migrate_to_41(results: Dict[str, Any], quiet: bool) -> None:
                   f"({', '.join(cleaned)}) — Bot Chat sessions now get the live roster instead.")
 
 
+def _migrate_to_42(results: Dict[str, Any], quiet: bool) -> None:
+    """Retire drift blocking while preserving explicit current-default inheritance."""
+    config = read_raw_config()
+    cron = config.get("cron")
+    if not isinstance(cron, dict) or "model_drift_guard" not in cron:
+        return
+    old_guard = cron.pop("model_drift_guard")
+    if old_guard is False:
+        cron.setdefault("follow_profile_defaults", True)
+    _commit(
+        config, results, quiet, "migrated cron.model_drift_guard",
+        "  Migrated cron model policy; explicit current-default inheritance is preserved.")
+
+
 #: Registry of (target_version, step), strictly ascending; simple default-flip steps are
 #: declared inline via _rewrite_stale_default / _rewrite_key partials. Later steps observe
 #: earlier steps' writes via read_raw_config() (filesystem state). v12 is the support floor:
@@ -627,16 +641,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
         message="  ✓ Model catalog now refreshes every 20 minutes (model_catalog.ttl_minutes)",
         extra_guard=lambda raw: "ttl_minutes" not in raw)),
     (41, _migrate_to_41),
-    # 41 → 42: cron.model_drift_guard is gone. Unpinned jobs now run on their creation snapshot
-    # instead of failing closed when the global model changes, so the toggle has nothing to gate.
-    (42, functools.partial(
-        _rewrite_key, section="cron", key="model_drift_guard", new=None,
-        match=lambda cur: cur is not None,
-        added="removed cron.model_drift_guard",
-        message=(
-            "  ✓ Removed cron.model_drift_guard — unpinned cron jobs now keep running on the "
-            "model/provider they were created under when the global default changes, instead "
-            "of being skipped. Pin a job or set cron.model to move it."))),
+    (42, _migrate_to_42),
 )
 
 

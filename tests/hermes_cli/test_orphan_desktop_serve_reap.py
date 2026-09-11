@@ -9,7 +9,10 @@ boot must clear those corpses without touching intentional fixed-port serves
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from hermes_cli.dashboard_procs import (
     _is_desktop_local_serve_cmdline,
@@ -388,3 +391,52 @@ def test_reap_spare_lock_owned_backend_even_without_exclude_match(tmp_path):
 
     assert terms == []
     assert result["matched"] == []
+
+
+# SSH ownership records belong to the shared root, even when startup has
+# selected a named profile and changed HERMES_HOME.
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("layout", ["standard", "custom"])
+@pytest.mark.parametrize("profile", [None, "virgil", "wren"])
+def test_reap_spares_shared_root_lock_from_named_profile(
+    tmp_path, monkeypatch, layout, profile
+):
+    native_home = tmp_path / "user"
+    root = native_home / ".hermes" if layout == "standard" else tmp_path / "data"
+    profile_home = root if profile is None else root / "profiles" / profile
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: native_home)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.delenv("HERMES_DESKTOP_CHILD_PID", raising=False)
+
+    oid, nonce = "f" * 32, "d" * 16
+    lock_dir = root / "desktop-ssh" / oid
+    lock_dir.mkdir(parents=True)
+    (lock_dir / "backend.lock.json").write_text(
+        json.dumps(_valid_lock_payload(7777, oid, nonce))
+    )
+
+    # Resolve actual on-disk locks with the production resolver. Only process
+    # discovery and signalling are replaced; no live process can be killed.
+    assert _lock_owned_serve_pids() == {7777}
+    scanned = [
+        (7777, "hermes serve --isolated --host 127.0.0.1 --port 0"),
+        (8888, "hermes serve --host 127.0.0.1 --port 0"),
+    ]
+    with (
+        patch("hermes_cli.dashboard_procs._scan_dashboard_processes", return_value=scanned) as scan,
+        patch("hermes_cli.dashboard_procs._process_ppid", return_value=1),
+        patch("os.kill") as kill,
+        patch("psutil.pid_exists", return_value=False),
+    ):
+        result = _reap_orphaned_desktop_local_serves(
+            sleep_fn=lambda _s: None,
+            process_age_seconds_fn=lambda _pid: 600.0,
+        )
+
+    assert 7777 in scan.call_args.kwargs["exclude_pids"]
+    assert result["matched"] == [8888]
+    assert result["killed"] == [8888]
+    assert [call.args[0] for call in kill.call_args_list] == [8888]

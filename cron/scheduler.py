@@ -1335,12 +1335,15 @@ class _CronJobConfig:
     cron_default_provider: str
 
 
-def _snapshot_pin(job: dict, axis: str, current: str, job_id: str) -> str:
+def _snapshot_pin(job: dict, axis: str, current: str, job_id: str, cfg: dict) -> str:
     """The creation snapshot is an unpinned axis's effective pin: return it, logging once when it
     differs from *current* (the live global default); ``""`` for legacy jobs without one, which keep
     following the global default. A global model/provider change must never stop a cron job; a job
     keeps running on what it was created under until the operator pins it or sets a cron.* fleet
     default (#44585)."""
+    cron_cfg = cfg.get("cron") or {}
+    if isinstance(cron_cfg, dict) and cron_cfg.get("follow_profile_defaults") is True:
+        return ""
     snapshot = str(job.get(f"{axis}_snapshot") or "").strip()
     if snapshot and current and snapshot.lower() != current.lower():
         logger.info(
@@ -1381,7 +1384,7 @@ def _load_cron_job_config(job: dict, job_id: str, job_name: str) -> _CronJobConf
                     model = _cron_default_model
                 else:
                     _, _global_model = resolve_cron_model_drift_defaults(_cfg)
-                    model = _snapshot_pin(job, "model", _global_model, job_id) or _global_model or model
+                    model = _snapshot_pin(job, "model", _global_model, job_id, _cfg) or _global_model or model
     except Exception as e:
         logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
 
@@ -1500,7 +1503,7 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
             str(jc.model_cfg.get("provider") or "").strip() if isinstance(jc.model_cfg, dict) else "")
         # None (not the config provider) keeps the legacy no-snapshot path resolving from persisted
         # config exactly as before.
-        requested = _snapshot_pin(job, "provider", global_provider, job_id) or None
+        requested = _snapshot_pin(job, "provider", global_provider, job_id, jc.cfg) or None
     try:
         # Do NOT pass HERMES_INFERENCE_PROVIDER as `requested`: it would override persisted config
         # and resurrect stale providers for unpinned jobs.
@@ -2825,7 +2828,10 @@ def _run_one_job_body(
 
         # get_secret() fails closed outside a scope; the ticker thread has none. Delivery adapters
         # resolve credentials, so the scope must span delivery too (reset in the outer finally).
-        _scope_token = set_secret_scope(build_profile_secret_scope(_get_hermes_home()))
+        from hermes_cli.env_loader import hydrate_profile_secret_sources
+        profile_home = _get_hermes_home()
+        hydrate_profile_secret_sources(profile_home)
+        _scope_token = set_secret_scope(build_profile_secret_scope(profile_home))
         # Same for terminal policy (gateway/run.py _profile_runtime_scope): else the ticker reads
         # process-global TERMINAL_* env a concurrent profile pinned. Resolution failure installs a
         # refusal scope — terminal execution raises instead of using the launch process's policy.

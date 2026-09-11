@@ -1202,9 +1202,9 @@ def _session_for_key(session_key: str) -> dict | None:
         return next((s for s in list(_sessions.values()) if s.get("session_key") == session_key), None)
 
 
-def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session_id: str = "") -> list:
+def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session_id: str = "", allow_action_approval: bool = False) -> list:
     with contextlib.suppress(Exception):
-        from gateway.session_context import set_session_vars
+        from gateway.session_context import build_action_approval_source, set_session_vars
         sess = _session_for_key(session_key) if session_key else None
         # Ephemeral task ids aren't in `_sessions` (reverse-map → "" would clear the cwd override);
         # callers that know the workspace pass it.
@@ -1221,8 +1221,13 @@ def _set_session_context(session_key: str, cwd: str | None = None, *, ui_session
             if _methods_browser_control._is_authenticated_identity(identity):
                 browser_control_principal = _methods_browser_control._principal_digest(identity)
                 browser_control_transport_family = _methods_browser_control._CLOUD_TRANSPORT_FAMILY
+        action_approval_source = (
+            build_action_approval_source(source=source, session_id=session_id)
+            if allow_action_approval else ""
+        )
         return set_session_vars(
             session_key=session_key, session_id=session_id, source=source,
+            action_approval_source=action_approval_source,
             browser_control_principal=browser_control_principal,
             browser_control_transport_family=browser_control_transport_family, cwd=resolved,
             ui_session_id=ui_session_id, cron_session="")

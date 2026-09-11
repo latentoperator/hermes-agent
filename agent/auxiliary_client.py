@@ -2189,12 +2189,14 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
         logger.debug("Auxiliary client: OpenRouter pool exhausted, trying OPENROUTER_API_KEY")
     or_key = explicit_api_key or _scoped_key_env("OPENROUTER_API_KEY")
     if not or_key:
-        _mark_provider_unhealthy("openrouter", ttl=60)
+        # Absence is configuration state, not a payment or credit failure.
+        # Auto mode can quietly continue to the next configured provider.
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return _create_openai_client(
         api_key=or_key, base_url=OPENROUTER_BASE_URL, default_headers=build_or_headers()
     ), or_model
+
 
 
 def _describe_openrouter_unavailable(model: str = None) -> str:
@@ -2229,8 +2231,7 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
     nous = _read_nous_auth()
     runtime = _resolve_nous_runtime_api(force_refresh=False)
     if runtime is None and not nous:
-        logger.warning("Auxiliary Nous client unavailable: no Nous authentication found (run: hermes auth).")
-        _mark_provider_unhealthy("nous", ttl=60)
+        logger.debug("Auxiliary Nous client unavailable: no Nous authentication found.")
         return None, None
     if runtime is None and nous:
         logger.debug("Auxiliary Nous: runtime JWT refresh failed; checking stored auth.json token.")
@@ -4260,7 +4261,7 @@ def _try_discovery_chain() -> Tuple[Optional[OpenAI], Optional[str], str]:
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "
-                   "Set OPENROUTER_API_KEY or configure a local model in config.yaml.", ", ".join(tried))
+                   "Configure auxiliary.<task>.provider or set a supported provider credential.", ", ".join(tried))
     return None, None, ""
 
 

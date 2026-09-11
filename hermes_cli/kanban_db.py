@@ -2906,12 +2906,14 @@ def edit_completed_task_result(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    run_summary: Optional[str] = None, run_metadata: Optional[dict] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition."""
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    effective_summary = reason if run_summary is None else run_summary
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -2940,7 +2942,8 @@ def block_task(
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
+            conn, task_id, outcome="blocked", status="blocked", summary=effective_summary,
+            metadata=run_metadata, synthesize=bool(effective_summary or run_metadata),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)
@@ -3161,6 +3164,10 @@ def request_changes(
         run_id = _end_run(
             conn, task_id, outcome="changes_requested", status=new_status, summary=reason,
         )
+        comment_row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
         _append_event(
             conn,
             task_id,
@@ -3170,10 +3177,16 @@ def request_changes(
                 "implementer": implementer,
                 "reviewer": reviewer,
                 "status": new_status,
+                # Let the ready-lane respawn guard distinguish the PR that
+                # prompted this review from fresh PR evidence added after the
+                # handoff.  The implementer gets exactly one rework claim;
+                # later ready-state retries are guarded again.
+                "comment_cursor": int(comment_row[0] or 0) if comment_row else 0,
             },
             run_id=run_id,
         )
     return True, implementer
+
 
 
 def promote_task(

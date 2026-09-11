@@ -1325,11 +1325,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
             sys.exit(1)
 
         current_branch = _current_branch_name(git_cmd, check=True)
+        pre_branch_alignment_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
         _plan = _prepare_checkout_for_update(
             git_cmd, branch, current_branch, is_fork=is_fork, assume_yes=assume_yes,
             gateway_mode=gateway_mode, gw_input_fn=gw_input_fn, switch_branch=opts.switch_branch,
             _windows_gateway_resume=_windows_gateway_resume)
         commit_count = _plan.commit_count
+        post_branch_alignment_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+        branch_alignment_changed_head = bool(
+            pre_branch_alignment_sha and post_branch_alignment_sha
+            and pre_branch_alignment_sha != post_branch_alignment_sha
+        )
+        if commit_count == 0 and branch_alignment_changed_head:
+            print("→ Branch switch changed the active code checkout; completing update steps")
+            commit_count = 1
 
         if commit_count == 0:
             _finish_already_up_to_date(
@@ -1353,6 +1362,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             git_cmd, branch, _plan.auto_stash_ref, prompt_for_restore=_plan.prompt_for_restore,
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
             keep_stash=opts.keep_stash)
+        if branch_alignment_changed_head:
+            pre_pull_sha = pre_branch_alignment_sha
         _apply_pulled_update(
             git_cmd, branch, pre_pull_sha, _plan, opts, gateway_mode=gateway_mode,
             is_fork=is_fork, desktop_dir=desktop_dir,

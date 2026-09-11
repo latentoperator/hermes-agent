@@ -7,6 +7,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+import json
 import contextlib
 import os
 import re
@@ -1204,15 +1205,61 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # A reviewer's explicit changes_requested transition is different: the
+    # implementer must be allowed to resume the existing PR exactly once.  A
+    # comment cursor stored on that event orders PR evidence precisely even
+    # when the comment and transition share the same one-second timestamp.
+    changes_event = conn.execute(
+        "SELECT id, payload, created_at FROM task_events "
+        "WHERE task_id = ? AND kind = 'changes_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    changes_bypass = False
+    changes_comment_cursor: Optional[int] = None
+    changes_at = 0
+    if changes_event is not None:
+        claimed_after = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id = ? "
+            "AND kind = 'claimed' AND id > ? LIMIT 1",
+            (task_id, int(changes_event["id"])),
+        ).fetchone()
+        changes_bypass = claimed_after is None
+        changes_at = int(changes_event["created_at"] or 0)
+        try:
+            changes_payload = (
+                json.loads(changes_event["payload"])
+                if changes_event["payload"]
+                else {}
+            )
+        except (TypeError, json.JSONDecodeError):
+            changes_payload = {}
+        if isinstance(changes_payload, dict) and isinstance(
+            changes_payload.get("comment_cursor"), int
+        ):
+            changes_comment_cursor = int(changes_payload["comment_cursor"])
+
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT id, body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
         if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            if changes_bypass:
+                if changes_comment_cursor is not None:
+                    evidence_after_changes = int(c["id"]) > changes_comment_cursor
+                else:
+                    # Legacy events have no exact cursor.  Only a strictly
+                    # newer comment re-arms the guard; equal timestamps are
+                    # treated as the review evidence that caused the handoff.
+                    evidence_after_changes = int(c["created_at"] or 0) > changes_at
+                if not evidence_after_changes:
+                    continue
             return "active_pr"
 
     return None
+
 
 
 def _profile_exists_fn() -> Optional[Callable[[str], bool]]:

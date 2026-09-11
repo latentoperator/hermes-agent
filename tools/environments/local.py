@@ -492,12 +492,40 @@ def _prepend_hermes_bin_dir(existing_path: str) -> str:
 
 
 def _managed_runtime_path_entries() -> list[str]:
-    """Existing Hermes-managed runtime dirs: ``$HERMES_HOME/node`` (+``/bin``) and
-    ``$HERMES_HOME/bin`` (managed ``uv``). Per call, not cached: home is
-    profile-scoped and a managed tree can appear mid-process."""
+    """Return existing Hermes-managed runtime dirs for the terminal subshell PATH.
+
+    The terminal tool spawns a subshell whose PATH is the agent process's PATH
+    plus ``_SANE_PATH``. Neither carries the runtimes Hermes installs for
+    itself, so on a machine where Hermes provisioned its own toolchain a
+    command the agent runs resolves a system copy instead — or nothing at all:
+
+    - ``$HERMES_HOME/node`` (+ ``/bin``) — installed to satisfy the desktop and
+      browser toolchain. ``tools/browser_tool.py`` already does this for its own
+      subprocesses; the agent's shell deserves the same.
+    - ``$HERMES_HOME/bin`` — the managed ``uv``. ``install.sh`` writes it there
+      and nothing has ever put that directory on PATH, so an install whose only
+      uv is the managed one looks uv-less to both the agent and the model.
+    - The default Hermes root's ``bin`` — profile subprocesses have a scoped
+      ``HERMES_HOME`` but must retain access to host-managed binaries installed
+      for the fleet in the root Hermes home.
+
+    Resolved per call rather than cached in a module constant because
+    ``get_hermes_home()`` is profile-scoped and a managed tree can appear
+    mid-process (``heal_hermes_managed_node``, a first browser install).
+    """
     try:
-        from hermes_constants import get_hermes_home, iter_hermes_node_dirs
-        return [str(d) for d in (*iter_hermes_node_dirs(), get_hermes_home() / "bin") if d.is_dir()]
+        from hermes_constants import (
+            get_default_hermes_root,
+            get_hermes_home,
+            iter_hermes_node_dirs,
+        )
+
+        candidates = [
+            *iter_hermes_node_dirs(),
+            get_hermes_home() / "bin",
+            get_default_hermes_root() / "bin",
+        ]
+        return list(dict.fromkeys(str(d) for d in candidates if d.is_dir()))
     except Exception:
         return []
 

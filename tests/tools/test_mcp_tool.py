@@ -691,6 +691,136 @@ class TestToolHandler:
             _servers.pop("test_srv", None)
 
 
+    def test_current_session_approval_source_is_bound_before_transport(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool_handlers import _make_tool_handler
+        from tools.mcp_tool import _servers
+
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("approved", is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        tokens = set_session_vars(
+            source="desktop",
+            session_id="20260823_210208_45d0c7",
+            action_approval_source="in_session:desktop:hopewell:20260823_210208_45d0c7",
+        )
+
+        try:
+            handler = _make_tool_handler("test_srv", "act", 120)
+            supplied = {
+                "approval": {
+                    "source": "current_session",
+                    "approved_by": "Chris Gray",
+                }
+            }
+            with self._patch_mcp_loop():
+                result = json.loads(handler(supplied))
+            assert result["result"] == "approved"
+            sent = mock_session.call_tool.call_args.kwargs["arguments"]
+            assert sent["approval"]["source"] == (
+                "in_session:desktop:hopewell:20260823_210208_45d0c7"
+            )
+            assert supplied["approval"]["source"] == "current_session"
+        finally:
+            clear_session_vars(tokens)
+            _servers.pop("test_srv", None)
+
+    def test_non_session_authorities_are_not_rewritten(self):
+        from tools.mcp_tool_handlers import _bind_trusted_action_approval_source
+
+        for source in (
+            "decision_card:dc_12345678",
+            "standing_permission:local:m365_draft_only:create_draft_email",
+        ):
+            args = {"approval": {"source": source}}
+            bound, error = _bind_trusted_action_approval_source(args)
+            assert error is None
+            assert bound is args
+
+    def test_direct_session_approval_fails_closed_without_trusted_metadata(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool_handlers import _make_tool_handler
+        from tools.mcp_tool import _servers
+
+        mock_session = MagicMock()
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        tokens = set_session_vars(source="desktop", session_id="desktop-session")
+
+        try:
+            handler = _make_tool_handler("test_srv", "act", 120)
+            result = json.loads(handler({
+                "approval": {
+                    "source": "in_session:desktop:hopewell:fabricated",
+                    "approved_by": "Chris Gray",
+                }
+            }))
+            assert "trusted current-session approval metadata" in result["error"]
+            mock_session.call_tool.assert_not_called()
+        finally:
+            clear_session_vars(tokens)
+            _servers.pop("test_srv", None)
+
+    def test_cli_approval_source_must_match_live_session(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool_handlers import _make_tool_handler
+        from tools.mcp_tool import _servers
+
+        monkeypatch.setenv("USER", "hopewell")
+        mock_session = MagicMock()
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        tokens = set_session_vars(source="cli", session_id="live-session")
+
+        try:
+            handler = _make_tool_handler("test_srv", "act", 120)
+            result = json.loads(handler({
+                "approval": {
+                    "source": "in_session:cli:hopewell:invented-session:approval-1",
+                    "approved_by": "Chris Gray",
+                }
+            }))
+            assert "does not match the active CLI session" in result["error"]
+            mock_session.call_tool.assert_not_called()
+        finally:
+            clear_session_vars(tokens)
+            _servers.pop("test_srv", None)
+
+    def test_valid_cli_approval_source_is_preserved(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.mcp_tool_handlers import _make_tool_handler
+        from tools.mcp_tool import _servers
+
+        monkeypatch.setenv("USER", "hopewell")
+        mock_session = MagicMock()
+        mock_session.call_tool = AsyncMock(
+            return_value=_make_call_result("approved", is_error=False)
+        )
+        server = _make_mock_server("test_srv", session=mock_session)
+        _servers["test_srv"] = server
+        tokens = set_session_vars(source="cli", session_id="live-session")
+        approval_source = "in_session:cli:hopewell:live-session:approval-1"
+
+        try:
+            handler = _make_tool_handler("test_srv", "act", 120)
+            with self._patch_mcp_loop():
+                result = json.loads(handler({
+                    "approval": {
+                        "source": approval_source,
+                        "approved_by": "Chris Gray",
+                    }
+                }))
+            assert result["result"] == "approved"
+            sent = mock_session.call_tool.call_args.kwargs["arguments"]
+            assert sent["approval"]["source"] == approval_source
+        finally:
+            clear_session_vars(tokens)
+            _servers.pop("test_srv", None)
+
+
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
         from tools.mcp_tool_handlers import _make_tool_handler
         from tools.mcp_tool import _servers

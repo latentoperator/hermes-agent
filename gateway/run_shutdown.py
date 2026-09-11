@@ -978,6 +978,8 @@ class GatewayShutdownMixin:
             except Exception as e:
                 logger.debug("Failed to send shutdown notification to %s:%s: %s", platform_str, chat_id, e)
                 continue
+            from gateway.run import _non_conversational_metadata
+            metadata = _non_conversational_metadata(metadata, platform=platform)
             if await self._send_shutdown_notice(adapter, chat_id, msg, "active chat", platform_str, metadata=metadata):
                 notified.add(dedup_key)
         if self._restart_requested and restart_source is not None:
@@ -1010,6 +1012,8 @@ class GatewayShutdownMixin:
                     "Failed to send shutdown notification to home channel %s:%s: %s", platform.value, home.chat_id, e,
                 )
                 continue
+            from gateway.run import _non_conversational_metadata
+            metadata = _non_conversational_metadata(metadata, platform=platform)
             # Home channels omit ``metadata=`` when empty (adapter doubles may not accept the kwarg).
             if await self._send_shutdown_notice(
                 adapter, str(home.chat_id), msg, "home channel", platform.value,

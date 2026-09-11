@@ -197,6 +197,7 @@ def _plugin_terminal_env_strip_keys() -> frozenset:
 # (claude/codex/gemini). Not provider credentials — no child needs them and they are the
 # highest-value secrets to keep from a compromised dependency. Provider keys = Tier 2.
 _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
+    "HERMES_ACTION_APPROVAL_SOURCE",
     # GitHub auth
     "GH_TOKEN", "GITHUB_TOKEN", "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY_PATH",
     "GITHUB_APP_INSTALLATION_ID",

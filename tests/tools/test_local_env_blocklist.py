@@ -1679,6 +1679,26 @@ class TestHermesBinDirOnPath:
         assert entries[0] == "/opt/hermes/bin"
         assert "/usr/bin" in entries
 
+    def test_profile_keeps_default_root_managed_bin(self, tmp_path, monkeypatch):
+        from tools.environments import local as local_mod
+
+        profile_home = tmp_path / ".hermes" / "profiles" / "dante"
+        profile_bin = profile_home / "bin"
+        root_bin = tmp_path / ".hermes" / "bin"
+        profile_bin.mkdir(parents=True)
+        root_bin.mkdir(parents=True)
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setattr(
+            "hermes_constants.get_default_hermes_root",
+            lambda: tmp_path / ".hermes",
+        )
+        monkeypatch.setattr("hermes_constants.iter_hermes_node_dirs", lambda: [])
+
+        entries = local_mod._managed_runtime_path_entries()
+        assert str(profile_bin) in entries
+        assert str(root_bin) in entries
+
 
 class TestHermesInternalDynamicSecrets:
     """Dynamically-named Hermes secrets injected at gateway/CLI startup must

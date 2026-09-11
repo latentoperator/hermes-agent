@@ -1084,6 +1084,8 @@ def _configure_auth_gate(
     # config. A non-loopback public hostname engages the gate even on a loopback
     # backend, else the SPA's local session token becomes remotely reachable.
     app.state.trusted_public_hosts = _dashboard_public_hosts()
+    from hermes_cli.web_server_chat import _dashboard_allowed_origins
+    app.state.trusted_proxy_origins = _dashboard_allowed_origins()
     # auth_required drives middleware, SPA-token injection, WS auth, the
     # startup refusal, the gate-on banner and uvicorn proxy_headers.
     if _desktop_loopback_auth_exempt(host, ssh_session_token, ssh_owner_nonce):

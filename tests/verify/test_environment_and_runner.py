@@ -3,6 +3,11 @@
 import http.server
 import json
 import subprocess
+import os
+import shlex
+import signal
+import socket
+import sys
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -193,11 +198,26 @@ class TestComposeGuard:
 
 
 def _free_port() -> int:
-    import socket
-
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _port_accepts_connections(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
 
 
 class TestReadiness:
@@ -222,6 +242,44 @@ class TestReadiness:
         assert result.readiness is not None
         assert not result.readiness.ready
         assert not result.ok
+
+    @pytest.mark.linux_only
+    @pytest.mark.live_system_guard_bypass
+    def test_teardown_kills_child_after_package_manager_parent_exits(self, tmp_path):
+        port = _free_port()
+        child_pid_path = tmp_path / "child.pid"
+        (tmp_path / "spawn_child.py").write_text(
+            """\
+import subprocess
+import sys
+from pathlib import Path
+
+child = subprocess.Popen(
+    [sys.executable, "-m", "http.server", sys.argv[1], "--bind", "127.0.0.1"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+Path(sys.argv[2]).write_text(str(child.pid), encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
+        command = " ".join(
+            shlex.quote(value)
+            for value in (sys.executable, "spawn_child.py", str(port), str(child_pid_path))
+        )
+        recipe = Recipe(name="parent-exits", start=command, port=port)
+
+        result = run_verify(tmp_path, recipe, phases=("start",), ready_timeout=10)
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        try:
+            assert result.readiness is not None
+            assert result.readiness.ready
+            assert _wait_until(lambda: not _port_accepts_connections(port))
+        finally:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def test_skip_start(self, tmp_path):
         recipe = Recipe(name="x", test=["true"], start="sleep 30", port=1)

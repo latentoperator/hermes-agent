@@ -304,6 +304,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def __init__(self):
         self._config = self._api_key = self._client = None
+        self._client_lock = threading.Lock()
         self._api_url, self._llm_base_url, self._mode = _DEFAULT_API_URL, "", "cloud"
         self._timeout, self._idle_timeout = _DEFAULT_TIMEOUT, _DEFAULT_IDLE_TIMEOUT
         self._bank_id, self._budget, self._bank_id_template = "hermes", "mid", ""
@@ -480,9 +481,12 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _get_client(self):
         """Return the cached Hindsight client (created once, reused)."""
-        if self._client is None:
-            self._client = self._new_embedded_client() if self._mode == "local_embedded" else self._new_cloud_client()
-        return self._client
+        if self._client is not None:
+            return self._client
+        with self._client_lock:
+            if self._client is None:
+                self._client = self._new_embedded_client() if self._mode == "local_embedded" else self._new_cloud_client()
+            return self._client
 
     def _run_sync(self, coro):
         """Schedule *coro* on the shared loop using the configured timeout."""
@@ -1187,6 +1191,9 @@ class HindsightMemoryProvider(MemoryProvider):
             with contextlib.suppress(Exception):
                 self._close_client()
             self._client = None
+
+
+
         # The module-global loop is intentionally NOT stopped: it's shared by every
         # provider in the process (one per gateway chat session); stopping it would
         # strand siblings' aiohttp sessions ("Unclosed client session"). Daemon

@@ -3,6 +3,7 @@ ladder: trust gating, circuit breaker, auth (401) refresh, session-expired recon
 
 import logging
 import asyncio
+import os
 import contextvars
 import inspect
 import json
@@ -468,6 +469,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
         if error is not None:
             return error
+        args, approval_source_error = _bind_trusted_action_approval_source(args)
+        if approval_source_error is not None:
+            return tool_error(approval_source_error)
         server, error = _acquire_call_server(server_name, tool_timeout)
         if server is None:
             return error
@@ -597,3 +601,45 @@ def _make_check_fn(server_name: str):
             return ((server is not None and (server.session is not None or server._is_recycled_stdio()))
                     or server_name in _core._lazy_server_configs)
     return _check
+
+
+def _bind_trusted_action_approval_source(args: dict) -> tuple[dict, str | None]:
+    """Replace model-authored in-session provenance with the live turn source."""
+    approval = args.get("approval")
+    if not isinstance(approval, dict):
+        return args, None
+    claimed = str(approval.get("source") or "").strip()
+    if claimed.startswith(("decision_card:", "standing_permission:")):
+        # Decision-card and other wrapper-specific authorities remain owned by
+        # their server-side validators.
+        return args, None
+    try:
+        from gateway.session_context import get_session_env
+
+        trusted = get_session_env("HERMES_ACTION_APPROVAL_SOURCE", "").strip()
+        surface = (
+            get_session_env("HERMES_SESSION_PLATFORM", "")
+            or get_session_env("HERMES_SESSION_SOURCE", "")
+        ).strip().lower()
+        session_id = get_session_env("HERMES_SESSION_ID", "").strip()
+    except Exception:
+        trusted = ""
+        surface = ""
+        session_id = ""
+    if trusted:
+        bound = dict(args)
+        bound_approval = dict(approval)
+        bound_approval["source"] = trusted
+        bound["approval"] = bound_approval
+        return bound, None
+    if surface == "cli" and claimed.startswith("in_session:") and session_id:
+        cli_user = str(os.environ.get("USER") or "").strip()
+        expected_prefix = f"in_session:cli:{cli_user}:{session_id}:"
+        if not cli_user or not claimed.startswith(expected_prefix) or claimed == expected_prefix:
+            return args, "approval source does not match the active CLI session"
+    if surface in {"desktop", "discord", "telegram"}:
+        return args, (
+            "trusted current-session approval metadata is unavailable for "
+            f"the active {surface} turn"
+        )
+    return args, None

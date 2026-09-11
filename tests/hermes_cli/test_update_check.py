@@ -78,7 +78,7 @@ def test_cache_is_daily_but_invalidated_when_head_moves(git_repo, monkeypatch):
 
     def write_cache(*, ts, head, behind):
         cache_file.write_text(json.dumps(
-            {"ts": ts, "behind": behind, "rev": None, "ver": __version__, "head": head}))
+            {"ts": ts, "behind": behind, "rev": None, "ver": __version__, "head": head, "source_path": str(git_repo)}))
 
     write_cache(ts=time.time() - banner._UPDATE_CHECK_CACHE_SECONDS + 60, head=SHA_A, behind=3)
     assert banner.check_for_updates() == 3
@@ -123,3 +123,26 @@ def test_upstream_main_sha_ls_remote_fallback_disables_git_prompts(monkeypatch):
     assert kwargs["stdin"] is banner.subprocess.DEVNULL
     assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
     assert kwargs["env"]["GCM_INTERACTIVE"] == "Never"
+
+
+def test_fork_probe_and_cache_follow_the_active_checkout(git_repo, tmp_path, monkeypatch):
+    """A fork consults Nous, and another checkout cannot reuse its cached answer."""
+    def stdout(args, **kwargs):
+        return {
+            ("remote", "get-url", "upstream"): "https://github.com/NousResearch/hermes-agent.git",
+            ("remote", "get-url", "origin"): "https://github.com/example/hermes-agent.git",
+            ("rev-parse", "HEAD"): SHA_A,
+        }.get(tuple(args))
+    monkeypatch.setattr(banner, "_git_stdout", stdout)
+    monkeypatch.setattr(banner, "_tips_behind", lambda *args: 7)
+    tip = MagicMock(return_value=SHA_B)
+    monkeypatch.setattr(banner, "_github_branch_tip", tip)
+    assert banner.check_for_updates() == 7
+    tip.assert_called_once_with("nousresearch/hermes-agent", "main")
+    tip.reset_mock()
+    assert banner.check_for_updates() == 7
+    tip.assert_not_called()
+    other = tmp_path / "other-checkout"
+    monkeypatch.setattr(banner, "_resolve_repo_dir", lambda: other)
+    assert banner.check_for_updates() == 7
+    tip.assert_called_once_with("nousresearch/hermes-agent", "main")

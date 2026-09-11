@@ -18,6 +18,7 @@ import hermes_state
 import hermes_state_wal
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 
@@ -1656,3 +1657,54 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_notify_success_cursor_cannot_regress_newer_claim(tmp_path):
+    db_path = tmp_path / "notify-kanban.db"
+    conn1 = kbc.connect(db_path=db_path)
+    conn2 = kbc.connect(db_path=db_path)
+    try:
+        task_id = kb.create_task(conn1, title="cursor", assignee="worker")
+        kbn.add_notify_sub(
+            conn1,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="123",
+        )
+        kb.complete_task(conn1, task_id, result="done")
+        _, first_cursor, first_events = kbn.claim_unseen_events_for_sub(
+            conn1,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="123",
+            kinds=["completed", "commented"],
+        )
+        assert [event.kind for event in first_events] == ["completed"]
+
+        kb.add_comment(conn2, task_id, "reviewer", "later event")
+        _, second_cursor, second_events = kbn.claim_unseen_events_for_sub(
+            conn2,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="123",
+            kinds=["completed", "commented"],
+        )
+        assert [event.kind for event in second_events] == ["commented"]
+        assert second_cursor > first_cursor
+
+        kbn.advance_notify_cursor(
+            conn1,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="123",
+            new_cursor=first_cursor,
+        )
+        row = conn1.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = 'telegram' AND chat_id = '123'",
+            (task_id,),
+        ).fetchone()
+        assert int(row["last_event_id"]) == second_cursor
+    finally:
+        conn1.close()
+        conn2.close()

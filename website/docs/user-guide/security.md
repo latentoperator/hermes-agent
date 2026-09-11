@@ -314,7 +314,24 @@ Useful flags: `--days N` (history window, default 90), `--min-count N`
 
 ## File Write Safety {#file-write-safety}
 
-Before `write_file` or `patch` touches disk, Hermes checks the target path against a denylist and an optional sandbox. Blocked writes return an error to the agent immediately — **there is no approval prompt** and no way to override from the chat UI. The model may still claim the edit succeeded; when `display.file_mutation_verifier` is on (default), trust the [file-mutation verifier footer](./configuration.md#file-mutation-verifier) over the assistant's closing summary.
+Before `write_file` or `patch` touches disk, Hermes checks the target path against a denylist and an optional sandbox. Hard-blocked writes return an error to the agent immediately and cannot be overridden from the chat UI. The model may still claim the edit succeeded; when `display.file_mutation_verifier` is on (default), trust the [file-mutation verifier footer](./configuration.md#file-mutation-verifier) over the assistant's closing summary.
+
+### Agent-instruction files (always ask)
+
+Project instruction files (`AGENTS.md`, `CLAUDE.md`, `SOUL.md`, `.cursorrules`, and project-local `.hermes/*`) steer future agent sessions, so `write_file` and `patch` require a one-operation human approval even under yolo/auto-approve. Interactive CLI and gateway sessions show the normal approval prompt and never persist a session/always grant.
+
+Headless Kanban workers have no stdin or live approval callback. After an unattended Decision Card is answered Yes, the worker can consume that approval exactly once when the card uses `action_kind: protected_instruction_write` and this exact JSON payload shape:
+
+```json
+{
+  "action": "write_protected_instruction_files",
+  "task_id": "t_example",
+  "paths": ["/absolute/project/AGENTS.md", "/absolute/project/CLAUDE.md"],
+  "yes_action": "write exactly the listed repo-instruction files once"
+}
+```
+
+Every absolute path must be a standalone line in the card question or context, followed or preceded by the exact visible grant line `Task <task_id> — Yes: <yes_action>`. The card's originating profile must match the worker profile, the active Kanban task must match `task_id`, and the button actor must be an explicit user ID in that platform's existing user allowlist (`*` and role-only authorization do not qualify for executable grants). A multi-file approval must be applied as one atomic `patch` call with exactly the approved target set. Hermes records `protected_write_claimed` in the shared Decision Card audit trail before the write; wrong paths, wrong task/profile, untrusted button identity, malformed payloads, and replay attempts keep failing closed. Because authority is consumed before file I/O, an apply failure requires operator review and a fresh card rather than an automatic retry.
 
 ### Protected paths (always blocked)
 

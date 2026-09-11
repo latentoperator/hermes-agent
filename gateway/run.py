@@ -4139,18 +4139,65 @@ class GatewayRunner(
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
-    def _set_session_env(self, context: SessionContext) -> list:
-        """Set session context variables (contextvars, not os.environ, so concurrent messages can't
-        overwrite each other). Returns reset tokens for ``_clear_session_env`` in a ``finally``."""
-        from gateway.session_context import set_session_vars
-        # Async-delivery capability tells async tools whether this channel can wake a later turn. Default
-        # True keeps CLI/unknown paths working; stateless adapters (api_server) declare False.
-        _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
+    def _set_session_env(
+        self,
+        context: SessionContext,
+        *,
+        message_id: str | None = None,
+        allow_action_approval: bool | None = None,
+    ) -> list:
+        """Set session context variables for the current async task.
+
+        Uses ``contextvars`` instead of ``os.environ`` so that concurrent
+        gateway messages cannot overwrite each other's session state.
+
+        Returns a list of reset tokens; pass them to ``_clear_session_env``
+        in a ``finally`` block.
+        """
+        from gateway.session_context import build_action_approval_source, set_session_vars
+        # Propagate the adapter's async-delivery capability so async tools
+        # (terminal notify_on_complete / watch_patterns, delegate_task
+        # background=True) know whether this channel can wake a later turn.
+        # Default True keeps CLI / unknown paths working; stateless adapters
+        # (api_server) declare supports_async_delivery=False. Use getattr so
+        # bare runners built via object.__new__ (tests) without self.adapters
+        # don't blow up — they simply default to supported.
+        _adapters = getattr(self, "adapters", None) or {}
+        _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        effective_message_id = (
+            str(message_id)
+            if message_id is not None
+            else str(
+                context.message_id
+                or context.source.message_id
+                or ""
+            )
+        )
+        effective_action_approval = (
+            context.allow_action_approval
+            if allow_action_approval is None
+            else allow_action_approval
+        )
+        action_approval_source = (
+            build_action_approval_source(
+                platform=context.source.platform.value,
+                user_id=str(context.source.user_id or ""),
+                scope_id=str(getattr(context.source, "scope_id", "") or ""),
+                chat_id=str(context.source.chat_id or ""),
+                thread_id=str(context.source.thread_id or ""),
+                message_id=effective_message_id,
+                session_id=context.session_id,
+            )
+            if effective_action_approval
+            else ""
+        )
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
-            chat_type=str(context.source.chat_type) if context.source.chat_type else "",
+            chat_type=(
+                str(context.source.chat_type) if context.source.chat_type else ""
+            ),
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
@@ -4159,10 +4206,13 @@ class GatewayRunner(
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
             session_key=context.session_key,
-            message_id=str(context.source.message_id) if context.source.message_id else "",
+            session_id=context.session_id,
+            message_id=effective_message_id,
+            action_approval_source=action_approval_source,
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
-            cron_session="")
+            cron_session="",
+        )
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""

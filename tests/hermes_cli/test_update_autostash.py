@@ -187,11 +187,16 @@ def _make_update_side_effect(
         if "show-current" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
         if "rev-parse" in joined and "HEAD" in joined:
-            # First call = pre-pull HEAD, every later call = post-pull HEAD
-            # (issue #79678's "did HEAD actually move" guard depends on these
-            # differing after a successful reset/merge).
+            # The branch-alignment guard samples HEAD twice before the pull;
+            # both reads stay on the same commit in these main-branch tests.
+            # The third read is the pre-pull baseline and the fourth is the
+            # post-pull HEAD used by issue #79678's "did HEAD move" guard.
             head_sha_calls.append(1)
-            if len(head_sha_calls) == 1:
+            if len(head_sha_calls) <= 2:
+                return SimpleNamespace(
+                    stdout="1111111111111111111111111111111111111beef\n", stderr="", returncode=0
+                )
+            if len(head_sha_calls) == 3:
                 if pre_pull_sha_unavailable:
                     return SimpleNamespace(stdout="", stderr="", returncode=0)
                 return SimpleNamespace(
@@ -584,6 +589,7 @@ def _setup_keep_stash_test(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "hermes_cli.gateway.find_gateway_pids", lambda **kw: [], raising=False
     )
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     return restore_calls, discard_calls, park_calls
 
 

@@ -261,7 +261,7 @@ from gateway.platforms.helpers import (
 )
 from utils import atomic_json_write, env_float
 from gateway.platforms.base import (
-    BasePlatformAdapter, SendResult,
+    BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult, classify_send_error,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
     cache_document_from_bytes_async, SUPPORTED_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit, utf16_len, validate_inbound_media_size,
@@ -1236,6 +1236,39 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 if adapter_self._missed_message_backfill_enabled():
                     adapter_self._ensure_missed_message_backfill_task()
 
+            async def _decision_card_on_interaction(interaction):
+                # Decision Cards may be sent by the live adapter OR by a
+                # standalone post-brief sender using raw Discord REST
+                # components.  The latter has no in-memory discord.ui.View, so
+                # catch its stable custom_id here and resolve it without
+                # involving the LLM loop. Register as an additive listener when
+                # discord.py exposes that API so the bot's built-in app-command
+                # interaction dispatcher remains intact for slash commands.
+                try:
+                    data = getattr(interaction, "data", None) or {}
+                    custom_id = data.get("custom_id") if isinstance(data, dict) else None
+                    if isinstance(custom_id, str) and custom_id.startswith("decision:"):
+                        await adapter_self._handle_decision_card_interaction(interaction, custom_id)
+                        return
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Decision card interaction handling failed: %s",
+                        adapter_self.name, exc, exc_info=True,
+                    )
+
+            add_listener = getattr(self._client, "add_listener", None)
+            listen = getattr(self._client, "listen", None)
+            if callable(add_listener):
+                add_listener(_decision_card_on_interaction, "on_interaction")
+            elif callable(listen):
+                listen("on_interaction")(_decision_card_on_interaction)  # pyright: ignore[reportCallIssue]
+            else:
+                logger.debug(
+                    "[%s] Discord client has no additive interaction-listener API; "
+                    "raw REST Decision Card fallback not registered",
+                    self.name,
+                )
+
             @self._client.event
             async def on_message(message: DiscordMessage):
                 await adapter_self._dispatch_discord_message(message)
@@ -1321,6 +1354,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             code, message, retryable = self._classify_connect_exception(e)
             self._set_fatal_error(code, message, retryable=retryable)
             return False
+
 
     def _classify_connect_exception(self, error: Exception) -> tuple:
         """Map a startup exception to ``(code, message, retryable)`` by TYPE only (never message
@@ -2831,11 +2865,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             result = SendResult(success=False, error="Refusing to send empty message")
             # Backfill replays from this table: record the dropped final reply as failed or it is lost.
             return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")))
+        nonconversational = _metadata_marks_nonconversational(metadata)
         try:
             thread_id = None
             if metadata and metadata.get("thread_id"):
                 thread_id = metadata["thread_id"]
-            nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
             if thread_id:
                 channel = await self._resolve_channel(thread_id)
@@ -2845,6 +2879,26 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 channel = await self._resolve_channel(chat_id)
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
+            parent_id = getattr(channel, "parent_id", None)
+            parent_channel_id = str(parent_id) if parent_id else None
+            try:
+                from gateway.outbound_discord_allowlist import (
+                    check_discord_outbound_allowed,
+                    deny_message,
+                    log_denial,
+                )
+                decision = check_discord_outbound_allowed(
+                    str(chat_id),
+                    thread_id=str(thread_id) if thread_id else None,
+                    parent_channel_id=parent_channel_id,
+                )
+                if not decision.allowed:
+                    log_denial(decision)
+                    return SendResult(success=False, error=deny_message(decision), error_kind="forbidden")
+            except Exception as allowlist_exc:
+                logger.error("[%s] Discord outbound allowlist check failed: %s", self.name, allowlist_exc, exc_info=True)
+                return SendResult(success=False, error=f"Discord outbound allowlist check failed: {allowlist_exc}", error_kind="forbidden")
+
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
@@ -2890,12 +2944,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
             return await self._record_response_async(reply_to, result, content, final_delivery)
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
+            unavailable_target_kind = self._discord_unavailable_target_kind(e)
+            error_kind = unavailable_target_kind or classify_send_error(e)
+            if nonconversational and unavailable_target_kind is not None:
+                logger.debug("[%s] Skipping non-conversational Discord send to unavailable target: %s", self.name, e)
+            else:
+                logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             if _is_discord_transport_error(e):
                 # Connection-shaped failure: runtime-retryable marker so the reconnect sweep can replay it.
-                result = SendResult(success=False, error="send_path_degraded", retryable=True)
+                result = SendResult(success=False, error="send_path_degraded", error_kind=error_kind, retryable=True)
             else:
-                result = SendResult(success=False, error=str(e))
+                result = SendResult(success=False, error=str(e), error_kind=error_kind)
             return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")))
 
     @staticmethod
@@ -5769,6 +5828,45 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         else:
             msg_type = MessageType.TEXT
         effective_channel = auto_threaded_channel or message.channel
+        # Preflight the same outbound allowlist used by send().  Mentions are
+        # otherwise accepted inbound, the agent spends tokens and may run tools,
+        # then every progress/final send is denied.  Fail before invoking the
+        # agent when this profile cannot answer in the target Discord thread.
+        if not isinstance(message.channel, discord.DMChannel):
+            try:
+                from gateway.outbound_discord_allowlist import (
+                    check_discord_outbound_allowed,
+                    deny_message,
+                    log_denial,
+                )
+
+                _effective_chat_id = str(getattr(effective_channel, "id", "") or "")
+                _effective_thread_id = thread_id if is_thread else None
+                _effective_parent_id = parent_channel_id
+                if not _effective_parent_id:
+                    _effective_parent_id = self._get_parent_channel_id(effective_channel)
+                decision = check_discord_outbound_allowed(
+                    _effective_chat_id,
+                    thread_id=_effective_thread_id,
+                    parent_channel_id=_effective_parent_id,
+                )
+                if not decision.allowed:
+                    log_denial(decision)
+                    logger.warning(
+                        "[%s] Ignoring inbound Discord message because outbound target is denied: %s",
+                        self.name,
+                        deny_message(decision),
+                    )
+                    return
+            except Exception as allowlist_exc:
+                logger.error(
+                    "[%s] Discord outbound allowlist preflight failed: %s",
+                    self.name,
+                    allowlist_exc,
+                    exc_info=True,
+                )
+                return
+
         if isinstance(message.channel, discord.DMChannel):
             chat_type = "dm"
             chat_name = message.author.name
@@ -5893,6 +5991,140 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
 
+    @staticmethod
+    def _discord_unavailable_target_kind(exc: BaseException) -> Optional[str]:
+        """Classify errors proving a captured Discord route is gone."""
+        code = getattr(exc, "code", None)
+        if code is None:
+            data = getattr(exc, "data", None)
+            if isinstance(data, dict):
+                code = data.get("code")
+        try:
+            code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code = None
+
+        text = str(exc).lower()
+        if code == 50001 or "error code: 50001" in text or "missing access" in text:
+            return "forbidden"
+        if code == 10003 or "error code: 10003" in text or "unknown channel" in text:
+            return "not_found"
+        return None
+
+    async def _handle_decision_card_interaction(self, interaction, custom_id: str) -> None:
+        """Resolve a Decision Card button interaction from a stable custom_id."""
+        try:
+            from gateway.decision_cards import handle_action, parse_custom_id
+            card_id, action = parse_custom_id(custom_id)
+        except Exception:
+            return
+
+        if not _component_check_auth(interaction, self._allowed_user_ids, self._allowed_role_ids):
+            await interaction.response.send_message(
+                "You're not authorized to answer this decision card.",
+                ephemeral=True,
+            )
+            return
+
+        user = getattr(interaction, "user", None)
+        display_name = getattr(user, "display_name", None) or getattr(user, "name", None) or "user"
+        user_id = str(getattr(user, "id", "") or "")
+        message = getattr(interaction, "message", None)
+        channel_id = str(getattr(interaction, "channel_id", "") or "")
+        thread_id = channel_id if channel_id else ""
+        message_id = str(getattr(message, "id", "") or "")
+
+        card, receipt = handle_action(
+            card_id,
+            action,
+            actor=display_name,
+            actor_id=user_id,
+            actor_platform="discord",
+            message_id=message_id,
+            channel_id=channel_id,
+            thread_id=thread_id,
+        )
+
+        embed = message.embeds[0] if (message and getattr(message, "embeds", None)) else None
+        if embed:
+            if action == "yes":
+                embed.color = discord.Color.green()
+                embed.set_footer(text=f"Yes by {display_name}")
+            elif action == "no":
+                embed.color = discord.Color.red()
+                embed.set_footer(text=f"No by {display_name}")
+            elif action == "wait":
+                embed.color = discord.Color.greyple()
+                embed.set_footer(text=f"Snoozed by {display_name}")
+            else:
+                embed.color = discord.Color.blue()
+                embed.set_footer(text=f"More info requested by {display_name}")
+
+        if action in {"yes", "no", "wait"}:
+            # For adapter-sent cards, discord.py supplies the actual View via
+            # the callback path. For raw REST cards, we can still acknowledge
+            # with an edited embed and remove components by passing view=None.
+            try:
+                await interaction.response.edit_message(embed=embed, view=None)
+            except Exception:
+                await interaction.response.send_message(receipt, ephemeral=False)
+        else:
+            await interaction.response.send_message(receipt, ephemeral=False)
+
+    async def send_decision_card(
+        self,
+        chat_id: str,
+        card_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a durable Decision Card with Yes / No / Wait / Info buttons."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        try:
+            target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+
+            body = str(content or "").strip()
+            max_desc = 4088
+            if len(body) > max_desc:
+                body = body[: max_desc - 3] + "..."
+
+            embed = discord.Embed(
+                title="Decision Card",
+                description=body,
+                color=discord.Color.orange(),
+            )
+            view = DecisionCardView(
+                card_id=card_id,
+                allowed_user_ids=self._allowed_user_ids,
+                allowed_role_ids=self._allowed_role_ids,
+            )
+            msg = await channel.send(embed=embed, view=view)
+            view._message = msg
+
+            try:
+                from gateway.decision_cards import record_delivery
+                record_delivery(
+                    card_id,
+                    platform="discord",
+                    chat_id=str(chat_id),
+                    thread_id=str(metadata.get("thread_id") or "") if metadata else "",
+                    message_id=str(msg.id),
+                )
+            except Exception:
+                logger.debug("[%s] Failed to record decision-card delivery", self.name, exc_info=True)
+
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as e:
+            logger.warning("[%s] send_decision_card failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+
+
+
 
 # ---------------------------------------------------------------------------
 # Discord UI Components (outside the adapter class)
@@ -5979,7 +6211,7 @@ def _resolve_exec_approval_admin_gate(config_extra: Optional[dict]) -> Tuple[boo
 def _define_discord_view_classes() -> None:
     """Register Discord UI view classes as module globals.
     Called at module load and after a lazy install so the classes exist whenever DISCORD_AVAILABLE."""
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView, DecisionCardView
 
     class _HermesView(discord.ui.View):
         """Shared plumbing for Hermes component views: allowlist auth, single-use
@@ -6428,6 +6660,107 @@ def _define_discord_view_classes() -> None:
                 except Exception:
                     pass
 
+    class DecisionCardView(discord.ui.View):
+        """Interactive view for durable Decision Cards."""
+
+        def __init__(
+            self,
+            card_id: str,
+            allowed_user_ids: set,
+            allowed_role_ids: Optional[set] = None,
+        ):
+            # Queue state, rather than a short-lived view timeout, controls the
+            # durable decision card lifecycle.
+            super().__init__(timeout=None)
+            self.card_id = card_id
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+
+            buttons = [
+                ("Yes", discord.ButtonStyle.success, "yes"),
+                ("No", discord.ButtonStyle.danger, "no"),
+                ("Wait", discord.ButtonStyle.secondary, "wait"),
+                ("Need More Info", discord.ButtonStyle.primary, "info"),
+            ]
+            for label, style, action in buttons:
+                button = discord.ui.Button(
+                    label=label,
+                    style=style,
+                    custom_id=f"decision:{card_id}:{action}",
+                )
+                button.callback = self._make_callback(action)
+                self.add_item(button)
+
+        def _check_auth(self, interaction: "discord.Interaction") -> bool:
+            return _component_check_auth(
+                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            )
+
+        def _make_callback(self, action: str):
+            async def _callback(interaction: "discord.Interaction"):
+                await self._resolve_action(interaction, action)
+
+            return _callback
+
+        async def _resolve_action(self, interaction: "discord.Interaction", action: str) -> None:
+            if not self._check_auth(interaction):
+                await interaction.response.send_message(
+                    "You're not authorized to answer this decision card.",
+                    ephemeral=True,
+                )
+                return
+
+            user = getattr(interaction, "user", None)
+            display_name = getattr(user, "display_name", None) or getattr(user, "name", None) or "user"
+            user_id = str(getattr(user, "id", "") or "")
+            message = getattr(interaction, "message", None)
+            channel_id = str(getattr(interaction, "channel_id", "") or "")
+            message_id = str(getattr(message, "id", "") or "")
+
+            try:
+                from gateway.decision_cards import handle_action
+                _card, receipt = handle_action(
+                    self.card_id,
+                    action,
+                    actor=display_name,
+                    actor_id=user_id,
+                    actor_platform="discord",
+                    message_id=message_id,
+                    channel_id=channel_id,
+                    thread_id=channel_id,
+                )
+            except Exception as exc:
+                await interaction.response.send_message(
+                    f"Decision card could not be recorded: {exc}",
+                    ephemeral=True,
+                )
+                return
+
+            embed = message.embeds[0] if (message and getattr(message, "embeds", None)) else None
+            if embed:
+                if action == "yes":
+                    embed.color = discord.Color.green()
+                    embed.set_footer(text=f"Yes by {display_name}")
+                elif action == "no":
+                    embed.color = discord.Color.red()
+                    embed.set_footer(text=f"No by {display_name}")
+                elif action == "wait":
+                    embed.color = discord.Color.greyple()
+                    embed.set_footer(text=f"Snoozed by {display_name}")
+                else:
+                    embed.color = discord.Color.blue()
+                    embed.set_footer(text=f"More info requested by {display_name}")
+
+            if action in {"yes", "no", "wait"}:
+                for child in self.children:
+                    child.disabled = True
+                try:
+                    await interaction.response.edit_message(embed=embed, view=self)
+                except Exception:
+                    await interaction.response.send_message(receipt, ephemeral=False)
+            else:
+                await interaction.response.send_message(receipt, ephemeral=False)
+
     class ClarifyChoiceView(_HermesView):
         """One button per clarify choice (max 24) plus ``✏️ Other``. A numeric click resolves the
         gateway clarify entry immediately; ``Other`` flips to text-capture (next message answers).
@@ -6711,6 +7044,20 @@ async def _standalone_send(
     if not token:
         return {"error": "Discord standalone send: DISCORD_BOT_TOKEN is not set"}
     try:
+        from gateway.outbound_discord_allowlist import (
+            check_discord_outbound_allowed,
+            deny_message,
+            log_denial,
+        )
+        decision = check_discord_outbound_allowed(str(chat_id), thread_id=str(thread_id) if thread_id else None)
+        if not decision.allowed:
+            log_denial(decision)
+            return {"error": deny_message(decision), "error_kind": "forbidden"}
+    except Exception as allowlist_exc:
+        logger.error("Discord standalone outbound allowlist check failed: %s", allowlist_exc, exc_info=True)
+        return {"error": f"Discord outbound allowlist check failed: {allowlist_exc}", "error_kind": "forbidden"}
+
+    try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
@@ -6837,6 +7184,7 @@ async def _standalone_send(
         # Include the exception type: str(TimeoutError()) is empty.
         logger.error("Discord standalone send failed", exc_info=True)
         return {"error": _standalone_sanitize_error(f"Discord send failed: {type(e).__name__}: {e}")}
+
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────

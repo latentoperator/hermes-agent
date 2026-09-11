@@ -1159,6 +1159,38 @@ class TestHomeChannelEnvOverrides:
             assert (home.chat_id, home.name) == expected, platform.value
 
 
+def test_twilio_partial_credentials_do_not_auto_enable_sms():
+    config = GatewayConfig()
+    with patch.dict(
+        os.environ,
+        {
+            "TWILIO_ACCOUNT_SID": "ACshared",
+            "TWILIO_AUTH_TOKEN": "shared-token",
+        },
+        clear=True,
+    ):
+        _apply_env_overrides(config)
+
+    assert Platform.SMS not in config.platforms
+
+
+def test_twilio_complete_credentials_auto_enable_sms():
+    config = GatewayConfig()
+    with patch.dict(
+        os.environ,
+        {
+            "TWILIO_ACCOUNT_SID": "ACsms",
+            "TWILIO_AUTH_TOKEN": "sms-token",
+            "TWILIO_PHONE_NUMBER": "+15551234567",
+        },
+        clear=True,
+    ):
+        _apply_env_overrides(config)
+
+    assert config.platforms[Platform.SMS].enabled is True
+    assert config.platforms[Platform.SMS].api_key == "sms-token"
+
+
 class TestMultiplexProfilesEnvOverride:
     """GATEWAY_MULTIPLEX_PROFILES env override — the 3-tier precedence chain.
 

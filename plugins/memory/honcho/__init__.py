@@ -566,9 +566,9 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
             path = resolve_config_path()
             try:
                 stat = path.stat()
-                memo_key = (str(path), stat.st_mtime_ns, stat.st_size)
+                memo_key = (str(path), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
             except OSError:
-                memo_key = (str(path), None, None)
+                memo_key = (str(path), None, None, None)
             cached = self._identity_signature_memo.get(memo_key)
             if cached is not None:
                 return dict(cached)

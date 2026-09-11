@@ -388,7 +388,7 @@ def advance_notify_cursor(
 ) -> None:
     with _kb.write_txn(conn):
         conn.execute(
-            "UPDATE kanban_notify_subs SET last_event_id = ? " + _SUB_KEY_WHERE,
+            "UPDATE kanban_notify_subs SET last_event_id = MAX(last_event_id, ?) " + _SUB_KEY_WHERE,
             (int(new_cursor), *_sub_key(task_id, platform, chat_id, thread_id)),
         )
 
