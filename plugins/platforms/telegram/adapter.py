@@ -4290,10 +4290,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
         user_display = getattr(query.from_user, "first_name", "User")
         try:
-            # message/channel ids stay empty on purpose: handle_action
-            # COALESCEs non-empty values into the card row, and those
-            # columns belong to the Discord message the card's primary
-            # buttons live on.
+            # Delivery coordinates are owned by record_delivery. Leave them
+            # intact here, including historical cards sent before Telegram
+            # became the sole Decision Cards destination.
             card, receipt = handle_action(
                 card_id,
                 action,
@@ -4315,8 +4314,8 @@ class TelegramAdapter(BasePlatformAdapter):
         await query.answer(text=f"{label} recorded")
 
         if action in {"yes", "no", "wait"}:
-            # Append the outcome to the mirrored card text and drop the
-            # buttons. Mirror text is sent without parse_mode, so edit
+            # Append the outcome to the card text and drop the
+            # buttons. Card text is sent without parse_mode, so edit
             # plain as well.
             original = getattr(query.message, "text", "") or ""
             try:

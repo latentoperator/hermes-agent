@@ -196,3 +196,28 @@ def test_parse_custom_id_rejects_non_decision():
     assert dc.parse_custom_id("decision:dc_123:wait") == ("dc_123", "wait")
     with pytest.raises(dc.DecisionCardError):
         dc.parse_custom_id("clarify:abc:0")
+
+
+def test_decision_card_requires_originating_profile(queue_db):
+    with pytest.raises(dc.DecisionCardError, match="originating_profile is required"):
+        dc.create_card(
+            question="Should Virgil continue with the smoke card?",
+            context="The card must be attributable to the asking agent.",
+            default_action="Do nothing",
+            fire_at="2026-07-04 22:00 CT",
+            requested_by="Virgil smoke test",
+        )
+
+
+def test_decision_card_text_leads_with_asking_agent(queue_db):
+    card = dc.create_card(
+        question="Should Virgil continue with the smoke card?",
+        context="The card must be visibly attributable.",
+        default_action="Do nothing",
+        fire_at="2026-07-04 22:00 CT",
+        requested_by="Virgil smoke test",
+        source_ref="kanban:t_demo",
+        originating_profile="virgil",
+    )
+
+    assert dc.format_card_text(card).splitlines()[0] == "**Virgil asks:**"
