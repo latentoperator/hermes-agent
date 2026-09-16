@@ -302,6 +302,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/approve [session\|always]` | Approve and execute a pending dangerous command. `session` approves for this session only; `always` adds to permanent allowlist. |
 | `/deny` | Reject a pending dangerous command. |
 | `/update` | Update Hermes Agent to the latest version. |
+| `/fleet reset-session <all\|profile[,profile]>` | Hopebox fork: reset authoritative sessions for all profiles or the named profiles. Messaging gateway only. |
 | `/restart` | Gracefully restart the gateway after draining active runs. When the gateway comes back online, it sends a confirmation to the requester's chat/thread. |
 | `/debug` | Upload debug report (system info + logs) and get shareable links. |
 | `/help` | Show messaging help. |
