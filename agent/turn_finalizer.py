@@ -542,9 +542,13 @@ def finalize_turn(
     # surfaces status="error" (desktop can toast) instead of a quiet complete frame, plus
     # the machine-readable cause 'session_persistence_failed:<locked|compression|...>'.
     if failed and str(_turn_exit_reason) == "session_persistence_failed":
+        from hermes_constants import profile_cli_selector
+
+        # Never rebind final_response here: the memory sync and the background-review gate
+        # below must still see an empty response on a persistence-failed turn.
         result["error"] = final_response or (
             "session storage could not be written — check the state database "
-            "health (`hermes doctor`), then send your message again"
+            f"health (`hermes {profile_cli_selector()}doctor`), then send your message again"
         )
         _cause = getattr(agent, "_last_persistence_error_cause", None)
         result["failure_reason"] = "session_persistence_failed:" + (_cause or "unknown")
