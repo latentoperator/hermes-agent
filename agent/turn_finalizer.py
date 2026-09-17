@@ -12,6 +12,7 @@ from contextlib import suppress
 from typing import Any, Callable, List, Optional, Tuple
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.turn_failure_copy import exit_reason_failure, stamp_failure
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
@@ -117,8 +118,12 @@ def _resolve_budget_fallback(
                 )
             final_response = agent._handle_max_iterations(messages, api_call_count)
 
-    # Preserve a durable handoff on the first exhaustion, including interrupted exits.
-    kanban_task = os.environ.get("HERMES_KANBAN_TASK") if budget_exhausted else None
+    # Only the dispatcher-owned worker may close its task. Delegated children and
+    # in-process cron runs can inherit HERMES_KANBAN_TASK from that worker.
+    kanban_task = (
+        os.environ.get("HERMES_KANBAN_TASK")
+        if budget_exhausted and is_dispatcher_owned_worker_context() else None
+    )
     if kanban_task:
         _stop_kanban_budget_exhausted(
             kanban_task, final_response=final_response, api_call_count=api_call_count,

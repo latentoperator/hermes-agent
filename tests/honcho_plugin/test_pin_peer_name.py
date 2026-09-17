@@ -580,7 +580,9 @@ class TestPinTransition:
 
         cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "old"}}}))
         sig_old = provider.identity_signature()["workspace"]
-        cfg_path.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "new"}}}))
+        replacement = tmp_path / "repointed-honcho.json"
+        replacement.write_text(json.dumps({**base, "hosts": {"hermes": {"workspace": "new"}}}))
+        replacement.replace(cfg_path)
         sig_new = provider.identity_signature()["workspace"]
 
         assert (sig_old, sig_new) == ("old", "new")
@@ -627,4 +629,3 @@ class TestProfilePeerUniqueness:
             "Profiles pinned to distinct peer names must not collapse to "
             "the same Honcho peer — otherwise profile isolation is fictional."
         )
-

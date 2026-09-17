@@ -427,3 +427,36 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     )
 
     block.assert_not_called()
+
+
+@pytest.mark.parametrize("scope", ["child", "non-owner"])
+def test_budget_exhausted_child_does_not_stop_parent_kanban_task(monkeypatch, scope):
+    """An in-process delegate_task child (or cron run) inherits ``HERMES_KANBAN_TASK`` from
+    the dispatcher worker; exhausting its budget must not block the parent's task."""
+    from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
+    block = MagicMock(name="block_task")
+    monkeypatch.setattr("hermes_cli.kanban_db.block_task", block)
+    agent = _LimitAgent()
+
+    ctx = delegated_child_context if scope == "child" else non_dispatcher_owned_context
+    with ctx():
+        finalize_turn(
+            agent,
+            final_response=None,
+            api_call_count=60,
+            interrupted=True,
+            failed=False,
+            messages=[{"role": "user", "content": "task"}],
+            conversation_history=[],
+            effective_task_id="task",
+            turn_id="turn",
+            user_message="task",
+            original_user_message="task",
+            _should_review_memory=False,
+            _turn_exit_reason="interrupted_by_user",
+        )
+
+    block.assert_not_called()
