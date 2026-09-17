@@ -95,10 +95,19 @@ Routines are plain [Hermes cron jobs](./features/cron.md) namespaced `[bot:<name
 Messages sent during a member turn queue behind the active room drive, including
 replies in the same thread. They do not interrupt that member or mark unseen
 messages as read. Stop cancels queued continuations and holds the members until
-resumed. A quiet room watches timed-out members for another 21 minutes after the
+resumed: @mention a held member, or address the whole room (`@all …` /
+`@everyone …`, any wording) to release everyone — `@all resume` is not a
+required incantation. `stop`, `halt` or `pause` holds a member only when the
+word sits next to its @mention (`stop @bot`, `@bot please pause`); the same word
+elsewhere in the sentence is read as ordinary prose, so a German `halt` no longer
+silences the bot it was sent to — but such a message does not release a held
+member either (`@bot please just stop now` never wakes it; repeat the stop next
+to the mention to hold it). A quiet room watches timed-out members for another 21 minutes after the
 foreground wait ends; this observation window does not extend the turn itself.
 Unresolved member failures remain visible in the collapsed Activity summary after
-the room settles. Expand Activity for the turn sequence; re-address the member to
+the room settles — including a turn the member's backend itself failed (bad
+credentials, provider errors), which is reported the moment the gateway
+reports it instead of looking like twenty minutes of thinking. Expand Activity for the turn sequence; re-address the member to
 try again. An ambiguous submit failure is not automatically resubmitted.
 
 
@@ -117,6 +126,8 @@ Groups are standalone rows in the same activity-ordered roster as Bot DMs. A Bot
 
 A room row organizes like a Bot row. Right-click it → **Pin to top** to keep a daily-driver room above the unpinned Bots and rooms (**Unpin** puts it back into recency order); the pin is saved with the room on this Desktop. Right-click → **Move to section** files the room into one of your [sections](#organize-bots-into-sections) — or drag the row onto a section heading — and **Remove from section** returns it to the group-chat bucket. A room's section is stored on its room record (rooms have no profile), so it stays local to this Desktop like the section list itself.
 
+The room composer (and the reply-in-thread composer) starts as a single row and grows as your prompt wraps or gains **Shift+Enter** newlines, up to half the window (at most 24rem); past that it scrolls inside the box so the transcript keeps its space. **Enter** sends.
+
 Use the **Move up** and **Move down** arrows beside a room to choose its position among rooms. Until the first move, the existing pinned-first, recent-activity order is unchanged. After a move, room order is saved on this Desktop and survives reloads; new rooms follow the explicitly ordered rooms within their pinned or unpinned band. Moves cannot cross the pinned boundary, and filtering does not discard hidden rooms from the saved order. These controls reorder actual Group Chat rooms, not user-created Bot folders, and do not change membership or gateway ownership.
 
 **Open chat** on any group row (2–6 Bots) opens a shared room where the whole group coordinates:
@@ -124,12 +135,16 @@ Use the **Move up** and **Move down** arrows beside a room to choose its positio
 - **One visible conversation.** Public messages and each member's reply stay readable in arrival order, with the speaker's name and timestamp. Starting another topic does not collapse earlier replies. **Reply in thread** continues that topic without reordering the room; **Activity** is a secondary status view, not a replacement for messages. Private Bot Chats remain separate.
 - Your message triggers up to **three serial rounds** of member turns. @-mentioned Bots respond (everyone responds when nobody is mentioned); each Bot replies briefly or passes, and the room settles when a full round stays silent.
 - Teammates can hand off to the primary Bot with `@hermes`, including in older saved rooms; Bots on other gateways keep their device-qualified tags (for example, `@default-vera`).
-- Bots pull each other in with `@name`, and escalate real judgment calls to you with `@user` — the group row shows a **needs you** badge when that happens. Pending questions and command approvals also light that badge; resolving the last prompt clears only prompt attention, not an independent mention. Prompts follow a renamed room, while disbanding retires them even if a member's in-flight poll arrives later.
+- Bots pull each other in with `@name`, and escalate real judgment calls to you with `@user` — the group row shows a **needs you** badge when that happens. Pending questions and command approvals also light that badge; resolving the last prompt clears only prompt attention, not an independent mention. A command approval in the room answers on the click itself — `once`, `session`, `always` or `deny` sends at once, with no second button to find. Prompts follow a renamed room, while disbanding retires them even if a member's in-flight poll arrives later.
 - Hard caps (10 messages per send, 3 rounds) keep rooms from spinning.
 - Each member keeps its own persistent room session, so room context survives like any other conversation.
 - **Not every Bot replies to every message.** Speaking is each member's own choice — a Bot replies only when it has something new to add and passes otherwise, and @-mentioning specific members scopes the round to them. Expect the members you addressed (or whoever has something to say) to speak, and the rest to stay quiet.
 - **Rooms keep running when you close the Desktop.** When every member of a room lives on the same gateway, that gateway owns turn scheduling through a durable driver: closing Hermes Desktop (or losing its connection) does not stop a room mid-discussion, and the Desktop simply catches up from the room's log when it reconnects. `groups.capabilities` on the gateway reports `driver: true` when this applies. More than one room worker may share a home — the messaging gateway (`hermes gateway run`) and the Desktop's own backend (`hermes serve`) both run one — and whichever holds the room's driver lease runs the next turn; a member's room session is held only for the duration of its turn, so the lease can move between workers without a turn being refused. Rooms whose members span several machines are different: each member's turns run on its own gateway, and the cross-connection courier described under *Bot-to-bot messaging* still applies to them.
+
+- **Rooms keep running when you close the Desktop.** When every member of a room lives on the same gateway, that gateway owns turn scheduling through a durable driver: closing Hermes Desktop (or losing its connection) does not stop a room mid-discussion, and the Desktop simply catches up from the room's log when it reconnects. `groups.capabilities` on the gateway reports `driver: true` when this applies. Rooms whose members span several machines are different: each member's turns run on its own gateway, and the cross-connection courier described under *Bot-to-bot messaging* still applies to them.
+- **Mentions read as identities.** In the transcript a routed `@bot` mention, the human handoff `@user`, and the broadcasts `@everyone` / `@all` render as inline references (accent text, not pills); unknown `@words` and e-mail addresses stay plain. Hover a Bot's message and use **Reply to @handle** to seed `@handle ` into the composer, so your next send goes to that Bot only (when a same-named Bot from a Connection shares the room, the tag is device-qualified, e.g. `@reviewer-mini` / `@reviewer-local`) — **Reply in thread** still continues the whole thread. If a reply box for a *different* thread is open, **Reply to** seeds the main composer instead and so starts a fresh thread; use **Reply in thread** to continue that thread.
 - **Rooms can span machines.** The New Group Chat picker seats Bots from any registered connection; each member's turns run on its own machine, in its own room session there. Cross-machine members carry a device badge (`dixie · Mac Mini`) in the room and in other members' transcripts, and the disambiguated `@name-device` handle works in room mentions — so same-named agents on two machines never blur together.
+- **Rooms show the same identity as the roster.** Transcript rows, the “X is thinking…” line and Activity rows resolve each member's title and avatar by its owning connection and profile — re-titling a Bot or changing its picture updates every room it sits in, remote members keep their own titles, and two same-named Bots on different connections never borrow each other's avatar. When two members would still read identically, Activity appends the connection label (`Reviewer · Mac Mini`).
 - **Plugins can watch members work.** The durable room log records `turn.started` and `turn.settled`; what a member does in between (tools, approvals, streamed text) is projected to plugins through the [`on_room_member_activity`](/user-guide/features/hooks#on_room_member_activity) hook with room, member and turn coordinates, so community clients can build tool cards and live member status on top of Group Chat without reading Hermes internals.
 
 ## Bot-to-bot messaging

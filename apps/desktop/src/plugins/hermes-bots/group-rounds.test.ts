@@ -116,6 +116,24 @@ describe('routing', () => {
     expect(parsed.mentioned.size).toBe(1)
   })
 
+  it('Reply-to tags route a same-named local + Connections twin each to itself', async () => {
+    const { rounds } = await loadRoom()
+
+    const local: GroupMember = { name: 'reviewer' }
+    const remote: GroupMember = { connectionId: 'mini', handle: 'reviewer-mini', name: 'reviewer', remoteSource: true, sourceScoped: true }
+    const members = [local, remote]
+
+    for (const member of members) {
+      const tag = rounds.groupReplyMentionTag(member, members)
+      const parsed = rounds.parseGroupChatMentions(`@${tag} `, members)
+
+      expect([tag, [...parsed.mentioned]]).toEqual([member.remoteSource ? 'reviewer-mini' : 'reviewer-local', [member.remoteSource ? 'mini::reviewer' : 'reviewer']])
+    }
+
+    // Unambiguous members keep the friendly tag the autocomplete inserts.
+    expect(rounds.groupReplyMentionTag({ name: 'ops', title: 'The Ops' }, MEMBERS)).toBe('the-ops')
+  })
+
   it('rotates the lead speaker each round', async () => {
     const { rounds } = await loadRoom()
 
@@ -835,6 +853,51 @@ describe('member holds (#93129)', () => {
     expect([...action.hold]).toEqual([])
     // A plain non-stop mention releases instead (direct address overrides hold).
     expect([...action.release]).toEqual(['impl'])
+  })
+
+  // #103893: a German room said "@impl go, das ist halt ein Test" and the
+  // filler "halt" four words away from the mention held the bot every time
+  // the text was resent. Only a stop word next to a mention is a directive.
+  it('treats a stop word far from every mention as prose, not a directive', async () => {
+    const { rounds } = await loadRoom()
+
+    for (const text of ['@impl go, das ist halt ein Test', '@impl mach mal Pause', 'stop the presses, @impl what do you think?']) {
+      const action = rounds.classifyGroupHoldDirective(text, ['conn::impl'], false)
+
+      expect([...action.hold]).toEqual([])
+      // Ambiguous, so neutral: the prose reading must not wake a held member either.
+      expect([...action.release]).toEqual([])
+    }
+
+    // Keys are roster keys, not handles: proximity must still hold on the raw @token.
+    expect([...rounds.classifyGroupHoldDirective('@impl please halt', ['conn::impl'], false).hold]).toEqual(['conn::impl'])
+  })
+
+  // A genuine stop whose stop word sits 3+ tokens from the mention may miss the
+  // hold, but it must never RELEASE (re-dispatch) the member it tells to stop.
+  it('never releases the addressed member on a distant genuine stop', async () => {
+    const { rounds } = await loadRoom()
+
+    for (const text of ['@impl please just stop now', 'hey @impl could you stop', '@impl, I need you to stop', '@impl you can stop']) {
+      const action = rounds.classifyGroupHoldDirective(text, ['c1::impl'], false)
+
+      expect([...action.release]).toEqual([])
+    }
+
+    expect(rounds.classifyGroupHoldDirective('@all please just stop now', [], true).releaseAll).toBe(false)
+  })
+
+  // #97740: a room stopped by the user went permanently silent because only
+  // the literal "@all resume" released the holds; "@all <task>" addresses
+  // every member and must re-engage them like a direct mention does.
+  it('releases every hold when the whole room is addressed without a stop word', async () => {
+    const { rounds } = await loadRoom()
+    const held = { docs: { at: 2 }, impl: { at: 1 } }
+
+    expect(rounds.applyGroupHoldDirective(held, { everyone: true, mentioned: [] }, '@all tell me a joke each', {})).toEqual({})
+    expect(rounds.applyGroupHoldDirective(held, { everyone: true, mentioned: [] }, '@all stop', { at: 5 }, ['impl', 'docs'])).not.toEqual({})
+    // An unaddressed message still leaves the holds alone.
+    expect(rounds.applyGroupHoldDirective(held, { everyone: false, mentioned: [] }, 'anyone there?', {})).toBe(held)
   })
 
   it('sets a hold on stop and clears it on resume for the same member', async () => {
