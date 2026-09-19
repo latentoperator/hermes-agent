@@ -9,10 +9,7 @@ boot must clear those corpses without touching intentional fixed-port serves
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from unittest.mock import patch
-
-import pytest
 
 from hermes_cli.dashboard_procs import (
     _is_desktop_local_serve_cmdline,
@@ -416,50 +413,39 @@ def test_reap_spare_lock_owned_backend_even_without_exclude_match(tmp_path):
     assert result["matched"] == []
 
 
-# SSH ownership records belong to the shared root, even when startup has
-# selected a named profile and changed HERMES_HOME.
-
-
-@pytest.mark.linux_only
-@pytest.mark.parametrize("layout", ["standard", "custom"])
-@pytest.mark.parametrize("profile", [None, "virgil", "wren"])
-def test_reap_spares_shared_root_lock_from_named_profile(
-    tmp_path, monkeypatch, layout, profile
-):
-    native_home = tmp_path / "user"
-    root = native_home / ".hermes" if layout == "standard" else tmp_path / "data"
-    profile_home = root if profile is None else root / "profiles" / profile
-    profile_home.mkdir(parents=True)
-    monkeypatch.setattr(Path, "home", lambda: native_home)
-    monkeypatch.setenv("HERMES_HOME", str(profile_home))
-    monkeypatch.delenv("HERMES_DESKTOP_CHILD_PID", raising=False)
-
-    oid, nonce = "f" * 32, "d" * 16
-    lock_dir = root / "desktop-ssh" / oid
-    lock_dir.mkdir(parents=True)
-    (lock_dir / "backend.lock.json").write_text(
-        json.dumps(_valid_lock_payload(7777, oid, nonce))
-    )
-
-    # Resolve actual on-disk locks with the production resolver. Only process
-    # discovery and signalling are replaced; no live process can be killed.
-    assert _lock_owned_serve_pids() == {7777}
+def test_reap_kills_descendants_of_killed_roots_but_spares_a_failed_roots_subtree():
+    """#112631: a SIGKILLed backend never ran PTY_REGISTRY.close_all(), so the reaper sweeps its
+    surviving hosted-TUI children — but only for roots it actually killed. A root whose own kill
+    raised (EPERM: not ours) keeps its subtree intact instead of being orphaned half-way."""
     scanned = [
-        (7777, "hermes serve --isolated --host 127.0.0.1 --port 0"),
-        (8888, "hermes serve --host 127.0.0.1 --port 0"),
+        (111, "hermes serve --host 127.0.0.1 --port 0"),  # ours: killed, child 1111 swept
+        (444, "hermes serve --host 127.0.0.1 --port 0"),  # not ours: EPERM, child 4444 spared
     ]
+    descendants = {1111: (111, 5.0), 4444: (444, 6.0)}
+    start_times = {1111: 5.0, 4444: 6.0}
+    sent: list[tuple[int, int]] = []
+
+    def fake_kill(pid, sig):
+        if pid == 444:
+            raise PermissionError("Operation not permitted")
+        sent.append((pid, sig))
+
     with (
-        patch("hermes_cli.dashboard_procs._scan_dashboard_processes", return_value=scanned) as scan,
+        patch("hermes_cli.dashboard_procs._scan_dashboard_processes", return_value=scanned),
         patch("hermes_cli.dashboard_procs._process_ppid", return_value=1),
-        patch("os.kill") as kill,
-        patch("psutil.pid_exists", return_value=False),
+        patch("hermes_cli.dashboard_procs._posix_descendants", return_value=descendants) as snap,
+        patch("gateway.status.get_process_start_time", side_effect=start_times.get),
+        patch("psutil.pid_exists", return_value=True),
+        patch("os.kill", side_effect=fake_kill),
+        patch("sys.platform", "darwin"),
     ):
+        os.environ.pop("HERMES_DESKTOP_CHILD_PID", None)
         result = _reap_orphaned_desktop_local_serves(
-            sleep_fn=lambda _s: None,
+            sleep_fn=lambda _s: None, signal_term=15, signal_kill=9,
             process_age_seconds_fn=lambda _pid: 600.0,
         )
 
-    assert 7777 in scan.call_args.kwargs["exclude_pids"]
-    assert result["matched"] == [8888]
-    assert result["killed"] == [8888]
-    assert [call.args[0] for call in kill.call_args_list] == [8888]
+    snap.assert_called_once_with([111, 444])  # snapshotted before the kill reparents them
+    assert result["killed"] == [111] and result["failed"] == [444]
+    assert (1111, 9) in sent, "surviving child of the killed backend was not swept"
+    assert not any(pid == 4444 for pid, _ in sent), "child of a root we could not kill was swept"

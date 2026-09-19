@@ -4243,6 +4243,47 @@ class TestRunConversation:
             for m in replayed
         )
 
+    def test_invalid_stored_tool_call_names_are_coerced_on_the_wire(self, agent):
+        """A stored ``multi_tool_use.parallel`` / shell-command / empty function.name must reach the
+        provider as ``^[A-Za-z0-9_-]{1,64}$`` on every request, and the persisted history must keep
+        the original bytes (#51944)."""
+        self._setup_agent(agent)
+        long_name = 'gbrain query "x" 2>/dev/null | head -40; ' + "y" * 340
+        history = [
+            {"role": "user", "content": "do two things"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "multi_tool_use.parallel", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": long_name, "arguments": "{}"}},
+                {"id": "c3", "type": "function", "function": {"name": "", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "name": "multi_tool_use.parallel", "content": "r1"},
+            {"role": "tool", "tool_call_id": "c2", "name": long_name, "content": "r2"},
+            {"role": "tool", "tool_call_id": "c3", "name": "", "content": "r3"},
+            {"role": "assistant", "content": "done"},
+        ]
+        requests = []
+
+        def _fake_api_call(api_kwargs):
+            requests.append(api_kwargs)
+            return _mock_response(content="ok", finish_reason="stop")
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_fake_api_call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("continue", conversation_history=history)
+
+        wire_names = [
+            tc["function"]["name"]
+            for m in requests[0]["messages"] if m.get("role") == "assistant"
+            for tc in (m.get("tool_calls") or [])
+        ]
+        assert wire_names == ["multi_tool_use_parallel", 'gbrain_query_x_2_dev_null_head_-40_yyyyyyyyyyyyyyyyyyyyyyyyyyyyy', "invalid_tool_call"]
+        assert all(len(n) <= 64 and n.replace("_", "").replace("-", "").isalnum() for n in wire_names)
+        assert [tc["function"]["name"] for tc in history[1]["tool_calls"]] == ["multi_tool_use.parallel", long_name, ""]
+
     def test_nous_401_refreshes_after_remint_and_retries(self, agent):
         self._setup_agent(agent)
         agent.provider = "nous"
@@ -4726,11 +4767,18 @@ class TestRunConversation:
         assert any(isinstance(m, dict) and m.get("role") == "tool" for m in msgs)
 
 
-    def test_kanban_task_stopped_on_iteration_exhaustion(self, agent, monkeypatch):
+    def test_kanban_block_called_on_iteration_exhaustion(self, agent, monkeypatch):
         """Regression: kanban worker must signal the dispatcher when its
-        iteration budget is exhausted. Hopebox stops the task on the first
-        exhaustion and preserves the final summary as a durable handoff so
-        the dispatcher cannot silently retry unchanged scope forever.
+        iteration budget is exhausted, otherwise the task silently re-runs
+        forever without ever tripping the failure_limit circuit breaker
+        (issue #23216 / #29747 gap 2).
+
+        As of #29747, the exhaustion path routes through
+        ``kanban_db._record_task_failure(outcome="timed_out")`` so the
+        ``consecutive_failures`` counter increments and the dispatcher's
+        ``failure_limit`` breaker eventually trips. The legacy
+        ``kanban_block`` call was replaced because blocked-outcome runs
+        bypass the failure counter.
         """
         self._setup_agent(agent)
         agent.max_iterations = 2
@@ -4750,16 +4798,14 @@ class TestRunConversation:
             tool_resp, tool_resp, summary_resp,
         ]
 
-        conn = SimpleNamespace(close=MagicMock())
-        mock_connect = MagicMock(return_value=conn)
-        mock_block = MagicMock(return_value=True)
-        mock_comment = MagicMock()
+        mock_record_failure = MagicMock(return_value=False)
+        mock_connect = MagicMock(return_value=MagicMock())
 
         with (
             patch("model_tools.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db_dispatch._record_task_failure",
+                  mock_record_failure),
             patch("hermes_cli.kanban_db_connect.connect", mock_connect),
-            patch("hermes_cli.kanban_db.block_task", mock_block),
-            patch("hermes_cli.kanban_db.add_comment", mock_comment),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -4769,18 +4815,20 @@ class TestRunConversation:
         # The agent should have reported the task as not completed.
         assert result["completed"] is False
 
-        mock_block.assert_called_once()
-        call = mock_block.call_args
-        assert call.args[0] is conn
-        assert call.args[1] == "t_test_task_123"
-        assert call.kwargs["kind"] == "needs_input"
-        assert "Iteration budget exhausted" in call.kwargs["reason"]
-        assert call.kwargs["run_summary"] == "Could not finish — budget exhausted."
-        assert call.kwargs["run_metadata"]["stop_reason"] == (
-            "iteration_budget_exhausted"
+        # _record_task_failure should have been called exactly once for
+        # the exhaustion event, with outcome="timed_out".
+        assert mock_record_failure.call_count == 1, (
+            f"Expected exactly 1 _record_task_failure call, "
+            f"got {mock_record_failure.call_count}. "
+            f"Calls: {mock_record_failure.call_args_list}"
         )
-        mock_comment.assert_called_once()
-        assert conn.close.called
+        call = mock_record_failure.call_args_list[0]
+        # Positional: (conn, task_id, ...)
+        assert call.args[1] == "t_test_task_123"
+        assert call.kwargs.get("outcome") == "timed_out"
+        assert call.kwargs.get("release_claim") is True
+        assert call.kwargs.get("end_run") is True
+        assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
@@ -6678,6 +6726,37 @@ class TestStreamingApiCall:
         assert resp.choices[0].message.content is None
         assert resp.choices[0].message.tool_calls is None
 
+    @pytest.mark.parametrize("carrier", ["reasoning_content", "reasoning"])
+    def test_reasoning_only_in_delta_model_extra_counts_as_stream_output(self, agent, carrier):
+        """Reasoning that reaches the stream only via ``delta.model_extra`` is real output:
+        the empty-stream guard must not fire and the text must survive (#56516)."""
+        def _extra_delta(text):
+            return SimpleNamespace(content=None, tool_calls=None, model_extra={carrier: text})
+
+        chunks = [
+            SimpleNamespace(model="m", choices=[SimpleNamespace(delta=_extra_delta("thinking "), finish_reason=None)]),
+            SimpleNamespace(model="m", choices=[SimpleNamespace(delta=_extra_delta("only"), finish_reason="length")]),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp.choices[0].message.content is None
+        assert resp.choices[0].message.reasoning_content == "thinking only"
+        assert resp.choices[0].finish_reason == "length"
+
+    def test_final_response_object_replays_reasoning_from_model_extra(self, agent):
+        """The 'completed response instead of an iterator' branch reads reasoning through the
+        same ``model_extra`` fallback as the delta path, so it is still shown (#56516)."""
+        message = SimpleNamespace(content="done", tool_calls=None, model_extra={"reasoning": "thought"})
+        final = SimpleNamespace(model="m", choices=[SimpleNamespace(message=message, finish_reason="stop")])
+        agent.client.chat.completions.create.return_value = final
+        agent.reasoning_callback = MagicMock()
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp is final
+        agent.reasoning_callback.assert_called_once_with("thought")
 
     def test_model_name_captured(self, agent):
         chunks = [

@@ -6,8 +6,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.turn_finalizer import finalize_turn
-from hermes_cli import kanban_db as kb
-from hermes_cli import kanban_db_connect as kbc
 
 
 class _LimitAgent:
@@ -167,16 +165,13 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
-def test_pending_response_stops_kanban_task_with_durable_handoff(monkeypatch):
+def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
-    block = MagicMock(name="block_task", return_value=True)
-    comment = MagicMock(name="add_comment")
+    record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db.block_task", block)
-    monkeypatch.setattr("hermes_cli.kanban_db.add_comment", comment)
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent()
 
     result = _finalize(
@@ -187,69 +182,18 @@ def test_pending_response_stops_kanban_task_with_durable_handoff(monkeypatch):
     )
 
     assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
-    block.assert_called_once_with(
+    record.assert_called_once_with(
         conn,
         "task-123",
-        reason=(
-            "Iteration budget exhausted (60/60). Review the saved handoff and "
-            "decompose or narrow the remaining scope before re-dispatch."
+        error=(
+            "Iteration budget exhausted (60/60) — task could not complete "
+            "within the allowed iterations"
         ),
-        kind="needs_input",
-        expected_run_id=42,
-        run_summary="composed report",
-        run_metadata={
-            "worker_session_id": "sess-test",
-            "budget_used": 60,
-            "budget_max": 60,
-            "stop_reason": "iteration_budget_exhausted",
-            "resume_action": "review_and_decompose",
-        },
+        outcome="timed_out",
+        release_claim=True,
+        end_run=True,
+        event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
-    comment.assert_called_once()
-
-
-def test_first_kanban_budget_exhaustion_closes_claim_and_preserves_handoff(
-    monkeypatch, tmp_path
-):
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
-    with kbc.connect() as conn:
-        task_id = kb.create_task(conn, title="oversized", assignee="wren")
-        claimed = kb.claim_task(conn, task_id, claimer="test-worker")
-        assert claimed is not None and claimed.current_run_id is not None
-        run_id = claimed.current_run_id
-
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
-    agent = _LimitAgent(max_iterations=3)
-    agent.session_id = "sess-budget-handoff"
-
-    result = _finalize(
-        agent,
-        final_response=None,
-        exit_reason="unknown",
-        api_call_count=3,
-    )
-
-    with kbc.connect() as conn:
-        task = kb.get_task(conn, task_id)
-        run = kb.latest_run(conn, task_id)
-        comments = kb.list_comments(conn, task_id)
-
-    assert task is not None and task.status == "blocked"
-    assert task.block_kind == "needs_input"
-    assert task.current_run_id is None
-    assert run is not None and run.outcome == "blocked"
-    assert run.summary == "summary from extra call"
-    assert run.metadata == {
-        "worker_session_id": "sess-budget-handoff",
-        "budget_used": 3,
-        "budget_max": 3,
-        "stop_reason": "iteration_budget_exhausted",
-        "resume_action": "review_and_decompose",
-    }
-    assert comments and "summary from extra call" in comments[-1].body
-    assert result["completed"] is False
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
@@ -290,18 +234,18 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     persisted_roles = [m["role"] for m in agent.persisted_messages]
     assert persisted_roles == ["user", "assistant"]
 
-def test_bounded_fallback_stops_kanban_task_when_interrupted(monkeypatch):
+
+def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     """When budget is exhausted and the turn was interrupted,
-    ``finalize_turn`` must still close the run with a durable handoff.
+    ``finalize_turn`` must still record a terminal kanban failure via
+    the bounded fallback path (#87096).
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-456")
-    block = MagicMock(name="block_task", return_value=True)
-    comment = MagicMock(name="add_comment")
+    record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db.block_task", block)
-    monkeypatch.setattr("hermes_cli.kanban_db.add_comment", comment)
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent()
 
     # Budget exhausted (60/60), interrupted, no fallback-eligible exit_reason
@@ -321,27 +265,28 @@ def test_bounded_fallback_stops_kanban_task_when_interrupted(monkeypatch):
         _turn_exit_reason="interrupted_by_user",
     )
 
-    block.assert_called_once()
-    args, kwargs = block.call_args
+    # The bounded fallback must fire even though interrupted=True
+    # makes budget_fallback_eligible=False.
+    record.assert_called_once()
+    args, kwargs = record.call_args
     assert args[1] == "task-456"
-    assert kwargs["kind"] == "needs_input"
-    assert kwargs["run_metadata"]["budget_used"] == 60
-    assert kwargs["run_metadata"]["budget_max"] == 60
-    comment.assert_called_once()
+    assert kwargs["outcome"] == "timed_out"
+    assert kwargs["release_claim"] is True
+    assert kwargs["end_run"] is True
+    assert kwargs["event_payload_extra"]["budget_used"] == 60
+    assert kwargs["event_payload_extra"]["budget_max"] == 60
 
 
-def test_bounded_fallback_stops_kanban_task_when_failed(monkeypatch):
+def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     """When budget is exhausted and the turn failed,
-    the bounded fallback must still preserve a terminal handoff.
+    the bounded fallback must still record a terminal kanban failure (#87096).
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-789")
-    block = MagicMock(name="block_task", return_value=True)
-    comment = MagicMock(name="add_comment")
+    record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db.block_task", block)
-    monkeypatch.setattr("hermes_cli.kanban_db.add_comment", comment)
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent()
 
     result = finalize_turn(
@@ -360,11 +305,10 @@ def test_bounded_fallback_stops_kanban_task_when_failed(monkeypatch):
         _turn_exit_reason="provider_failure",
     )
 
-    block.assert_called_once()
-    args, kwargs = block.call_args
+    record.assert_called_once()
+    args, kwargs = record.call_args
     assert args[1] == "task-789"
-    assert kwargs["kind"] == "needs_input"
-    comment.assert_called_once()
+    assert kwargs["outcome"] == "timed_out"
 
 
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
@@ -372,10 +316,10 @@ def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
     active, the bounded fallback must NOT fire (#87096).
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    block = MagicMock(name="block_task", return_value=True)
+    record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db.block_task", block)
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent()
 
     result = finalize_turn(
@@ -394,7 +338,7 @@ def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
         _turn_exit_reason="interrupted_by_user",
     )
 
-    block.assert_not_called()
+    record.assert_not_called()
 
 
 def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
@@ -403,10 +347,10 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-999")
-    block = MagicMock(name="block_task", return_value=True)
+    record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db.block_task", block)
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent(budget_remaining=60)
 
     # api_call_count=10, max_iterations=60 — budget NOT exhausted
@@ -426,19 +370,22 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
         _turn_exit_reason="interrupted_by_user",
     )
 
-    block.assert_not_called()
+    record.assert_not_called()
 
 
 @pytest.mark.parametrize("scope", ["child", "non-owner"])
-def test_budget_exhausted_child_does_not_stop_parent_kanban_task(monkeypatch, scope):
+def test_budget_exhausted_child_does_not_record_parent_kanban_timeout(monkeypatch, scope):
     """An in-process delegate_task child (or cron run) inherits ``HERMES_KANBAN_TASK`` from
-    the dispatcher worker; exhausting its budget must not block the parent's task."""
+    the dispatcher worker; exhausting ITS budget must not record ``timed_out`` against the
+    parent's task or release the parent's claim (#112817)."""
     from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
-    block = MagicMock(name="block_task")
-    monkeypatch.setattr("hermes_cli.kanban_db.block_task", block)
+    record = MagicMock(name="record_task_failure")
+    conn = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
     agent = _LimitAgent()
 
     ctx = delegated_child_context if scope == "child" else non_dispatcher_owned_context
@@ -459,4 +406,4 @@ def test_budget_exhausted_child_does_not_stop_parent_kanban_task(monkeypatch, sc
             _turn_exit_reason="interrupted_by_user",
         )
 
-    block.assert_not_called()
+    record.assert_not_called()
