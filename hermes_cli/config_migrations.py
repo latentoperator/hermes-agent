@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import copy
 import functools
+import logging
 import re
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 #: Auto-migration support floor. Configs whose on-disk ``_config_version`` is below this are NOT
 #: auto-migrated (v12 predates ~two years of releases; carrying the sub-v12 steps and the env
@@ -121,6 +124,8 @@ def _migrate_to_12(results: Dict[str, Any], quiet: bool) -> None:
         if not isinstance(entry, dict):
             continue
         old_name = entry.get("name", "")
+        if not isinstance(old_name, str):  # hand-edited name: 5 must not crash .strip()
+            old_name = ""
         old_url = entry.get("base_url", "") or entry.get("url", "") or entry.get("api", "") or ""
         if not old_url:
             continue
@@ -194,6 +199,8 @@ def _migrate_to_14(results: Dict[str, Any], quiet: bool) -> None:
         return
     legacy_model = raw_stt["model"]
     provider = raw_stt.get("provider", "local")
+    if not isinstance(provider, str):  # a mapping/int provider has no valid target section
+        provider = "local"
     config = read_raw_config()
     stt = config.get("stt", {})
     stt.pop("model", None)
@@ -201,11 +208,14 @@ def _migrate_to_14(results: Dict[str, Any], quiet: bool) -> None:
     def _place(section: str) -> None:
         existing = raw_stt.get(section, {})
         if not isinstance(existing, dict) or "model" not in existing:
-            stt.setdefault(section, {})["model"] = legacy_model
+            target = stt.get(section)
+            if not isinstance(target, dict):  # stt.<section>: 5 — replace, don't index a scalar
+                target = stt[section] = {}
+            target["model"] = legacy_model
 
     if provider in {"local", "local_command"}:
         # An OpenAI model name is dropped; the local section already defaults to "base".
-        if legacy_model in _LOCAL_WHISPER_MODELS:
+        if isinstance(legacy_model, str) and legacy_model in _LOCAL_WHISPER_MODELS:
             _place("local")
     else:
         _place(provider)
@@ -223,10 +233,11 @@ def _migrate_to_16(results: Dict[str, Any], quiet: bool) -> None:
         return
     platforms = _dict_at(display, "platforms")
     for plat, mode in old_overrides.items():
-        if plat not in platforms:
-            platforms[plat] = {}
-        if "tool_progress" not in platforms[plat]:
-            platforms[plat]["tool_progress"] = mode
+        target = platforms.get(plat)
+        if not isinstance(target, dict):  # platforms.<plat>: 5 — replace, don't index a scalar
+            target = platforms[plat] = {}
+        if "tool_progress" not in target:
+            target["tool_progress"] = mode
     display["platforms"] = platforms
     config["display"] = display
     migrated = ", ".join(f"{p}={m}" for p, m in old_overrides.items())
@@ -249,7 +260,12 @@ def _migrate_to_17(results: Dict[str, Any], quiet: bool) -> None:
         val = str(raw).strip() if raw else ""
         if not val or (k == "provider" and val == "auto"):
             continue
-        aux_comp = config.setdefault("auxiliary", {}).setdefault("compression", {})
+        aux = config.get("auxiliary")
+        if not isinstance(aux, dict):  # auxiliary: 5 — setdefault would index a scalar
+            aux = config["auxiliary"] = {}
+        aux_comp = aux.get("compression")
+        if not isinstance(aux_comp, dict):
+            aux_comp = aux["compression"] = {}
         cur = aux_comp.get(k)
         if not cur or (k == "provider" and cur == "auto"):
             aux_comp[k] = val
@@ -542,20 +558,6 @@ def _migrate_to_41(results: Dict[str, Any], quiet: bool) -> None:
                   f"({', '.join(cleaned)}) — Bot Chat sessions now get the live roster instead.")
 
 
-def _migrate_to_42(results: Dict[str, Any], quiet: bool) -> None:
-    """Retire drift blocking while preserving explicit current-default inheritance."""
-    config = read_raw_config()
-    cron = config.get("cron")
-    if not isinstance(cron, dict) or "model_drift_guard" not in cron:
-        return
-    old_guard = cron.pop("model_drift_guard")
-    if old_guard is False:
-        cron.setdefault("follow_profile_defaults", True)
-    _commit(
-        config, results, quiet, "migrated cron.model_drift_guard",
-        "  Migrated cron model policy; explicit current-default inheritance is preserved.")
-
-
 def _migrate_to_45(results: Dict[str, Any], quiet: bool) -> None:
     # 44 → 45: append `connections` to every saved `platform_toolsets` list that predates it
     # (an explicit list treats absence as unchecked). Skipped when `known_builtin_toolsets`
@@ -688,7 +690,16 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
         message="  ✓ Model catalog now refreshes every 20 minutes (model_catalog.ttl_minutes)",
         extra_guard=lambda raw: "ttl_minutes" not in raw)),
     (41, _migrate_to_41),
-    (42, _migrate_to_42),
+    # 41 → 42: cron.model_drift_guard is gone. Unpinned jobs now run on their creation snapshot
+    # instead of failing closed when the global model changes, so the toggle has nothing to gate.
+    (42, functools.partial(
+        _rewrite_key, section="cron", key="model_drift_guard", new=None,
+        match=lambda cur: cur is not None,
+        added="removed cron.model_drift_guard",
+        message=(
+            "  ✓ Removed cron.model_drift_guard — unpinned cron jobs now keep running on the "
+            "model/provider they were created under when the global default changes, instead "
+            "of being skipped. Pin a job or set cron.model to move it."))),
     # 42 → 43: gateway.multiplex_profile_allowlist is gone. A multiplexing default gateway serves
     # every live profile under profiles/; a profile that must not be served is archived or deleted.
     (43, functools.partial(
@@ -725,4 +736,16 @@ def run_migrations(current_ver: int, results: Dict[str, Any], quiet: bool) -> No
     """
     for target_ver, migration_fn in MIGRATIONS:
         if current_ver < target_ver:
-            migration_fn(results, quiet)
+            try:
+                migration_fn(results, quiet)
+            except Exception as exc:
+                # A malformed nested value in one step must not abort the rest of the
+                # ladder (config loading itself fails otherwise). Loud, not silent.
+                warning = f"config migration to v{target_ver} failed and was skipped: {exc}"
+                results.setdefault("warnings", []).append(warning)
+                # Quiet callers (profile creation, unattended update) discard ``results`` and
+                # migrate_config still stamps the latest version, so without a log line the
+                # skipped step vanishes for good.
+                logger.warning("%s", warning)
+                if not quiet:
+                    print(f"  ⚠ {warning}")
