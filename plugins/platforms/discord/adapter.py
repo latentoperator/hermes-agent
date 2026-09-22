@@ -3012,26 +3012,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 channel = await self._resolve_channel(chat_id)
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
-            parent_id = getattr(channel, "parent_id", None)
-            parent_channel_id = str(parent_id) if parent_id else None
-            try:
-                from gateway.outbound_discord_allowlist import (
-                    check_discord_outbound_allowed,
-                    deny_message,
-                    log_denial,
-                )
-                decision = check_discord_outbound_allowed(
-                    str(chat_id),
-                    thread_id=str(thread_id) if thread_id else None,
-                    parent_channel_id=parent_channel_id,
-                )
-                if not decision.allowed:
-                    log_denial(decision)
-                    return SendResult(success=False, error=deny_message(decision), error_kind="forbidden")
-            except Exception as allowlist_exc:
-                logger.error("[%s] Discord outbound allowlist check failed: %s", self.name, allowlist_exc, exc_info=True)
-                return SendResult(success=False, error=f"Discord outbound allowlist check failed: {allowlist_exc}", error_kind="forbidden")
-
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
@@ -6050,45 +6030,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         else:
             msg_type = MessageType.TEXT
         effective_channel = auto_threaded_channel or message.channel
-        # Preflight the same outbound allowlist used by send().  Mentions are
-        # otherwise accepted inbound, the agent spends tokens and may run tools,
-        # then every progress/final send is denied.  Fail before invoking the
-        # agent when this profile cannot answer in the target Discord thread.
-        if not isinstance(message.channel, discord.DMChannel):
-            try:
-                from gateway.outbound_discord_allowlist import (
-                    check_discord_outbound_allowed,
-                    deny_message,
-                    log_denial,
-                )
-
-                _effective_chat_id = str(getattr(effective_channel, "id", "") or "")
-                _effective_thread_id = thread_id if is_thread else None
-                _effective_parent_id = parent_channel_id
-                if not _effective_parent_id:
-                    _effective_parent_id = self._get_parent_channel_id(effective_channel)
-                decision = check_discord_outbound_allowed(
-                    _effective_chat_id,
-                    thread_id=_effective_thread_id,
-                    parent_channel_id=_effective_parent_id,
-                )
-                if not decision.allowed:
-                    log_denial(decision)
-                    logger.warning(
-                        "[%s] Ignoring inbound Discord message because outbound target is denied: %s",
-                        self.name,
-                        deny_message(decision),
-                    )
-                    return
-            except Exception as allowlist_exc:
-                logger.error(
-                    "[%s] Discord outbound allowlist preflight failed: %s",
-                    self.name,
-                    allowlist_exc,
-                    exc_info=True,
-                )
-                return
-
         if isinstance(message.channel, discord.DMChannel):
             chat_type = "dm"
             chat_name = message.author.name
@@ -7029,20 +6970,6 @@ async def _standalone_send(
         token = (get_secret("DISCORD_BOT_TOKEN", "") or "").strip()
     if not token:
         return send_error("Discord standalone send: DISCORD_BOT_TOKEN is not set")
-    try:
-        from gateway.outbound_discord_allowlist import (
-            check_discord_outbound_allowed,
-            deny_message,
-            log_denial,
-        )
-        decision = check_discord_outbound_allowed(str(chat_id), thread_id=str(thread_id) if thread_id else None)
-        if not decision.allowed:
-            log_denial(decision)
-            return {"error": deny_message(decision), "error_kind": "forbidden"}
-    except Exception as allowlist_exc:
-        logger.error("Discord standalone outbound allowlist check failed: %s", allowlist_exc, exc_info=True)
-        return {"error": f"Discord outbound allowlist check failed: {allowlist_exc}", "error_kind": "forbidden"}
-
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
         _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
