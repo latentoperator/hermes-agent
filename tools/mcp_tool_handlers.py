@@ -755,6 +755,7 @@ def _bind_trusted_action_approval_source(args: dict) -> tuple[dict, str | None]:
         )
     return args, None
 
+
 def _declared_app_offerable(server_name: str) -> bool:
     """True unless the registered declaration is unavailable on this host. Called only for a
     connected server, so a reachable loopback port outranks the interactive-session rule."""

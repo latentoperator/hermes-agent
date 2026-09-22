@@ -14,7 +14,6 @@ import os
 import re
 import shlex
 import sys
-from gateway.slash_commands_status import HISTORY_UNREADABLE
 import time
 from datetime import datetime
 from pathlib import Path
