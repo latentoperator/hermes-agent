@@ -71,6 +71,11 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
 # dashboard) skip bundled-skill seeding. Delete the file to opt back in.
 NO_BUNDLED_SKILLS_MARKER = ".no-bundled-skills"
 
+# ``profile.yaml`` ``role`` values. A role grants backend capabilities (the setup toolset), so
+# only the backend writes one, and a copy of a profile (clone-all, import) never inherits it.
+SETUP_ROLE = "setup"
+PROFILE_ROLES = frozenset({SETUP_ROLE})
+
 # Header seeded into a profile's empty .env so it owns a credentials file from day one.
 _PLACEHOLDER_ENV = (
     "# Per-profile secrets for this Hermes profile.\n"
@@ -552,6 +557,8 @@ class ProfileInfo:
     # appends here). Lets Bot Mode group chats re-link persisted member
     # descriptors to the renamed live profile (#110200).
     previous_names: List[str] = field(default_factory=list)
+    # Backend-assigned role (``SETUP_ROLE`` or None). Only ``hermes_cli.setup_profile`` writes it.
+    role: Optional[str] = None
 
 
 def _load_yaml_dict(path: Path) -> Optional[dict]:
@@ -566,12 +573,52 @@ def _load_yaml_dict(path: Path) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
+# (path, kind) -> (file signature, the small derived value). `list_profiles` re-reads three YAML
+# files PER PROFILE, and it is the shared body of `GET /api/profiles` and `profiles.list`, which the
+# Bots roster polls every 5s per connection — so an installer-seeded config.yaml (the annotated
+# template, ~119KB) was re-parsed for every bot every five seconds to yield the same two strings.
+# Only DERIVED values are cached, never a document a caller could write back: the raw readers
+# (`read_user_config_raw`, `_load_yaml_dict`) keep their uncached contract. See #117378.
+_PROFILE_FILE_CACHE: Dict[tuple, tuple] = {}
+_PROFILE_FILE_CACHE_MAX = 512
+
+
+def _profile_file_signature(path: Path) -> Optional[tuple]:
+    """``(mtime_ns, size, inode)``, or None when the file is absent. The atomic writers rename a
+    temp file into place, so a rewrite always lands a new inode even within one mtime tick."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+
+
+def _cached_profile_read(path: Path, kind: str, compute):
+    """``compute()``'s value, reused while *path* has not changed. A missing file is never cached:
+    reading it costs nothing, and one created later must be picked up."""
+    signature = _profile_file_signature(path)
+    if signature is None:
+        return compute()
+    key = (str(path), kind)
+    cached = _PROFILE_FILE_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    value = compute()
+    if len(_PROFILE_FILE_CACHE) >= _PROFILE_FILE_CACHE_MAX:
+        _PROFILE_FILE_CACHE.clear()
+    _PROFILE_FILE_CACHE[key] = (signature, value)
+    return value
+
+
 def _read_distribution_meta(profile_dir: Path) -> tuple:
     """``(name, version, source)`` from ``distribution.yaml``; ``(None, None, None)`` if absent."""
-    data = _load_yaml_dict(profile_dir / "distribution.yaml")
-    if data is None:
-        return None, None, None
-    return data.get("name"), data.get("version"), data.get("source")
+    def _read() -> tuple:
+        data = _load_yaml_dict(profile_dir / "distribution.yaml")
+        if data is None:
+            return None, None, None
+        return data.get("name"), data.get("version"), data.get("source")
+
+    return _cached_profile_read(profile_dir / "distribution.yaml", "distribution", _read)
 
 
 def _read_config_model(profile_dir: Path) -> tuple:
@@ -579,17 +626,21 @@ def _read_config_model(profile_dir: Path) -> tuple:
     config_path = profile_dir / "config.yaml"
     if not config_path.exists():
         return None, None
-    try:
-        # load_config() targets the ACTIVE profile's home; read THIS profile's file raw.
-        from hermes_cli.config import read_user_config_raw
-        model_cfg = read_user_config_raw(config_path).get("model", {})
-        if isinstance(model_cfg, str):
-            return model_cfg, None
-        if isinstance(model_cfg, dict):
-            return model_cfg.get("default") or model_cfg.get("model"), model_cfg.get("provider")
-    except Exception:
-        pass
-    return None, None
+
+    def _read() -> tuple:
+        try:
+            # load_config() targets the ACTIVE profile's home; read THIS profile's file raw.
+            from hermes_cli.config import read_user_config_raw
+            model_cfg = read_user_config_raw(config_path).get("model", {})
+            if isinstance(model_cfg, str):
+                return model_cfg, None
+            if isinstance(model_cfg, dict):
+                return model_cfg.get("default") or model_cfg.get("model"), model_cfg.get("provider")
+        except Exception:
+            pass
+        return None, None
+
+    return _cached_profile_read(config_path, "config-model", _read)
 
 
 def launch_model_seed(source_cfg: dict) -> dict:
@@ -615,13 +666,12 @@ def _seed_model_config(profile_dir: Path) -> None:
     if config_path.exists():
         return
     with contextlib.suppress(Exception):  # creation must not fail over this; `hermes model` sets it later
-        import yaml
         from hermes_constants import get_hermes_home
-        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.config import atomic_config_write, read_user_config_raw
         source = get_hermes_home() / "config.yaml"
         seed = launch_model_seed(read_user_config_raw(source)) if source.is_file() else {}
         if seed:
-            config_path.write_text(yaml.safe_dump(seed, sort_keys=False), encoding="utf-8")
+            atomic_config_write(config_path, seed)
 
 
 def _check_gateway_running(profile_dir: Path) -> bool:
@@ -740,20 +790,28 @@ def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``profile.yaml`` -> ``{description, description_auto, display_name,
     previous_names}`` (empty defaults when missing/unreadable). Never raises — a
     corrupt file on one profile must not break ``hermes profile list``."""
-    data = _load_yaml_dict(profile_dir / "profile.yaml") or {}
-    ui_meta = data.get("ui_meta")
-    bot_title = ""
-    if isinstance(ui_meta, dict):
-        hermes_bots = ui_meta.get("hermes-bots")
-        if isinstance(hermes_bots, dict):
-            bot_title = str(hermes_bots.get("title") or "").strip()
-    return {
-        "description": str(data.get("description") or "").strip(),
-        "description_auto": bool(data.get("description_auto", False)),
-        "display_name": str(data.get("display_name") or "").strip(),
-        "bot_title": bot_title,
-        "previous_names": _clean_previous_names(data.get("previous_names")),
-    }
+    def _read() -> dict:
+        data = _load_yaml_dict(profile_dir / "profile.yaml") or {}
+        ui_meta = data.get("ui_meta")
+        bot_title = ""
+        if isinstance(ui_meta, dict):
+            hermes_bots = ui_meta.get("hermes-bots")
+            if isinstance(hermes_bots, dict):
+                bot_title = str(hermes_bots.get("title") or "").strip()
+        return {
+            "description": str(data.get("description") or "").strip(),
+            "description_auto": bool(data.get("description_auto", False)),
+            "display_name": str(data.get("display_name") or "").strip(),
+            "bot_title": bot_title,
+            "previous_names": _clean_previous_names(data.get("previous_names")),
+            "role": data.get("role") if data.get("role") in PROFILE_ROLES else None,
+        }
+
+    # A copy per caller (list included): the cached value is shared, and a caller that mutates
+    # its result must not poison the next reader.
+    meta = dict(_cached_profile_read(profile_dir / "profile.yaml", "profile-meta", _read))
+    meta["previous_names"] = list(meta["previous_names"])
+    return meta
 
 
 def _clean_previous_names(raw) -> List[str]:
@@ -774,13 +832,19 @@ def _clean_previous_names(raw) -> List[str]:
 def write_profile_meta(
     profile_dir: Path, *, description: Optional[str] = None, description_auto: Optional[bool] = None,
     display_name: Optional[str] = None, previous_names: Optional[List[str]] = None,
+    role: Optional[str] = None,
 ) -> None:
     """Update ``profile.yaml`` in place: only passed fields are overwritten; the file is
-    created if missing. The profile directory itself must exist."""
+    created if missing. The profile directory itself must exist. ``role`` grants backend
+    capabilities, so no client-facing writer passes it through."""
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
+    if role is not None and role not in PROFILE_ROLES:
+        raise ValueError(f"unknown profile role: {role!r}")
     path = profile_dir / "profile.yaml"
     existing: dict = _load_yaml_dict(path) or {}
+    if role is not None:
+        existing["role"] = role
     if description is not None:
         existing["description"] = description.strip()
     if description_auto is not None:
@@ -802,6 +866,17 @@ def write_profile_meta(
     # Atomic write: bare open("w") truncates before the dump, and the read path swallows
     # parse errors as {}, so a crashed write would silently drop unspecified fields.
     # See #51356.
+    from utils import atomic_yaml_write
+    atomic_yaml_write(path, existing, sort_keys=False)
+
+
+def drop_profile_role(profile_dir: Path) -> None:
+    """Remove ``role`` from a copied ``profile.yaml``: a copy is an ordinary profile."""
+    path = profile_dir / "profile.yaml"
+    existing = _load_yaml_dict(path)
+    if not existing or "role" not in existing:
+        return
+    existing.pop("role")
     from utils import atomic_yaml_write
     atomic_yaml_write(path, existing, sort_keys=False)
 
@@ -988,9 +1063,10 @@ def _copytree_keep_junctions(src: Path, dst: Path, ignore, dirs_exist_ok: bool =
 
 
 def _clone_all_into(source_dir: Path, profile_dir: Path, canon: str) -> None:
-    """--clone-all: full copytree minus infrastructure/history, then strip runtime files
-    and cloned single-use OAuth grants."""
+    """--clone-all: full copytree minus infrastructure/history, then strip runtime files,
+    the backend-assigned role, and cloned single-use OAuth grants."""
     _copytree_keep_junctions(source_dir, profile_dir, _clone_all_copytree_ignore(source_dir))
+    drop_profile_role(profile_dir)
     materialized = _materialize_symlinked_files(profile_dir)
     if materialized:
         logger.info("profile %s: materialized symlinked %s so the clone never writes through to %s",
@@ -1002,13 +1078,14 @@ def _clone_all_into(source_dir: Path, profile_dir: Path, canon: str) -> None:
         (profile_dir / stale).unlink(missing_ok=True)
     # auth.json / .anthropic_oauth.json copied verbatim fork single-use OAuth grants
     # (Anthropic / Codex / xAI): one credential with two owners, and the first profile to
-    # refresh revokes the pair for every sibling. Drop the copies; the clone signs in itself.
+    # refresh revokes the pair for every sibling. Drop the copies; the clone reads the root
+    # grant through the credential-pool fallback.
     from hermes_cli.auth import strip_cloned_single_use_oauth_grants
     stripped = strip_cloned_single_use_oauth_grants(profile_dir)
     if any(stripped.values()):
         logger.info(
             "profile %s: dropped cloned single-use OAuth grants %s "
-            "(run `hermes -p %s auth add <provider>` to sign in)", canon, stripped, canon,
+            "(inherits the root grant instead)", canon, stripped,
         )
 
 
@@ -1614,7 +1691,7 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
     old_home = os.environ.get("HERMES_HOME")
     try:
         os.environ["HERMES_HOME"] = str(profile_dir)
-        from hermes_cli.gateway import get_service_name, get_launchd_plist_path
+        from hermes_cli.gateway import get_service_name, get_launchd_plist_path, user_systemd_unit_dir
 
         def _run(*cmd: str) -> None:
             subprocess.run(list(cmd), capture_output=True, check=False, timeout=10)
@@ -1622,7 +1699,7 @@ def _cleanup_gateway_service(name: str, profile_dir: Path) -> None:
         system = _platform.system()
         if system == "Linux":
             svc_name = get_service_name()
-            svc_file = Path.home() / ".config" / "systemd" / "user" / f"{svc_name}.service"
+            svc_file = user_systemd_unit_dir() / f"{svc_name}.service"
             if svc_file.exists():
                 _run("systemctl", "--user", "disable", svc_name)
                 _run("systemctl", "--user", "stop", svc_name)
@@ -1931,6 +2008,7 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
         if archive_root != canon:
             final_source = staging_root / canon
             extracted.rename(final_source)
+        drop_profile_role(final_source)
         shutil.move(str(final_source), str(profile_dir))
     return profile_dir
 
