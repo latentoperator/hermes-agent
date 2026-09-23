@@ -165,7 +165,7 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
-def test_pending_response_records_kanban_timeout(monkeypatch):
+def test_pending_response_records_kanban_iteration_exhaustion(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
     record = MagicMock(name="record_task_failure")
@@ -189,10 +189,10 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
             "Iteration budget exhausted (60/60) — task could not complete "
             "within the allowed iterations"
         ),
-        outcome="timed_out",
+        outcome="iteration_exhausted",
         release_claim=True,
         end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        event_payload_extra={"iterations_used": 60, "iterations_limit": 60},
     )
 
 
@@ -270,11 +270,11 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     record.assert_called_once()
     args, kwargs = record.call_args
     assert args[1] == "task-456"
-    assert kwargs["outcome"] == "timed_out"
+    assert kwargs["outcome"] == "iteration_exhausted"
     assert kwargs["release_claim"] is True
     assert kwargs["end_run"] is True
-    assert kwargs["event_payload_extra"]["budget_used"] == 60
-    assert kwargs["event_payload_extra"]["budget_max"] == 60
+    assert kwargs["event_payload_extra"]["iterations_used"] == 60
+    assert kwargs["event_payload_extra"]["iterations_limit"] == 60
 
 
 def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
@@ -308,7 +308,7 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     record.assert_called_once()
     args, kwargs = record.call_args
     assert args[1] == "task-789"
-    assert kwargs["outcome"] == "timed_out"
+    assert kwargs["outcome"] == "iteration_exhausted"
 
 
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
@@ -374,9 +374,9 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
 
 
 @pytest.mark.parametrize("scope", ["child", "non-owner"])
-def test_budget_exhausted_child_does_not_record_parent_kanban_timeout(monkeypatch, scope):
+def test_budget_exhausted_child_does_not_record_parent_kanban_failure(monkeypatch, scope):
     """An in-process delegate_task child (or cron run) inherits ``HERMES_KANBAN_TASK`` from
-    the dispatcher worker; exhausting ITS budget must not record ``timed_out`` against the
+    the dispatcher worker; exhausting ITS budget must not record ``iteration_exhausted`` against the
     parent's task or release the parent's claim (#112817)."""
     from agent.delegation_context import delegated_child_context, non_dispatcher_owned_context
 
