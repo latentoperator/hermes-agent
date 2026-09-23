@@ -205,3 +205,42 @@ def test_bare_tool_marker_is_not_reused_as_final_response():
         f"Expected 3 API calls (including nudge), got: {result['api_calls']}."
     )
 
+
+def test_successful_reaction_only_turn_needs_no_text_reply():
+    """A visible tapback is a complete reply, not a failed empty generation."""
+    with (
+        patch("model_tools.get_tool_definitions", return_value=_tool_defs("react_to_message")),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key", base_url="https://openrouter.ai/api/v1/",
+            quiet_mode=True, skip_context_files=True, skip_memory=True,
+            platform="desktop",
+        )
+
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.valid_tool_names = {"react_to_message"}
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.side_effect = [
+        _response(content="", finish_reason="tool_calls",
+                  tool_calls=[_tool_call("react_to_message", "tapback1")]),
+        _response(content="", finish_reason="stop"),
+    ]
+    with (
+        patch("model_tools.handle_function_call", return_value='{"success": true, "row_id": 1}'),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Thanks")
+
+    assert result["completed"] is True
+    assert result["final_response"] == ""
+    assert result["api_calls"] == 2
+    assert result["turn_exit_reason"] == "reaction_only"
+    assert result["messages"][-1]["role"] == "assistant"
+

@@ -10,6 +10,7 @@ retries (budgeted, deterministic-empty short-circuit) → fallback provider → 
 from __future__ import annotations
 
 import logging
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -22,6 +23,31 @@ from agent.turn_recovery import interruptible_backoff_sleep
 logger = logging.getLogger("agent.conversation_loop")
 
 _INLINE_THINK_RE = re.compile(r'<think>|<thinking>|<reasoning>', re.IGNORECASE)
+
+
+def _successful_reaction_only_turn(messages: List[Dict[str, Any]]) -> bool:
+    """A successful tapback can itself answer the latest user message."""
+    if len(messages) < 3 or messages[-1].get("role") != "tool":
+        return False
+    call = messages[-2]
+    calls = call.get("tool_calls") if call.get("role") == "assistant" else None
+    if not isinstance(calls, list) or len(calls) != 1:
+        return False
+    if calls[0].get("function", {}).get("name") != "react_to_message":
+        return False
+    try:
+        success = json.loads(messages[-1].get("content") or "").get("success") is True
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if not success:
+        return False
+    # A reaction after substantive work is not proof the task was finished.
+    for message in reversed(messages[:-2]):
+        if message.get("role") == "user":
+            return True
+        if message.get("role") == "tool":
+            return False
+    return False
 
 
 @dataclass
@@ -171,6 +197,18 @@ def recover_empty_response(
         # A streamed fragment isn't a confirmed preview: gateway fallback delivery
         # sends the text plus the abnormal-turn explanation.
         agent._response_was_previewed = False
+        return _verdict("break")
+
+    if (
+        finish_reason == "stop"
+        and not agent._extract_reasoning(assistant_message)
+        and _successful_reaction_only_turn(messages)
+    ):
+        # Keep role alternation for the next turn; the GUI hides blank assistant rows.
+        append_message(messages, agent._build_assistant_message(assistant_message, finish_reason))
+        _turn_exit_reason = "reaction_only"
+        final_response = ""
+        logger.info("Successful reaction-only turn — no text reply required")
         return _verdict("break")
 
     # Prior turn had real content + ONLY housekeeping tools: model is done, reuse it.
