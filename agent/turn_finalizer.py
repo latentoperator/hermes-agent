@@ -45,7 +45,7 @@ def _assistant_row_missing_visible_text(msg: dict) -> bool:
 def _record_kanban_budget_exhausted(
     kanban_task: str, api_call_count: int, max_iterations: int, logger: logging.Logger
 ) -> None:
-    """Record a terminal ``timed_out`` outcome for a kanban worker out of budget.
+    """Record a terminal ``iteration_exhausted`` outcome for a kanban worker out of budget.
 
     Routed via ``_record_task_failure`` (not ``kanban_block``) so it counts toward the
     consecutive-failure circuit breaker. Idempotent via the ``_end_run`` CAS
@@ -68,10 +68,10 @@ def _record_kanban_budget_exhausted(
                     f"Iteration budget exhausted ({api_call_count}/{max_iterations}) — "
                     "task could not complete within the allowed iterations"
                 ),
-                outcome="timed_out",
+                outcome="iteration_exhausted",
                 release_claim=True,
                 end_run=True,
-                event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
+                event_payload_extra={"iterations_used": api_call_count, "iterations_limit": max_iterations},
             )
         finally:
             with suppress(Exception):
@@ -168,7 +168,7 @@ def _resolve_budget_fallback(
     # If running as a kanban worker, signal the dispatcher that the worker could not complete (rather than
     # treating it as a protocol violation). This applies whether the user-facing fallback came from the
     # summary call or an explicitly pending continuation; both exhausted the task budget and must advance
-    # the failure circuit. We route through ``_record_task_failure(outcome="timed_out")`` rather than
+    # We route through ``_record_task_failure(outcome="iteration_exhausted")`` rather than
     # ``kanban_block`` so this counts toward the dispatcher's consecutive-failure circuit breaker (#29747
     # gap 2).
     # Bounded fallback (#87096): budget was exhausted but none of the normal fallback paths were eligible

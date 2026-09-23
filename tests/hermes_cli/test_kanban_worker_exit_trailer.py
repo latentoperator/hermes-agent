@@ -10,7 +10,9 @@ unblocks it.
 from __future__ import annotations
 
 import time
+from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -144,3 +146,72 @@ def test_exit_single_query_writes_trailer_only_for_kanban_workers(monkeypatch, c
         exit_single_query(kb.KANBAN_RATE_LIMIT_EXIT_CODE)
     assert exc.value.code == kb.KANBAN_RATE_LIMIT_EXIT_CODE
     assert f"{KANBAN_WORKER_EXIT_TRAILER}{kb.KANBAN_RATE_LIMIT_EXIT_CODE}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("max_retries, expected_status", [(2, "ready"), (1, "blocked")])
+def test_iteration_budget_records_distinct_outcome(kanban_home, max_retries, expected_status, capsys):
+    """The real agent finalizer records the run/event, then the dispatcher breaker acts."""
+    import logging
+    from agent.turn_finalizer import _record_kanban_budget_exhausted
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="budget", assignee="a", max_retries=max_retries)
+        kb.claim_task(conn, tid, claimer=kb._claimer_id())
+        _record_kanban_budget_exhausted(tid, 200, 200, logging.getLogger(__name__))
+        run = kb.list_runs(conn, tid)[-1]
+        events = kb.list_events(conn, tid)
+        event = next(e for e in events if e.kind == "iteration_exhausted")
+        task = kb.get_task(conn, tid)
+        assert run.outcome == "iteration_exhausted"
+        assert run.error is not None and "Iteration budget exhausted (200/200)" in run.error
+        assert run.metadata is not None and run.metadata["iterations_used"] == 200
+        assert event.payload is not None and event.payload["iterations_limit"] == 200
+        assert task is not None and task.status == expected_status and task.consecutive_failures == 1
+        if expected_status == "blocked":
+            assert events[-1].kind == "gave_up"
+            assert events[-1].payload is not None
+            assert events[-1].payload["trigger_outcome"] == "iteration_exhausted"
+    from hermes_cli.kanban import _cmd_show
+    assert _cmd_show(Namespace(task_id=tid, json=False)) == 0
+    shown = capsys.readouterr().out
+    assert "iteration_exhausted" in shown and "200/200" in shown
+
+
+def test_wall_clock_timeout_keeps_its_outcome(kanban_home):
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="clock", assignee="a", max_runtime_seconds=30)
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, tid, claimer=f"{host}:clock")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (71001, int(time.time()) - 120, tid),
+        )
+        conn.execute("UPDATE task_runs SET started_at=? WHERE task_id=?", (int(time.time()) - 120, tid))
+        conn.commit()
+        assert tid in kbd.enforce_max_runtime(conn, signal_fn=lambda *_: None)
+        run = kb.list_runs(conn, tid)[-1]
+        event = kb.list_events(conn, tid)[-1]
+        assert run.outcome == event.kind == "timed_out"
+        assert run.metadata["limit_seconds"] == 30
+        assert "elapsed" in run.error
+
+
+def test_iteration_and_clock_notification_copy_remains_distinct():
+    from gateway.kanban_watchers_notifier import _EVENT_FORMATTERS, TERMINAL_KINDS
+    from tui_gateway.session_notifications import _format_kanban_event_text, _KANBAN_NOTIFY_KINDS
+
+    assert "iteration_exhausted" in TERMINAL_KINDS and "iteration_exhausted" in _KANBAN_NOTIFY_KINDS
+    task = SimpleNamespace(title="task", assignee="a")
+    sub = {"task_id": "t_1"}
+    note = SimpleNamespace(head="Kanban t_1", task_id="t_1")
+    for kind, payload, expected in (
+        ("iteration_exhausted", {"iterations_used": 200, "iterations_limit": 200}, "iteration budget 200/200"),
+        ("timed_out", {"limit_seconds": 300}, "5-minute limit"),
+    ):
+        event = SimpleNamespace(kind=kind, payload=payload)
+        gateway_text = _EVENT_FORMATTERS[kind](event, note)[0]
+        tui_text = _format_kanban_event_text(sub, task, event, "default")
+        assert expected in gateway_text
+        assert tui_text is not None
+        assert ("iteration budget" in tui_text) == (kind == "iteration_exhausted")
+        assert ("timed out" in tui_text) == (kind == "timed_out")

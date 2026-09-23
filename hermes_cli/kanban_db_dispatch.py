@@ -1409,6 +1409,8 @@ def _record_task_failure(
                 detail = {"failures": failures, "retry_status": retry_status}
                 if infrastructure:
                     detail["infrastructure"] = True
+                if event_payload_extra:
+                    detail.update(event_payload_extra)
                 run_id = _kb._end_run(
                     conn, task_id, outcome=outcome, status=outcome, error=error, metadata=detail,
                 )
@@ -1435,17 +1437,25 @@ def _record_task_failure(
         }
         run_id = None
         if end_run:
-            # Only the spawn path has an open run to close.
+            # Preserve the specific budget-stop outcome on the run, even when
+            # the breaker also blocks the task with a gave_up event.
+            exhausted = outcome == "iteration_exhausted"
+            metadata = {
+                "failures": failures,
+                "trigger_outcome": outcome,
+                "effective_limit": effective_limit,
+                "limit_source": limit_source,
+                "retry_status": retry_status,
+            }
+            if event_payload_extra:
+                metadata.update(event_payload_extra)
             run_id = _kb._end_run(
-                conn, task_id, outcome="gave_up", status="gave_up", error=error,
-                metadata={
-                    "failures": failures,
-                    "trigger_outcome": outcome,
-                    "effective_limit": effective_limit,
-                    "limit_source": limit_source,
-                    "retry_status": retry_status,
-                },
+                conn, task_id, outcome=outcome if exhausted else "gave_up",
+                status=outcome if exhausted else "gave_up", error=error,
+                metadata=metadata,
             )
+            if exhausted:
+                _kb._append_event(conn, task_id, outcome, metadata, run_id=run_id)
         if force_trip:
             # The caller applied its own bounded policy, so the counter cannot
             # judge this block: ``recompute_ready`` holds it for an operator.
