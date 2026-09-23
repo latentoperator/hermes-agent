@@ -61,7 +61,8 @@ def _maybe_inject_iteration_budget_warning(agent: Any, messages: Any) -> bool:
     )
     if kanban_worker:
         notice += (
-            " While tools are still available, call kanban_complete only if all task "
+            " If changing code in a git workspace, checkpoint a passing commit and push now; "
+            "record any push failure. While tools are still available, call kanban_complete only if all task "
             "requirements are verified, or kanban_request_review if it is ready for "
             "review; otherwise persist a kanban_comment handoff and "
             "continue. A diff or commit alone is not completion evidence."

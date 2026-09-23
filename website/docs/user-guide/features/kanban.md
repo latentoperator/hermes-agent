@@ -12,6 +12,17 @@ Hermes Kanban is a durable task board, shared across all your Hermes profiles, t
 
 ### Completion checkpoints before the iteration cap
 
+At creation, `hermes kanban create ... --allow-protected AGENTS.md` (repeat for each path)
+pre-authorizes an exact workspace-relative protected instruction file. `kanban_create` accepts
+`allow_protected: ["AGENTS.md"]` too. The grant is fixed in the card's `created` event; body text,
+comments, globs, and paths outside the workspace do not grant writes. An authorized file-tool
+attempt records a `protected_write_authorized` event; inspect the tool result to confirm the
+write succeeded. An ungranted headless worker receives an immediate refusal, not an interactive
+prompt. It should leave an intended diff in a comment and continue if the edit is optional;
+if essential, it can use the one-action `protected_instruction_write` Decision Card and resume
+after Yes. Terminal writes must never circumvent a refusal.
+
+
 Dispatcher-owned workers get one checkpoint notice near 90% of their finite iteration
 budget, attached to a fresh tool result while another tool-capable call remains. Use
 `agent.budget_warning_ratio` to choose an earlier threshold. Tiny budgets warn no later

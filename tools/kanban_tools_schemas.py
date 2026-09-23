@@ -481,6 +481,10 @@ KANBAN_CREATE_SCHEMA = _schema(
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
         )),
+        "allow_protected": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Creation-time grant for exact workspace-relative protected instruction paths (e.g. AGENTS.md); no glob or parent traversal. Logged in the card's created event.",
+        },
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "
                 "continuation turns the worker may take before the task "

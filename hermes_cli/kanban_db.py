@@ -1260,6 +1260,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    allow_protected: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1280,6 +1281,18 @@ def create_task(
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
     completion_contract = validate_contract(completion_contract)
+    # Creation-time authority lives in the created event, not editable body text.
+    protected_paths = []
+    for raw in allow_protected or ():
+        if not isinstance(raw, str) or not raw or raw.startswith(("/", "~")) or "\\" in raw:
+            raise ValueError("allow_protected requires workspace-relative paths")
+        parts = raw.split("/")
+        if any(part in {"", ".", ".."} for part in parts) or ":" in parts[0]:
+            raise ValueError("allow_protected requires exact paths without traversal or globs")
+        if any(ch in raw for ch in "*?[]"):
+            raise ValueError("allow_protected does not accept globs")
+        protected_paths.append(raw)
+    protected_paths = sorted(set(protected_paths))
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1392,6 +1405,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "allow_protected": protected_paths or None,
                     },
                 )
                 if task_status == "blocked":

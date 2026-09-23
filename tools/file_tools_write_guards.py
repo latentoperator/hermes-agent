@@ -339,8 +339,19 @@ def _check_protected_instruction_write(paths: list[str], task_id: str = "default
                            for p in paths) if r]
     if not reasons:
         return None
+    if _claim_kanban_card_protected_write(paths, task_id):
+        return None
     if _claim_kanban_protected_write_grant(paths, task_id):
         return None
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+    if os.environ.get("HERMES_KANBAN_TASK") and is_dispatcher_owned_worker_context():
+        return (
+            "BLOCKED: protected instruction write was not pre-authorized for this Kanban card. "
+            "No interactive approval was requested and no file was changed. Do not retry via terminal or "
+            "another tool. If optional, skip this edit, comment with the intended diff and finish "
+            "the remaining work. If essential, checkpoint committed work, then request one "
+            "protected_instruction_write Decision Card for the exact path and block as needs_input."
+        )
     return _request_protected_instruction_approval(reasons, task_id)
 
 
@@ -580,6 +591,51 @@ def _looks_like_read_file_line_numbered_content(content: str) -> bool:
 def _is_internal_file_tool_content(content: str) -> bool:
     """Return True when content is file-tool display text, not intended file bytes."""
     return _is_internal_file_status_text(content) or _looks_like_read_file_line_numbered_content(content)
+
+
+def _claim_kanban_card_protected_write(paths: list[str], task_id: str = "default") -> bool:
+    """Read the immutable creation grant under the board's write lock and log an attempted write.
+
+    The creator authorizes exact paths, not a glob or an arbitrary path named in body text.
+    Refuse an unowned task, another run, or a symlink out of the workspace.
+    """
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+    if not is_dispatcher_owned_worker_context():
+        return False
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE")
+    run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not tid or not workspace or not run_id or not os.path.isabs(workspace):
+        return False
+    root = os.path.realpath(workspace)
+    try:
+        resolved = [os.path.realpath(str(_resolve_path_for_task(p, task_id))) for p in paths]
+        relative = [os.path.relpath(p, root).replace(os.sep, "/") for p in resolved]
+        if not all(os.path.commonpath((root, p)) == root and p != root for p in resolved):
+            return False
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import connect_closing
+        with connect_closing() as conn:
+            with kb.write_txn(conn):
+                task = kb.get_task(conn, tid)
+                if (not task or task.status != "running" or task.current_run_id != int(run_id)
+                        or os.path.realpath(task.workspace_path or "") != root):
+                    return False
+                event = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? AND kind='created' ORDER BY id LIMIT 1",
+                    (tid,),
+                ).fetchone()
+                granted = (kb._json_or(event["payload"]) or {}).get("allow_protected") if event else None
+                if not granted or not set(relative).issubset(set(granted)):
+                    return False
+                kb._append_event(conn, tid, "protected_write_authorized", {
+                    "paths": sorted(set(resolved)), "source": "creation_grant", "run_id": int(run_id),
+                    "note": "authorization attempt; file tool reports whether application succeeded",
+                }, run_id=int(run_id))
+                return True
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        logger.warning("Kanban protected-write grant failed closed: %s", exc)
+        return False
 
 
 def _claim_kanban_protected_write_grant(
