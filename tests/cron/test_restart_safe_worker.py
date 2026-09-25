@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -365,6 +366,73 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
     assert not (tmp_path / "cron/external-workers/exec-1.json").exists()
 
 
+@pytest.mark.platforms("posix")
+def test_external_worker_bootstraps_selected_dependencies_for_each_profile(
+    tmp_path, monkeypatch,
+):
+    """A managed interpreter has no selected dependency generation until bootstrap runs."""
+    import cron.scheduler as scheduler
+    from hermes_cli import _launchers
+    from pm.environments import install_state_dir, site_packages
+    from tests.hermes_cli.test_source_launcher_publication import BOOT_FILES
+    from tools.process_registry import GatewayChildDispatch
+
+    source = Path(__file__).resolve().parents[2]
+    repo = tmp_path / "isolated installation"
+    for relative in BOOT_FILES:
+        destination = repo / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source / relative, destination)
+    worker = repo / "cron/scheduler.py"
+    worker.parent.mkdir()
+    (worker.parent / "__init__.py").write_text("", encoding="utf-8")
+    worker.write_text(
+        "import json, os, sys\n"
+        "from pathlib import Path\n"
+        "import dependency_only_in_generation as dependency\n"
+        "args = sys.argv\n"
+        "payload = Path(args[args.index('--external-worker-file') + 1])\n"
+        "ack = Path(args[args.index('--ack-file') + 1])\n"
+        "job = json.loads(payload.read_text())['job']\n"
+        "Path(os.environ['HERMES_HOME'], 'receipt').write_text(dependency.VALUE)\n"
+        "ack.write_text(json.dumps({'execution_id': job['execution_id'], 'pid': os.getpid()}))\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(scheduler, "__file__", str(worker))
+    monkeypatch.setattr(
+        "tools.process_registry.restart_safe_gateway_child_argv",
+        lambda command, **_: GatewayChildDispatch("degraded", command),
+    )
+    monkeypatch.setattr(scheduler, "mark_execution_handoff_pending", lambda eid: {"id": eid})
+    monkeypatch.setattr(scheduler, "get_execution", lambda eid: {"id": eid, "status": "completed"})
+
+    homes = [tmp_path / "profile-A", tmp_path / "profile-B", tmp_path / "profile-A"]
+    for index, home in enumerate(homes):
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+        store = home / "tools"
+        store.mkdir(parents=True, exist_ok=True)
+        interpreter = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
+        (store / "facts.json").write_text(json.dumps({"packages": {"python": {
+            "entry": str(interpreter.parents[1]),
+        }}}), encoding="utf-8")
+        generation = install_state_dir(repo) / "environments" / "active" / "venv"
+        site = site_packages(generation)
+        site.mkdir(parents=True, exist_ok=True)
+        (generation / "pyvenv.cfg").write_text("home = fixture\n", encoding="utf-8")
+        (site / "dependency_only_in_generation.py").write_text(
+            f"VALUE = {home.name!r}\n", encoding="utf-8")
+        (install_state_dir(repo) / "facts.json").write_text(
+            json.dumps({"packages": {"venv": {"environment": str(generation)}}}),
+            encoding="utf-8",
+        )
+        _launchers.ensure_install_launchers(repo, repo / ".hermes/bin")
+        monkeypatch.setattr(scheduler, "_get_hermes_home", lambda home=home: home)
+        job = {"id": "bootstrap", "execution_id": f"exec-{index}"}
+        assert scheduler._launch_external_cron_worker(job) is True
+        assert (home / "receipt").read_text(encoding="utf-8") == home.name
+
+
 def test_launch_external_worker_honors_ack_within_adoption_grace(
     tmp_path, monkeypatch
 ):
@@ -583,14 +651,12 @@ def test_launch_external_worker_degrades_by_default_with_real_helper(
     assert not (tmp_path / "cron/external-workers/exec-1.json").exists()
 
 
-def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
+def test_launch_external_worker_uses_install_bound_bootstrap_not_ambient_pythonpath(
     tmp_path, monkeypatch,
 ):
-    """#112729: the worker starts in ``cron.scheduler`` (no ``hermes_cli.main`` bootstrap),
-    so its import path must be explicit — a rotted editable mapping or PYTHONSAFEPATH
-    otherwise kills it with "No module named 'cron'" before the ack. The spawn env carries
-    the gateway's own checkout first and keeps the gateway's other PYTHONPATH entries."""
+    """#112729: bootstrap pins the checkout and selects dependencies, not PYTHONPATH."""
     import cron.scheduler as scheduler
+    from hermes_cli._launchers import installation_command
     from tools.process_registry import GatewayChildDispatch
 
     job = {"id": "job-1", "execution_id": "exec-1", "prompt": "work"}
@@ -604,22 +670,21 @@ def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
 
     assert scheduler._launch_external_cron_worker(job) is True
     repo_root = Path(scheduler.__file__).resolve().parent.parent
-    entries = spawned[0][1]["env"]["PYTHONPATH"].split(os.pathsep)
-    assert entries[0] == str(repo_root)
-    assert str(tmp_path / "user-libs") in entries
+    assert spawned[0][0] == installation_command(
+        repo_root,
+        ["--external-worker-file", str(tmp_path / "cron/external-workers/exec-1.json"),
+         "--ack-file", str(tmp_path / "cron/external-workers/exec-1.ready")],
+        module="cron.scheduler",
+    )
+    assert str(tmp_path / "user-libs") in spawned[0][1]["env"].get("PYTHONPATH", "")
     assert spawned[0][1]["cwd"] == str(repo_root)
 
 
-def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
+def test_launch_external_worker_keeps_sanitized_env_not_os_environ(
     tmp_path, monkeypatch,
 ):
-    """The pin prepends the checkout to the PYTHONPATH the shared sanitizer *kept*; it
-    must not rebuild from raw ``os.environ`` (which would resurrect entries
-    ``build_subprocess_env`` stripped). Under a wheel/pipx install the checkout IS
-    purelib, already importable -- pinning it would hoist site-packages above the stdlib,
-    so the pin is skipped there."""
+    """The worker receives only the sanitized env; bootstrap ignores its PYTHONPATH."""
     import cron.scheduler as scheduler
-    import cron.scheduler_worker_env as worker_env_mod
     from tools.process_registry import GatewayChildDispatch
 
     job = {"id": "job-1", "execution_id": "exec-1", "prompt": "work"}
@@ -635,17 +700,10 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
                      "PYTHONPATH": str(tmp_path / "kept-by-sanitizer")},
     )
     spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
-    repo_root = Path(scheduler.__file__).resolve().parent.parent
 
     assert scheduler._launch_external_cron_worker(job) is True
-    entries = spawned[0][1]["env"]["PYTHONPATH"].split(os.pathsep)
-    assert entries == [str(repo_root), str(tmp_path / "kept-by-sanitizer")]
-
-    # Wheel / pipx layout: repo_root == purelib -> untouched.
-    monkeypatch.setattr(worker_env_mod, "_installed_purelib", lambda: repo_root)
-    untouched = {"PYTHONPATH": str(tmp_path / "kept-by-sanitizer")}
-    assert worker_env_mod.pin_hermes_tree_on_pythonpath(dict(untouched), repo_root) == untouched
-    assert "PYTHONPATH" not in worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root)
+    assert spawned[0][1]["env"]["PYTHONPATH"] == str(tmp_path / "kept-by-sanitizer")
+    assert str(tmp_path / "raw-environ-only") not in spawned[0][1]["env"]["PYTHONPATH"]
 
 
 def test_shared_run_path_hands_gateway_fire_to_external_worker(monkeypatch):

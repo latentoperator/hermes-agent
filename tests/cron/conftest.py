@@ -14,6 +14,14 @@ inside the test, which overrides this fixture's value for that scope.
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cron_launcher_store(monkeypatch):
+    """Any cron launch probe must use test-owned PM state, not the live install."""
+    from hermes_constants import get_hermes_home
+
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(get_hermes_home() / "tools"))
+
+
 @pytest.fixture()
 def make_cron_provider():
     """Factory for minimal CronScheduler test doubles.
