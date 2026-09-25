@@ -1558,7 +1558,9 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     import shutil
     import sys
     from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import _launchers
 
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda root: None)
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
@@ -1581,10 +1583,11 @@ def test_resolve_hermes_argv_module_actually_runs():
     """
     import subprocess
     from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import _launchers
     import shutil
     import unittest.mock as mock
 
-    with mock.patch.dict(os.environ, {}, clear=False):
+    with mock.patch.object(_launchers, "resolve_store_python", return_value=None), mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kbd._resolve_hermes_argv()
@@ -1593,6 +1596,22 @@ def test_resolve_hermes_argv_module_actually_runs():
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
     )
+
+
+def test_resolve_hermes_argv_uses_published_managed_launcher(tmp_path, monkeypatch):
+    """An isolated store Python needs the install bootstrap, not bare ``-m``."""
+    from hermes_cli import _launchers
+
+    repo = tmp_path / "source"
+    launcher = repo / ".hermes" / "bin" / "hermes"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(kbd, "__file__", str(repo / "hermes_cli" / "kanban_db_dispatch.py"))
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda root: tmp_path / "store-python")
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
+    assert kbd._resolve_hermes_argv() == [str(launcher)]
 
 
 # ---------------------------------------------------------------------------

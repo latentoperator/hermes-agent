@@ -2443,8 +2443,19 @@ def _rotate_worker_log(
 
 
 def _module_hermes_argv() -> list[str]:
-    """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
+    """Invoke this install, including bootstrap for an isolated managed Python."""
+    from pathlib import Path
+    from hermes_cli._launchers import resolve_store_python, runtime_command
+
+    root = Path(__file__).resolve().parents[1]
+    if resolve_store_python(root) is not None:
+        # The daemon's launcher inserted the source tree into sys.path. Its
+        # child does not inherit that insertion, so `sys.executable -m` fails
+        # even though find_spec("hermes_cli") succeeds in the parent.
+        launcher = root / ".hermes" / "bin" / "hermes"
+        if launcher.is_file() and os.access(launcher, os.X_OK):
+            return [str(launcher)]
+        return runtime_command(root)
     return [sys.executable, "-m", "hermes_cli.main"]
 
 
@@ -2509,14 +2520,14 @@ def _hermes_path_argv(path: str) -> list[str]:
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
-    is not importable. The module argv must win over PATH: a PATH-first lookup
+    same-directory file), then this install's bootstrap launcher for managed
+    source installs (or the running interpreter's module form otherwise),
+    then ``which("hermes")`` (Windows: safe PATH search, batch shims fall back
+    to the module form) only when ``hermes_cli`` is not importable. The
+    install-bound argv must win over PATH: a PATH-first lookup
     lets an attacker-planted ``hermes`` shadow the running install (#111569).
-    Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``
-    sits below ``gateway`` in the dependency order.
+    Unlike ``gateway.run._resolve_hermes_bin``, this resolver must preserve
+    the managed source install's bootstrap when a dispatcher spawns a child.
     """
     import importlib.util
     import shutil
