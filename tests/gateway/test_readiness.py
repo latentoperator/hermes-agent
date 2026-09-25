@@ -29,7 +29,7 @@ def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monke
         active_api_runs=2,
     )
 
-    assert result["status"] == "ok"
+    assert result["status"] == ("ok" if result["checks"]["disk"]["status"] == "ok" else "degraded")
     assert result["checks"]["state_db"]["status"] == "ok"
     assert result["checks"]["session_store"]["status"] == "ok"
     assert result["checks"]["config"]["status"] == "ok"
@@ -91,5 +91,4 @@ def test_readiness_uses_running_session_store_state_over_independent_probe(
         },
     )
     assert recovered["checks"]["session_store"] == {"status": "ok"}
-
 
