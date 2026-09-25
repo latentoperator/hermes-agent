@@ -485,12 +485,7 @@ describe('quickstart', () => {
         percent: 30,
         error: null
       }
-    ]
-
-    // The poller refreshes this cache from the backend on mount. Keep both
-    // fixtures running so the assertion cannot race an empty backend reply.
-    mocked.getLocalModelsJobs.mockResolvedValue({ jobs })
-    $localRuntimeJobs.set(jobs)
+    ])
     renderPane()
 
     // The hero names the model and shows the composed status line
