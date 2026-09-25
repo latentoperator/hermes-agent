@@ -13,8 +13,40 @@ import pytest
 
 from pm.environment import PythonEnvironment
 from pm.plugin_declarations import read_python_declaration, unsupported_requirements
-from pm.workspace import enabled_member_dirs, lock_and_sync
+from pm.workspace import _generate_pyproject, enabled_member_dirs, lock_and_sync
 from tests.pm import _fixtures
+
+
+def test_tool_only_pyproject_is_not_an_installable_plugin(tmp_path):
+    (tmp_path / "plugin.yaml").write_text("name: browser-steel\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n', encoding="utf-8"
+    )
+    declaration = read_python_declaration(tmp_path)
+    assert declaration.pyproject is None
+    assert not declaration.is_member
+
+
+def test_profile_copies_share_one_dependency_only_workspace_member(tmp_path):
+    core = tmp_path / "core"
+    core.mkdir()
+    (core / "pyproject.toml").write_text(
+        '[project]\nname="hermes-agent"\nversion="0.0.0"\n', encoding="utf-8"
+    )
+    projects = []
+    for profile in ("default", "dante"):
+        plugin = tmp_path / profile / "plugins" / "hindsight"
+        plugin.mkdir(parents=True)
+        (plugin / "pyproject.toml").write_text(
+            '[project]\nname="hermes-plugin-hindsight"\nversion="1"\n'
+            'dependencies=["hindsight-client>=0.10.1,<1"]\n'
+            '[tool.uv]\npackage=false\n', encoding="utf-8"
+        )
+        projects.append(plugin)
+    workspace = tmp_path / "workspace"
+    _generate_pyproject(projects, workspace, source=core)
+    document = tomllib.loads((workspace / "pyproject.toml").read_text())
+    assert len(document["tool"]["uv"]["workspace"]["members"]) == 1
 
 
 @pytest.mark.parametrize("modern", [False, True])

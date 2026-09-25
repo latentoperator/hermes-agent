@@ -106,6 +106,8 @@ def _copy_core_inputs(source: Path, destination: Path) -> None:
 
 def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Path, *, source: Path) -> None:
     """Snapshot core and plugin build inputs into a fresh generation."""
+    import tomllib
+
     source = source.resolve()
     if root.resolve() == source or source.is_relative_to(root.resolve()):
         raise InstallError("venv", "workspace must not replace the core source")
@@ -114,13 +116,34 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
     core_pyproject = source / "pyproject.toml"
     core_text = core_pyproject.read_text(encoding="utf-8-sig")
 
-    members = [_workspace_member(source, root, identity=identity).relative_to(root).as_posix()
-               for identity, source in member_sources(plugin_dirs).items()
-               if _is_member_candidate(source)]
+    members = []
+    shared_declarations: dict[str, bytes] = {}
+    for identity, entry in member_sources(plugin_dirs).items():
+        if not _is_member_candidate(entry):
+            continue
+        declaration = read_python_declaration(entry)
+        if declaration.pyproject is not None:
+            metadata_bytes = declaration.pyproject.read_bytes()
+            metadata = tomllib.loads(metadata_bytes.decode("utf-8-sig"))
+            project = metadata.get("project", {})
+            name = str(project.get("name", "")).lower().replace("_", "-")
+            uv = metadata.get("tool", {}).get("uv", {})
+            # Profile copies are separate plugin instances but share one Python
+            # environment. A dependency-only or non-package project needs one
+            # workspace member; uv refuses duplicate distribution names.
+            dependency_only = uv.get("package") is False or (
+                not declaration.install_requirements and "build-system" not in metadata
+            )
+            if name and dependency_only:
+                previous = shared_declarations.get(name)
+                if previous is not None:
+                    if previous != metadata_bytes:
+                        raise InstallError("venv", f"Plugin project {name!r} has conflicting profile declarations")
+                    continue
+                shared_declarations[name] = metadata_bytes
+        members.append(_workspace_member(entry, root, identity=identity).relative_to(root).as_posix())
 
     if members:
-        import tomllib
-
         import tomli_w
 
         document = tomllib.loads(core_text)

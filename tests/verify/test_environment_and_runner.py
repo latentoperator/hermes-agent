@@ -246,7 +246,7 @@ class TestReadiness:
         assert not result.readiness.ready
         assert not result.ok
 
-    @pytest.mark.linux_only
+    @pytest.mark.platforms("linux")
     @pytest.mark.live_system_guard_bypass
     def test_teardown_kills_child_after_package_manager_parent_exits(self, tmp_path):
         port = _free_port()

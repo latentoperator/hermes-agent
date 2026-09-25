@@ -107,7 +107,7 @@ def test_fetch_retries_explicit_bws_rate_limit(monkeypatch, tmp_path):
     )
     sleeps = []
 
-    monkeypatch.setattr(bw.subprocess, "run", lambda *_a, **_kw: next(responses))
+    monkeypatch.setattr(bw, "run_cli", lambda *_a, **_kw: next(responses))
     monkeypatch.setattr(bw.time, "sleep", sleeps.append)
     monkeypatch.setattr(bw.random, "uniform", lambda *_a: 0.0)
 
@@ -146,8 +146,7 @@ def test_source_filters_source_keys_and_aliases_target_env(monkeypatch, tmp_path
         ]
     )
     monkeypatch.setattr(
-        bw.subprocess,
-        "run",
+        bw, "run_cli",
         lambda *_a, **_kw: mock.Mock(returncode=0, stdout=payload, stderr=""),
     )
     monkeypatch.setattr(bw, "find_bws", lambda **_kw: fake_binary)
