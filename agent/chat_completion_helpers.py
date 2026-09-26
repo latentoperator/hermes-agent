@@ -43,8 +43,8 @@ from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS, append_message, stamp_message_timestamp
 from agent.message_sanitization import (
-    _sanitize_surrogates, _repair_tool_call_arguments, normalize_finish_reason as _normalize_finish_reason,
-    sanitize_outbound_kwargs, strip_images_for_rejecting_model,
+    _sanitize_messages_surrogates, _sanitize_surrogates, _repair_tool_call_arguments,
+    normalize_finish_reason as _normalize_finish_reason, sanitize_outbound_kwargs, strip_images_for_rejecting_model,
 )
 from agent.reasoning_summaries import append_streamed_reasoning_detail, separate_glued_reasoning_blocks
 from agent.repetition_guard import is_repetition_dominated
@@ -1734,19 +1734,24 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
                     has_replayable_native_compaction_checkpoint,
                 )
 
-                note_checkpoint = getattr(
-                    agent.context_compressor, "note_native_compaction_checkpoint", None
-                )
-                if (
-                    callable(note_checkpoint)
-                    and has_replayable_native_compaction_checkpoint(agent, [msg])
-                ):
-                    note_checkpoint()
-                    # The response priced the pre-checkpoint input, not the next
-                    # compacted request. A matching durable prefix is now stale.
-                    from agent.usage_anchor import set_usage_anchor
+                if has_replayable_native_compaction_checkpoint(agent, [msg]):
+                    note_checkpoint = getattr(
+                        agent.context_compressor, "note_native_compaction_checkpoint", None
+                    )
+                    if callable(note_checkpoint):
+                        note_checkpoint()
+                        # The response priced the pre-checkpoint input, not the next
+                        # compacted request. A matching durable prefix is now stale.
+                        from agent.usage_anchor import set_usage_anchor
 
-                    set_usage_anchor(agent, None)
+                        set_usage_anchor(agent, None)
+                    # The next request drops every item before this checkpoint, so a repeat
+                    # read must serve content again, not an "unchanged" stub (#32106).
+                    # Without a task id the reset would clear every task's caches.
+                    if task_id := getattr(agent, "_current_task_id", None):
+                        from agent.conversation_compression import _reset_read_dedup_caches
+
+                        _reset_read_dedup_caches(task_id, session_id=getattr(agent, "session_id", None) or "")
 
     if assistant_tool_calls:
         msg["tool_calls"] = [_assistant_tool_call_dict(agent, tc, i) for i, tc in enumerate(assistant_tool_calls)]
@@ -2259,6 +2264,18 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
         if isinstance(api_msg, dict):
             for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
                 del api_msg[internal_key]
+    # Same closing normalization as assemble_api_request so the summary's prefix stays
+    # bit-identical to the main loop's (a diverging early row defeats prefix caching).
+    for api_msg in api_messages:
+        if isinstance(api_msg.get("content"), str):
+            api_msg["content"] = api_msg["content"].strip()
+    from agent.conversation_loop import _canonicalize_api_tool_calls, _clone_message_for_send
+    _canonicalize_api_tool_calls(api_messages)
+    # Third closing pass of the main path: lone surrogates -> U+FFFD (else the SDK's utf-8
+    # wire encode raises and burns the summary retries). The sanitizer is in-place and these
+    # rows still share nested dicts with history, so clone first like the main path does.
+    api_messages = [_clone_message_for_send(m) for m in api_messages]
+    _sanitize_messages_surrogates(api_messages)
     return api_messages
 
 
