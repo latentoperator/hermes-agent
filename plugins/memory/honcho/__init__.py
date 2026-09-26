@@ -143,7 +143,7 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         self._turn_count = 0
         # Author of the turn in flight, refreshed by on_turn_start.
         self._turn_author: dict[str, Any] = {}
-        # (config path, mtime_ns, size) -> identity_signature() values.
+        # (config path, device, inode, mtime_ns, ctime_ns, size) -> identity_signature() values.
         self._identity_signature_memo: dict[tuple, dict[str, Any]] = {}
         # Injection audit. Off unless the logging key enables it: the record holds the user's representation.
         self._injection_log_path: Optional[str] = None
@@ -687,15 +687,17 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
     def identity_signature(self) -> Dict[str, Any]:
         """Identity-mapping values from honcho.json that bust a cached gateway agent when they change.
 
-        Memoized on the file's mtime and size, so the per-message call is one stat. ``{}`` when the
+        Memoized on file identity and timestamps, so the per-message call is one stat. File
+        identity catches atomic replacements with equal size and timestamp. ``{}`` when the
         config cannot be read."""
         try:
             path = resolve_config_path()
             try:
                 stat = path.stat()
-                memo_key = (str(path), stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
+                memo_key = (str(path), stat.st_dev, stat.st_ino,
+                            stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size)
             except OSError:
-                memo_key = (str(path), None, None, None)
+                memo_key = (str(path), None, None, None, None, None)
             cached = self._identity_signature_memo.get(memo_key)
             if cached is not None:
                 return dict(cached)
