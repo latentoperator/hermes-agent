@@ -46,7 +46,10 @@ from agent.message_sanitization import (
     _sanitize_messages_surrogates, _sanitize_surrogates, _repair_tool_call_arguments,
     normalize_finish_reason as _normalize_finish_reason, sanitize_outbound_kwargs, strip_images_for_rejecting_model,
 )
-from agent.reasoning_summaries import append_streamed_reasoning_detail, separate_glued_reasoning_blocks
+from agent.reasoning_summaries import (
+    append_streamed_reasoning_detail, separate_glued_reasoning_blocks,
+    streamed_reasoning_detail_text,
+)
 from agent.repetition_guard import is_repetition_dominated
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool_lifecycle import is_persistent_env
@@ -2178,6 +2181,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None, reset_a
             agent._provider_fallback_active = True
             agent._provider_fallback_route = (str(fb_model), str(fb_provider))
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
+            from hermes_cli.observability.shared_metrics_events import record_fallback
+            record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
             # The stale-call streak measured the OLD provider; carrying it over would
             # short-circuit the fresh fallback before its first stream attempt.
             _reset_stale_streak(agent)
@@ -2325,7 +2330,8 @@ def _anthropic_summary_attempt(agent, api_messages: list, api_request_id: str):
             reasoning_config=agent.reasoning_config, is_oauth=agent._is_anthropic_oauth,
             preserve_dots=agent._anthropic_preserve_dots(), base_url=getattr(agent, "_anthropic_base_url", None))
         ant_kw = _merge_nous_portal_messages_extra_body(agent, ant_kw)
-        response = _managed_summary_call(agent, api_request_id, ant_kw, agent._anthropic_messages_create, retry_count=retry_count)
+        response = _managed_summary_call(
+            agent, api_request_id, ant_kw, agent._interruptible_api_call, retry_count=retry_count)
         return _summary_text(agent, response, strip_tool_prefix=agent._is_anthropic_oauth)
     return _attempt
 
@@ -2341,10 +2347,10 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
     sanitize_outbound_kwargs(agent, summary_kwargs)
 
     def _attempt(retry_count: int) -> str:
-        summary_client = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry" if retry_count else "iteration_limit_summary")
+        # Use the ordinary request-local lifecycle: a summary can be interrupted
+        # during a long prefill without closing the shared primary client.
         response = _managed_summary_call(
-            agent, api_request_id, summary_kwargs,
-            lambda request: summary_client.chat.completions.create(**bypass_chat_sdk_request_transform(request, summary_client)),
+            agent, api_request_id, summary_kwargs, agent._interruptible_api_call,
             retry_count=retry_count)
         return _summary_text(agent, response)
     return _attempt
@@ -2371,7 +2377,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     # Shared constant so compaction recognizers can identify this runtime nudge by its stable
     # content after SessionDB projection strips metadata flags.
     from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
-    append_message(messages, {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST})
+    nudge = append_message(messages, {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST})
 
     try:
         api_messages = _iteration_summary_api_messages(agent, messages)
@@ -2392,6 +2398,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 final_response = text
             break
 
+    except InterruptedError:
+        # Cancellation is not a summary failure: drop the unanswered nudge and let the
+        # finalizer end the turn as interrupted so the pending message is requeued.
+        summary_call_outcome = "cancelled"
+        if messages and messages[-1] is nudge:
+            messages.pop()
+        raise
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
         from agent.turn_failure_copy import site_copy
@@ -3137,6 +3150,11 @@ class _StreamingCall(StreamingWaitMonitor):
         base_timeout, read_timeout, conn_cap = self._stream_timeouts()
         content_parts: list = []
         reasoning_parts: list = []
+        # Live-display accumulator for detail-derived reasoning text: de-gluing must
+        # compare against what the display actually received, not ``reasoning_parts``
+        # (a provider that mirrors the same text in both fields would otherwise read
+        # as already-glued on the first chunk and get a spurious break).
+        detail_display_parts: list[str] = []
         # OpenAI structured refusal (``delta.refusal``): the explanation streams here and
         # ``delta.content`` stays empty, so an un-accumulated refusal looks like an empty
         # stream and burns the empty-response retries (the non-streaming fix is #46013).
@@ -3222,7 +3240,6 @@ class _StreamingCall(StreamingWaitMonitor):
                 reasoning_text = separate_glued_reasoning_blocks(
                     reasoning_parts[-1] if reasoning_parts else "", reasoning_text)
                 reasoning_parts.append(reasoning_text)
-                self._emit_reasoning(reasoning_text)
             # Structured reasoning_details deltas carry the provider's replay data; the
             # non-streaming path already keeps them, so dropping them here lost
             # reasoning continuity on nearly every turn. Pydantic parks unknown fields
@@ -3230,8 +3247,26 @@ class _StreamingCall(StreamingWaitMonitor):
             rd_delta = getattr(delta, "reasoning_details", None)
             if rd_delta is None and isinstance(getattr(delta, "model_extra", None), dict):
                 rd_delta = delta.model_extra.get("reasoning_details")
+            detail_text_parts = []
             for rd in rd_delta if isinstance(rd_delta, (list, tuple)) else ():
+                detail_text_parts.append(streamed_reasoning_detail_text(rd))
                 append_streamed_reasoning_detail(reasoning_details, rd)
+            # Details may carry the full text while ordinary reasoning is only
+            # a sparse fragment or a mirror. Deliver one representation per
+            # chunk, without rewriting either persisted/replayed field.
+            # Summary-part boundaries need the same repair the plain path applies:
+            # de-glue against the detail display's own accumulator (not
+            # ``reasoning_parts`` — with mirrored fields that would insert a
+            # spurious break on the first chunk), so the live box and the
+            # persisted ``reasoning_content`` agree.
+            detail_text = "".join(detail_text_parts)
+            if detail_text:
+                detail_text = separate_glued_reasoning_blocks(
+                    detail_display_parts[-1] if detail_display_parts else "", detail_text)
+                detail_display_parts.append(detail_text)
+            display_reasoning = detail_text or reasoning_text
+            if display_reasoning:
+                self._emit_reasoning(display_reasoning)
             # Not routed to the live display: the transport promotes a sole-payload
             # refusal to content + ``content_filter`` and the loop surfaces it terminally.
             delta_refusal = getattr(delta, "refusal", None)
@@ -3343,7 +3378,8 @@ class _StreamingCall(StreamingWaitMonitor):
                 has_truncated_tool_args = True
             mock_tool_calls.append(SimpleNamespace(
                 id=tc["id"], type=tc["type"], extra_content=tc.get("extra_content"),
-                function=SimpleNamespace(name=tc["function"]["name"], arguments=arguments)))
+                function=SimpleNamespace(name=tc["function"]["name"], arguments=arguments,
+                                         args_repaired=arguments != tc["function"]["arguments"])))
         return mock_tool_calls or None, has_truncated_tool_args
 
     def _finish_chat_stream(self, stream, role, content_parts, reasoning_parts, tool_calls_acc, finish_reason,

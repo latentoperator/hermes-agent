@@ -15,8 +15,6 @@ import base64
 import json
 import logging
 import os
-import platform
-import random
 import re
 import shutil
 import time
@@ -35,8 +33,6 @@ from agent.secret_sources.base import (
 logger = logging.getLogger(__name__)
 
 _BWS_RUN_TIMEOUT = 30
-_BWS_RATE_LIMIT_MAX_ATTEMPTS = 5
-_BWS_RATE_LIMIT_BASE_DELAY = 1.0
 
 # <hermes_home>/cache/bws_cache.json holds only secret VALUES (never the access
 # token); kept out of .env so users editing .env don't commit BSM-sourced secrets.
@@ -282,15 +278,12 @@ def _run_bws_list(bws: Path, access_token: str, project_id: str, server_url: str
     if server_url:  # empty keeps whatever BWS_SERVER_URL the shell already had
         env["BWS_SERVER_URL"] = server_url
 
-    for attempt in range(1, _BWS_RATE_LIMIT_MAX_ATTEMPTS + 1):
-        proc = run_cli(cmd, env=env, timeout=_BWS_RUN_TIMEOUT, label="bws",
-                       timeout_message=f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets")
-        if proc.returncode == 0:
-            break
+    proc = run_cli(cmd, env=env, timeout=_BWS_RUN_TIMEOUT, label="bws",
+                   timeout_message=f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets")
+
+    if proc.returncode != 0:
         err = _summarize_bws_stderr(proc.stderr or proc.stdout or "")
-        if not _is_bws_rate_limited(err) or attempt >= _BWS_RATE_LIMIT_MAX_ATTEMPTS:
-            raise RuntimeError(f"bws exited {proc.returncode}: {err[:200]}")
-        time.sleep(_bws_rate_limit_delay(attempt, err))
+        raise RuntimeError(f"bws exited {proc.returncode}: {err[:200]}")
 
     raw = proc.stdout.strip()
     if not raw:
@@ -349,8 +342,6 @@ class BitwardenSource(SecretSource):
             "override_existing": {"description": "BSM values overwrite .env/shell values", "default": True},
             "auto_install": {"description": "Auto-download the pinned bws binary", "default": True},
             "server_url": {"description": "Region / self-hosted endpoint (empty = US Cloud)", "default": ""},
-            "aliases": {"description": "Map BSM source keys to target env var names", "default": {}},
-            "include_keys": {"description": "Optional allowlist of BSM source keys to import", "default": []},
         }
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
@@ -391,16 +382,9 @@ class BitwardenSource(SecretSource):
                                 f"or belongs to another region.  ({result.error})")
             return result
 
-        result.secrets, skipped, alias_warnings = _filter_and_alias_secrets(
-            secrets,
-            aliases=_normalize_aliases(cfg.get("aliases")),
-            include_keys=_normalize_string_list(cfg.get("include_keys")),
-        )
-        result.skipped.extend(skipped)
+        result.secrets = secrets
         result.warnings.extend(warnings)
-        result.warnings.extend(alias_warnings)
         return result
-
 
 
 def clear_caches(home_path: Optional[Path] = None) -> None:
@@ -413,192 +397,3 @@ def clear_caches(home_path: Optional[Path] = None) -> None:
 
 
 _reset_cache_for_tests = clear_caches
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import stat  # noqa: F401,E402
-
-def apply_bitwarden_secrets(
-    *,
-    enabled: bool,
-    access_token_env: str = "BWS_ACCESS_TOKEN",
-    project_id: str = "",
-    override_existing: bool = False,
-    cache_ttl_seconds: float = 300,
-    auto_install: bool = True,
-    server_url: str = "",
-    home_path: Optional[Path] = None,
-    encrypted_cache_enabled: bool = False,
-    encrypted_cache_max_stale_seconds: float = 0,
-) -> FetchResult:
-    """Pull secrets from BSM and set them on ``os.environ``.
-
-    This is the function ``load_hermes_dotenv()`` calls after the .env
-    files have loaded.  It is intentionally defensive — any failure
-    returns a :class:`FetchResult` with ``error`` set; it never raises.
-
-    ``server_url`` selects the Bitwarden region or self-hosted endpoint
-    (e.g. ``https://vault.bitwarden.eu`` for EU Cloud).  Empty string
-    means use ``bws``'s default (US Cloud).
-
-    Parameters mirror the ``secrets.bitwarden.*`` config keys so the
-    caller can just splat the dict in.
-    """
-    result = FetchResult()
-
-    if not enabled:
-        return result
-
-    access_token = os.environ.get(access_token_env, "").strip()
-    if not access_token:
-        result.error = (
-            f"secrets.bitwarden.enabled is true but {access_token_env} is "
-            "not set.  Run `hermes secrets bitwarden setup`."
-        )
-        return result
-
-    if not project_id:
-        result.error = (
-            "secrets.bitwarden.project_id is empty.  "
-            "Run `hermes secrets bitwarden setup`."
-        )
-        return result
-
-    binary = find_bws(install_if_missing=auto_install)
-    result.binary_path = binary
-    if binary is None:
-        result.error = (
-            "bws binary not available and auto-install is disabled.  "
-            "Run `hermes secrets bitwarden setup` to install."
-        )
-        return result
-
-    try:
-        secrets, warnings = fetch_bitwarden_secrets(
-            access_token=access_token,
-            project_id=project_id,
-            binary=binary,
-            cache_ttl_seconds=cache_ttl_seconds,
-            server_url=server_url,
-            home_path=home_path,
-            encrypted_cache_enabled=encrypted_cache_enabled,
-            encrypted_cache_max_stale_seconds=encrypted_cache_max_stale_seconds,
-        )
-    except RuntimeError as exc:
-        result.error = str(exc)
-        return result
-
-    result.secrets = secrets
-    result.warnings.extend(warnings)
-
-    for key, value in secrets.items():
-        if key == access_token_env:
-            # Don't let BSM clobber the very token we used to fetch
-            # itself — that would be a footgun if someone stored the
-            # token as a BSM secret too.
-            result.skipped.append(key)
-            continue
-        if not override_existing and os.environ.get(key):
-            result.skipped.append(key)
-            continue
-        os.environ[key] = value
-        result.applied.append(key)
-
-    return result
-
-
-
-_PLUGIN_COMPAT_LAZY = {
-    'DiskCache': ('agent.secret_sources._cache', 'DiskCache'),
-}
-
-
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
-    target = _PLUGIN_COMPAT_LAZY.get(name)
-    if target is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    import importlib
-    from hermes_cli.plugin_compat import warn_once
-    warn_once(__name__, name, *target)
-    return getattr(importlib.import_module(target[0]), target[1])
-# ---- END PLUGIN-COMPAT ----
-
-
-def _bws_rate_limit_delay(attempt: int, message: str) -> float:
-    """Return bounded exponential backoff for BWS fleet-start throttling."""
-    retry_after = _BWS_RATE_LIMIT_BASE_DELAY
-    marker = "try again in "
-    lowered = message.lower()
-    if marker in lowered:
-        tail = lowered.split(marker, 1)[1]
-        token = tail.split()[0].rstrip("s.,")
-        try:
-            retry_after = max(retry_after, float(token))
-        except ValueError:
-            pass
-    exponential = _BWS_RATE_LIMIT_BASE_DELAY * (2 ** (attempt - 1))
-    return min(max(retry_after, exponential) + random.uniform(0.0, 0.75), 8.0)
-
-
-
-
-def _filter_and_alias_secrets(
-    secrets: Dict[str, str],
-    *,
-    aliases: Optional[Dict[str, str]] = None,
-    include_keys: Optional[List[str]] = None,
-) -> tuple[Dict[str, str], List[str], List[str]]:
-    """Apply source-key allowlisting and aliases before env application."""
-    include_set = set(include_keys or [])
-    alias_map = aliases or {}
-    filtered: Dict[str, str] = {}
-    skipped: List[str] = []
-    warnings: List[str] = []
-    for key, value in secrets.items():
-        if include_set and key not in include_set:
-            skipped.append(key)
-            continue
-        target_key = alias_map.get(key, key)
-        if not _is_valid_env_name(target_key):
-            warnings.append(
-                f"Skipping alias target {target_key!r} for {key!r}: "
-                "not a valid env-var name"
-            )
-            continue
-        filtered[target_key] = value
-    return filtered, skipped, warnings
-
-
-
-
-def _is_bws_rate_limited(message: str) -> bool:
-    lowered = message.lower()
-    return (
-        "429" in lowered
-        or "too many requests" in lowered
-        or "slow down" in lowered
-    )
-
-
-
-
-def _normalize_aliases(raw: object) -> dict[str, str]:
-    """Return valid string-to-string BSM alias mappings from config."""
-    if not isinstance(raw, dict):
-        return {}
-    return {
-        source: target
-        for source, target in raw.items()
-        if isinstance(source, str) and isinstance(target, str)
-    }
-
-
-
-
-def _normalize_string_list(raw: object) -> list[str]:
-    if not isinstance(raw, list):
-        return []
-    return [item for item in raw if isinstance(item, str)]
