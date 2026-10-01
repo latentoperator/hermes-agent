@@ -106,3 +106,21 @@ describe('skipKittyKeyboardProtocol', () => {
     }
   })
 })
+
+describe('supportsExtendedKeys', () => {
+  // Herdr only sends CSI 13;2u for Shift+Enter once the pane requests
+  // enhanced keys; without the push Shift+Enter is a bare CR (submit).
+  it('enables extended keys inside herdr panes', async () => {
+    const { env } = await import('../utils/env.js')
+    const { supportsExtendedKeys, skipKittyKeyboardProtocol } = await import('./terminal.js')
+    const saved = env.terminal
+
+    try {
+      env.terminal = 'herdr'
+      expect(supportsExtendedKeys()).toBe(true)
+      expect(skipKittyKeyboardProtocol()).toBe(false)
+    } finally {
+      env.terminal = saved
+    }
+  })
+})
