@@ -1538,9 +1538,9 @@ def check_respawn_guard(
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
+    handoff or authorized ready-resume followed the comment: the profile must
+    work on that PR). The review lane skips the last two: they are the *inputs*
+    to a review handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
     row = conn.execute(
@@ -1620,11 +1620,10 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
+    #    Exception: a handoff or authorized resume AFTER the newest PR comment
+    #    means work on THAT PR, not a duplicate implementation (#111910).
+    #    Automatic crash/TTL recovery is not authorization; explicit operator
+    #    requeues and promotions following a dependency completion are.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
@@ -1634,18 +1633,68 @@ def check_respawn_guard(
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
             continue
+        last_claim_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed'", (task_id,),
+        ).fetchone()[0]
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
-            "SELECT kind, payload FROM task_events "
+            "SELECT id, kind, payload FROM task_events "
             "WHERE task_id = ? AND created_at > ? "
-            "AND kind IN ('assigned', 'changes_requested', 'review_reopened')",
+            "AND kind IN ('assigned', 'changes_requested', 'review_reopened', "
+            "'promoted', 'promoted_manual', 'unblocked', 'status', 'reclaimed')",
             (task_id, int(c["created_at"] or 0)),
         ).fetchall()
-        if any(_is_handoff_event(e["kind"], e["payload"]) for e in events):
+        if any(
+            _is_pr_continuation_event(
+                conn, task_id, e, int(c["created_at"] or 0), last_claim_id,
+            )
+            for e in events
+        ):
             return None
         return "active_pr"
 
     return None
+
+
+def _is_pr_continuation_event(
+    conn: sqlite3.Connection, task_id: str, event: sqlite3.Row, comment_at: int,
+    last_claim_id: int,
+) -> bool:
+    """Distinguish outside authorization from the dispatcher's recovery loop.
+
+    Legacy ready ``unblocked``/``promoted`` events have null payloads. A
+    promotion alone is insufficient: an untyped failed run can auto-promote
+    too, so require a linked parent's terminal event after the PR comment and
+    before this promotion. A ready claim consumes the resume authorization;
+    a newly posted PR URL starts the guard afresh as well.
+    """
+    kind, payload = event["kind"], event["payload"]
+    if kind in ("assigned", "changes_requested", "review_reopened"):
+        return _is_handoff_event(kind, payload)
+    if event["id"] <= last_claim_id:
+        return False
+    data = {} if payload is None else _kb._json_or(payload, None)
+    if not isinstance(data, dict):
+        return False
+    if kind == "reclaimed":
+        return data.get("manual") is True and data.get("retry_status") == "ready"
+    if kind == "status":
+        return data.get("status") == "ready"
+    if kind == "promoted_manual":
+        return True
+    if data.get("status", "ready") != "ready":
+        return False
+    if kind == "unblocked":
+        return True
+    if kind == "promoted":
+        return conn.execute(
+            "SELECT 1 FROM task_links l JOIN task_events e ON e.task_id = l.parent_id "
+            "WHERE l.child_id = ? AND e.kind IN ('completed', 'archived') "
+            "AND e.created_at > ? AND e.id > ? AND e.id < ? LIMIT 1",
+            (task_id, comment_at, last_claim_id, event["id"]),
+        ).fetchone() is not None
+    return False
 
 
 def _is_handoff_event(kind: str, payload: Optional[str]) -> bool:
