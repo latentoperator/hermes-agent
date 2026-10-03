@@ -25,6 +25,7 @@ def _clear_memo():
 
 @pytest.fixture
 def home(tmp_path, monkeypatch) -> Path:
+    monkeypatch.setattr("hermes_cli.profiles._get_wrapper_dir", lambda: tmp_path / "wrappers")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text("model:\n  provider: openai\n", encoding="utf-8")
     bob = tmp_path / "profiles" / "bob"
