@@ -726,6 +726,11 @@ def cleanup_all_browsers() -> None:
     except Exception:
         pass
 
+    def _stop_harness():
+        from tools.browser_use_cli import stop_harness_daemons
+        stop_harness_daemons()
+    _best_effort("Browser Use harness daemon stop", _stop_harness)
+
     _install._discover_homebrew_node_dirs.cache_clear()
     # Clearing only browser caches can reload stale YAML after a same-size edit
     # within one filesystem timestamp tick (or a preserved-mtime config write).

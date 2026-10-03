@@ -1700,7 +1700,10 @@ export const frOverrides = {
         "Retirer tous les ensembles d'outils activés ? Cela désactive la mémoire, le terminal, la recherche web, la délégation et la plupart des autres outils jusqu'à leur réactivation.",
       keepAwakeTitle: "Garder l'ordinateur éveillé",
       keepAwakeDesc:
-        "Empêcher cette machine de se mettre en veille pendant les exécutions longues ou nocturnes. L'écran peut toujours s'obscurcir.",
+        "Empêcher cette machine de se mettre en veille. « Pendant le travail » ne s'applique que pendant qu'un tour est en cours : les exécutions nocturnes continuent sans garder le portable éveillé toute la semaine. L'écran peut toujours s'obscurcir.",
+      keepAwakeOff: 'Désactivé',
+      keepAwakeWhileWorking: 'Pendant le travail',
+      keepAwakeAlways: 'Toujours',
       disableF12Title: 'Désactiver les outils de développement avec F12',
       disableF12Desc:
         "Empêcher F12 d'ouvrir les outils de développement. Ctrl+Maj+I (ou Cmd+Option+I sur Mac) continue de fonctionner.",
@@ -4064,6 +4067,8 @@ export const frOverrides = {
       reveal: 'Afficher dans le dossier',
       copyPath: 'Copier le chemin',
       removeFromSidebar: 'Masquer de la barre latérale',
+      createdInPreviousContext:
+        "Le projet a été créé sur la connexion ou le profil précédent. Revenez-y ; IDEA.md n'a pas été écrit.",
       createFailed: 'Impossible de créer le projet',
       staleBackend:
         'Mettez à jour le backend Hermes pour créer des projets — votre backend est plus ancien que cette application de bureau (Paramètres → Mises à jour → Backend).',
@@ -4304,7 +4309,7 @@ export const frOverrides = {
       '/init': 'Générer ou mettre à jour les instructions de projet AGENTS.md à partir d’une analyse du dépôt',
       '/suggestions': 'Examiner les automatisations suggérées (accepter/ignorer)',
       '/blueprint': 'Configurer une automatisation à partir d’un modèle',
-      '/browser': 'Gérer la connexion CDP du navigateur [connect|disconnect|status] (gateway local uniquement)',
+      '/browser': 'Gérer le navigateur de l’agent [connect|disconnect|status|use]',
       '/palette': 'Ouvrir la palette de commandes floue (aussi Ctrl+P)',
       '/usage':
         'Afficher l’utilisation des jetons et les limites de débit ; `reset` utilise une réinitialisation de limite Codex en réserve',
@@ -5259,6 +5264,8 @@ export const frOverrides = {
   },
   preview: {
     tab: 'Aperçu',
+    pin: "Épingler à l'espace de travail",
+    unpin: "Détacher de l'espace de travail",
     closePane: "Fermer le panneau d'aperçu",
     loading: "Chargement de l'aperçu",
     unavailable: 'Aperçu indisponible',
@@ -5287,6 +5294,7 @@ export const frOverrides = {
     editing: 'Modification',
     unsavedChanges: 'Modifications non enregistrées',
     saveFailed: message => `Impossible d'enregistrer : ${message}`,
+    saveScopeChanged: 'Revenez à la connexion et au profil d’origine pour enregistrer ce brouillon.',
     diskChangedTitle: 'Fichier modifié sur le disque',
     diskChangedBody:
       "Ce fichier a changé depuis que vous l'avez ouvert. L'écraser avec votre version, ou abandonner vos modifications et recharger ?",
@@ -5482,6 +5490,7 @@ export const frOverrides = {
       branchNewChat: 'Créer une branche dans une nouvelle conversation',
       react: 'Réagir',
       dismissError: "Ignorer l'erreur",
+      responseStopped: 'Réponse interrompue',
       errorLayers: {
         auth: "Erreur d'authentification",
         billing: 'Crédits épuisés',
@@ -5736,6 +5745,8 @@ export const frOverrides = {
       skipped: 'Ignoré',
       noAnswer: 'Pas de réponse',
       confirmAndContinueLabel: 'Confirmer et continuer',
+      singleSelectHint: 'Choisir une réponse',
+      multiSelectHint: 'Choisir toutes les réponses qui s’appliquent',
       questionProgress: (answered, total) => `${answered} réponse${answered === 1 ? '' : 's'} sur ${total}`,
       notDelivered:
         "Cette question n'a pas atteint l'app, elle ne peut donc pas être répondue ici. Appuyez sur Arrêter pour terminer le tour, puis répondez dans le chat."

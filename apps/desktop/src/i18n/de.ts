@@ -1693,7 +1693,10 @@ export const deOverrides = {
         'Alle aktivierten Toolsets entfernen? Das deaktiviert Speicher, Terminal, Websuche, Delegation und die meisten anderen Tools, bis Sie sie wieder aktivieren.',
       keepAwakeTitle: 'Computer wach halten',
       keepAwakeDesc:
-        'Verhindert, dass dieser Rechner in den Ruhezustand wechselt, damit Läufe über Nacht oder länger weiterlaufen. Der Bildschirm kann trotzdem abdunkeln.',
+        'Verhindert, dass dieser Rechner in den Ruhezustand wechselt. „Während der Arbeit“ gilt nur, solange ein Durchlauf läuft: Läufe über Nacht laufen weiter, ohne den Laptop die ganze Woche wach zu halten. Der Bildschirm kann trotzdem abdunkeln.',
+      keepAwakeOff: 'Aus',
+      keepAwakeWhileWorking: 'Während der Arbeit',
+      keepAwakeAlways: 'Immer',
       disableF12Title: 'F12-DevTools deaktivieren',
       disableF12Desc:
         'Verhindert, dass F12 die Entwicklertools öffnet. Strg+Umschalt+I (bzw. Cmd+Opt+I auf dem Mac) funktioniert weiterhin.',
@@ -4053,6 +4056,8 @@ export const deOverrides = {
       reveal: 'Im Ordner anzeigen',
       copyPath: 'Pfad kopieren',
       removeFromSidebar: 'Aus der Sidebar ausblenden',
+      createdInPreviousContext:
+        'Das Projekt wurde auf der vorherigen Verbindung oder im vorherigen Profil erstellt. Wechsle zurück; IDEA.md wurde nicht geschrieben.',
       createFailed: 'Projekt konnte nicht erstellt werden',
       staleBackend:
         'Aktualisieren Sie das Hermes-Backend, um Projekte zu erstellen – Ihr Backend ist älter als diese Desktop-App (Einstellungen → Updates → Backend).',
@@ -4292,7 +4297,7 @@ export const deOverrides = {
       '/init': 'AGENTS.md-Projektanweisungen aus einem Repo-Scan erzeugen oder aktualisieren',
       '/suggestions': 'Vorgeschlagene Automatisierungen prüfen (annehmen/verwerfen)',
       '/blueprint': 'Eine Automatisierung aus einer Blueprint-Vorlage einrichten',
-      '/browser': 'Browser-CDP-Verbindung verwalten [connect|disconnect|status] (nur lokales Gateway)',
+      '/browser': 'Browser des Agenten verwalten [connect|disconnect|status|use]',
       '/palette': 'Die unscharfe Befehlspalette öffnen (auch Strg+P)',
       '/usage': 'Token-Nutzung und Ratenlimits anzeigen; `reset` löst ein angespartes Codex-Limit-Reset ein',
       '/subscription': 'Ihren Nous-Tarif ansehen und im Browser ändern',
@@ -5245,6 +5250,8 @@ export const deOverrides = {
   },
   preview: {
     tab: 'Vorschau',
+    pin: 'An Arbeitsbereich anheften',
+    unpin: 'Vom Arbeitsbereich lösen',
     closePane: 'Vorschau-Fenster schließen',
     loading: 'Vorschau wird geladen',
     unavailable: 'Vorschau nicht verfügbar',
@@ -5273,6 +5280,8 @@ export const deOverrides = {
     editing: 'Wird bearbeitet',
     unsavedChanges: 'Nicht gespeicherte Änderungen',
     saveFailed: message => `Speichern fehlgeschlagen: ${message}`,
+    saveScopeChanged:
+      'Wechsle zur ursprünglichen Verbindung und zum ursprünglichen Profil zurück, um diesen Entwurf zu speichern.',
     diskChangedTitle: 'Datei auf der Festplatte geändert',
     diskChangedBody:
       'Diese Datei wurde geändert, seit Sie sie geöffnet haben. Mit Ihrer Version überschreiben oder Ihre Änderungen verwerfen und neu laden?',
@@ -5464,6 +5473,7 @@ export const deOverrides = {
       branchNewChat: 'In neuem Chat abzweigen',
       react: 'Reagieren',
       dismissError: 'Fehler schließen',
+      responseStopped: 'Antwort gestoppt',
       errorLayers: {
         auth: 'Authentifizierungsfehler',
         billing: 'Keine Credits mehr',
@@ -5722,6 +5732,8 @@ export const deOverrides = {
       skipped: 'Übersprungen',
       noAnswer: 'Keine Antwort',
       confirmAndContinueLabel: 'Bestätigen und fortfahren',
+      singleSelectHint: 'Eines auswählen',
+      multiSelectHint: 'Alle Treffer auswählen',
       questionProgress: (answered, total) => `${answered} von ${total} beantwortet`,
       notDelivered:
         'Diese Frage hat die App nicht erreicht und kann hier nicht beantwortet werden. Klicken Sie auf Stopp, um den Durchgang zu beenden, und antworten Sie dann im Chat.'
