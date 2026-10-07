@@ -133,6 +133,17 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
     """
     killpg = getattr(os, "killpg", None)
     if killpg is not None:
+        getpgid = getattr(os, "getpgid", None)
+        if getpgid is not None:
+            try:
+                if getpgid(proc.pid) != proc.pid:
+                    # A live child sharing the runner's group must be stopped directly.
+                    killpg = None
+            except ProcessLookupError:
+                pass  # The leader exited; its stable group ID may still own descendants.
+            except PermissionError:
+                return
+    if killpg is not None:
         # ``start_new_session=True`` makes the spawned PID the process-group
         # ID. Keep using that stable ID after the shell/package-manager leader
         # exits; querying the dead leader with getpgid() loses its descendants.
