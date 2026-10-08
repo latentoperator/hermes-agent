@@ -1,5 +1,54 @@
 """The workspace and admission paths agree on scoped keys and disabled plugins."""
+import pytest
+
 from pm.workspace import enabled_member_dirs
+
+
+@pytest.mark.parametrize("versions", [("0.3.0", "0.3.0"), ("0.3.0", "0.3.3")])
+def test_generate_pyproject_keeps_virtual_profile_copies_independent(tmp_path, versions):
+    """A version-only canary is legal; copied virtual members stay unique for uv."""
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tomllib
+    from pm.workspace import _generate_pyproject
+
+    source = tmp_path / "core"
+    source.mkdir()
+    (source / "pyproject.toml").write_text(
+        '[project]\nname="canary-root"\nversion="1"\nrequires-python=">=3.11"\n'
+        'dependencies=[]\n[tool.uv]\npackage=false\n', encoding="utf-8")
+    plugins = []
+    originals = []
+    for profile, version in zip(("dante", "virgil"), versions):
+        plugin = tmp_path / "profiles" / profile / "plugins" / "directsdk"
+        plugin.mkdir(parents=True)
+        text = ('[project]\nname="hermes-plugin-claude-subscription-directsdk"\n'
+                f'version={json.dumps(version)}\nrequires-python=">=3.10"\ndependencies=[]\n')
+        (plugin / "pyproject.toml").write_text(text, encoding="utf-8")
+        originals.append(text)
+        plugins.append(plugin)
+    root = tmp_path / "generation"
+    _generate_pyproject(plugins, root, source=source)
+    document = tomllib.loads((root / "pyproject.toml").read_text())
+    members = document["tool"]["uv"]["workspace"]["members"]
+    assert len(members) == 2
+    projects = [tomllib.loads((root / member / "pyproject.toml").read_text())["project"]
+                for member in members]
+    assert len({project["name"] for project in projects}) == 2
+    assert sorted(project["version"] for project in projects) == sorted(versions)
+    assert all(project["dependencies"] == [] for project in projects)
+    assert [(plugin / "pyproject.toml").read_text() for plugin in plugins] == originals
+    uv = shutil.which("uv")
+    assert uv, "regression requires the installed uv runner"
+    result = subprocess.run(
+        [uv, "lock", "--offline", "--python", sys.executable], cwd=root,
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path),
+             "UV_CACHE_DIR": str(tmp_path / "uv-cache"), "UV_NO_CONFIG": "1"},
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
 
 
 def test_scoped_members_respect_disabled_and_keep_other_profiles(tmp_path, monkeypatch):

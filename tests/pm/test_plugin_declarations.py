@@ -27,7 +27,7 @@ def test_tool_only_pyproject_is_not_an_installable_plugin(tmp_path):
     assert not declaration.is_member
 
 
-def test_profile_copies_share_one_dependency_only_workspace_member(tmp_path):
+def test_profile_copies_keep_unique_dependency_only_workspace_members(tmp_path):
     core = tmp_path / "core"
     core.mkdir()
     (core / "pyproject.toml").write_text(
@@ -46,7 +46,54 @@ def test_profile_copies_share_one_dependency_only_workspace_member(tmp_path):
     workspace = tmp_path / "workspace"
     _generate_pyproject(projects, workspace, source=core)
     document = tomllib.loads((workspace / "pyproject.toml").read_text())
-    assert len(document["tool"]["uv"]["workspace"]["members"]) == 1
+    members = document["tool"]["uv"]["workspace"]["members"]
+    assert len(members) == 2
+    generated = [tomllib.loads((workspace / member / "pyproject.toml").read_text())["project"]
+                 for member in members]
+    assert len({project["name"] for project in generated}) == 2
+    assert all(project["dependencies"] == ["hindsight-client>=0.10.1,<1"] for project in generated)
+
+
+@pytest.mark.parametrize("compatible", [True, False])
+def test_virtual_profile_dependency_constraints_are_resolved_together(tmp_path, compatible):
+    core = tmp_path / "core"
+    core.mkdir()
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    for version in ("1.0", "2.0"):
+        _fixtures._wheel(wheels, "fixturedep", version)
+    (core / "pyproject.toml").write_text(
+        '[project]\nname="core"\nversion="1"\nrequires-python=">=3.11"\n'
+        '[tool.uv]\npackage=false\nno-index=true\n'
+        f'find-links=[{json.dumps(wheels.as_posix())}]\n', encoding="utf-8")
+    first = "fixturedep>=1,<3" if compatible else "fixturedep==1.0"
+    projects = []
+    for profile, spec in (("default", first), ("virgil", "fixturedep==2.0")):
+        plugin = tmp_path / profile / "plugins" / "same-plugin"
+        plugin.mkdir(parents=True)
+        (plugin / "pyproject.toml").write_text(
+            '[project]\nname="same-plugin"\nversion="1"\n'
+            f'dependencies={json.dumps([spec])}\n[tool.uv]\npackage=false\n', encoding="utf-8")
+        projects.append(plugin)
+    workspace = tmp_path / "workspace"
+    _generate_pyproject(projects, workspace, source=core)
+    uv = shutil.which("uv")
+    assert uv, "real offline resolver is required"
+    result = subprocess.run(
+        [uv, "lock", "--offline", "--no-index", "--find-links", str(wheels),
+         "--python", sys.executable], cwd=workspace,
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path),
+             "UV_CACHE_DIR": str(tmp_path / "cache"), "UV_NO_CONFIG": "1"},
+        capture_output=True, text=True, timeout=30)
+    if compatible:
+        assert result.returncode == 0, result.stderr
+        packages = tomllib.loads((workspace / "uv.lock").read_text())["package"]
+        assert any(p["name"] == "fixturedep" and p["version"] == "2.0" for p in packages)
+    else:
+        assert result.returncode != 0
+        assert "No solution found" in result.stderr
+        assert "fixturedep==1.0" in result.stderr and "fixturedep==2.0" in result.stderr
+        assert "not found in the cache" not in result.stderr
 
 
 @pytest.mark.parametrize("modern", [False, True])
