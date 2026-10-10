@@ -22,8 +22,8 @@ def _fake_multiplexer(monkeypatch, tmp_path, *, multiplex: bool, pid_file: bool 
     import json
 
     import hermes_constants
-    import gateway.status as status
-    import hermes_cli.profiles as profiles
+    from gateway import status
+    from hermes_cli import profiles
 
     monkeypatch.setattr(profiles, "_get_wrapper_dir", lambda: tmp_path / "wrappers")
 

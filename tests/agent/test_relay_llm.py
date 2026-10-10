@@ -485,7 +485,10 @@ def test_stream_uses_rewritten_request_and_post_intercept_chunks(relay_turn):
             annotated,
         )
 
-    def rewrite_stream(request, next_call):
+    def rewrite_stream(name, request, context, next_call):
+        assert name == "test-provider"
+        assert context.response_codec is None
+
         async def generate():
             upstream = await next_call(request)
             async for chunk in upstream:
@@ -898,7 +901,7 @@ def test_logical_close_skips_pop_under_concurrent_turn_scope(relay_turn):
 
     # Scope views are context-local: the turn's scopes live in the session context, so the
     # overlap and every stack assertion must be observed through that same context.
-    observe_top = lambda: lease.host.run_in_session(  # noqa: E731
+    observe_top = lambda: lease.host.run_in_session(
         lease.session, relay_runtime._current_top, relay
     )
     top_before_sibling = observe_top()
@@ -1129,7 +1132,7 @@ def test_stream_refuses_replay_after_transformed_relay_output(
 ):
     """A transformed delivered chunk consumes an unknown provider source; replaying the
     pending raw list would emit that source a second time after its transformed form."""
-    relay, turn = relay_turn
+    relay, _turn = relay_turn
     raw_chunks = [{"delta": "first"}, {"delta": "second"}]
 
     async def transform_then_fail(
@@ -1182,7 +1185,7 @@ def test_stream_does_not_replay_chunks_relay_passed_over(
 ):
     """A match at index > 0 means Relay saw and skipped the earlier chunks — they were
     suppressed, not merely pending, and the fallback must not resurrect them."""
-    relay, turn = relay_turn
+    relay, _turn = relay_turn
     raw_chunks = [{"delta": "first"}, {"delta": "second"}]
 
     async def reorder_then_fail(
@@ -1593,7 +1596,7 @@ def test_stream_current_unwraps_completed_response_with_real_interceptor(relay_t
     relay, _turn = relay_turn
     completed = _completed_response()
 
-    async def identity_stream(request, next_call):
+    async def identity_stream(_name, request, _context, next_call):
         return await next_call(request)
 
     relay.intercepts.register_llm_stream_execution(
@@ -1622,7 +1625,7 @@ def test_stream_current_preserves_real_relay_interceptor_chunks(relay_turn):
     """Priming a real managed pipeline must retain its transformed first chunk."""
     relay, _turn = relay_turn
 
-    def rewrite_stream(request, next_call):
+    def rewrite_stream(_name, request, _context, next_call):
         async def generate():
             upstream = await next_call(request)
             async for chunk in upstream:
@@ -1706,7 +1709,7 @@ def test_stream_managed_traps_direct_completed_response(relay_turn):
         session_id="session-1",
         name="test-provider",
         model_name="test-model",
-        finalizer=lambda: {},
+        finalizer=dict,
         completed_response_predicate=_choices_predicate,
     )
     stream._prime_completed_response()
@@ -1731,7 +1734,7 @@ def test_stream_current_inside_managed_callback_returns_raw(relay_turn):
             lambda inner_request: _completed_response(),
             name="moa-aggregator",
             model_name="test-model",
-            finalizer=lambda: {},
+            finalizer=dict,
             completed_response_predicate=_choices_predicate,
         )
 
@@ -1741,7 +1744,7 @@ def test_stream_current_inside_managed_callback_returns_raw(relay_turn):
         session_id="session-1",
         name="moa",
         model_name="test-model",
-        finalizer=lambda: {},
+        finalizer=dict,
         completed_response_predicate=_choices_predicate,
     )
     assert list(stream) == []
