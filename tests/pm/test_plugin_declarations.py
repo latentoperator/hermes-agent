@@ -23,8 +23,7 @@ def test_tool_only_pyproject_is_not_an_installable_plugin(tmp_path):
         '[tool.pytest.ini_options]\ntestpaths = ["tests"]\n', encoding="utf-8"
     )
     declaration = read_python_declaration(tmp_path)
-    assert declaration.pyproject is None
-    assert not declaration.is_member
+    assert not declaration.installs_packages
 
 
 def test_profile_copies_keep_unique_dependency_only_workspace_members(tmp_path):
@@ -84,7 +83,7 @@ def test_virtual_profile_dependency_constraints_are_resolved_together(tmp_path, 
          "--python", sys.executable], cwd=workspace,
         env={"PATH": os.environ["PATH"], "HOME": str(tmp_path),
              "UV_CACHE_DIR": str(tmp_path / "cache"), "UV_NO_CONFIG": "1"},
-        capture_output=True, text=True, timeout=30)
+        capture_output=True, text=True, timeout=30, check=False)
     if compatible:
         assert result.returncode == 0, result.stderr
         packages = tomllib.loads((workspace / "uv.lock").read_text())["package"]
@@ -177,3 +176,19 @@ def test_invalid_requirement_refused_at_declaration_boundary(tmp_path, modern):
     with pytest.raises(ValueError):
         read_python_declaration(tmp_path)
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(("body", "installs"), [
+    ("dependencies = []\n", False),
+    ('dependencies = ["fixturedep>=1,<2"]\n', True),
+    ('dependencies = []\n[build-system]\nrequires = ["setuptools"]\nbuild-backend = "setuptools.build_meta"\n', True),
+    ('dependencies = []\n[dependency-groups]\ndev = ["fixturedep"]\n', True),
+    ('dependencies = []\n[project.optional-dependencies]\nextra = ["fixturedep"]\n', True),
+], ids=["empty", "dependencies", "buildable", "dependency-groups", "extras"])
+def test_only_a_pyproject_that_installs_something_needs_dependency_consent(tmp_path, body, installs):
+    """``dependencies = []`` puts nothing in the environment; a buildable plugin, extras and dependency
+    groups (``uv sync --all-packages`` installs a member's default groups) still do."""
+    (tmp_path / "plugin.yaml").write_text("name: probe\n", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "probe"\nversion = "1"\n' + body, encoding="utf-8")
+    assert read_python_declaration(tmp_path).installs_packages is installs

@@ -4,53 +4,6 @@ import pytest
 from pm.workspace import enabled_member_dirs
 
 
-@pytest.mark.parametrize("versions", [("0.3.0", "0.3.0"), ("0.3.0", "0.3.3")])
-def test_generate_pyproject_keeps_virtual_profile_copies_independent(tmp_path, versions):
-    """A version-only canary is legal; copied virtual members stay unique for uv."""
-    import json
-    import os
-    import shutil
-    import subprocess
-    import sys
-    import tomllib
-    from pm.workspace import _generate_pyproject
-
-    source = tmp_path / "core"
-    source.mkdir()
-    (source / "pyproject.toml").write_text(
-        '[project]\nname="canary-root"\nversion="1"\nrequires-python=">=3.11"\n'
-        'dependencies=[]\n[tool.uv]\npackage=false\n', encoding="utf-8")
-    plugins = []
-    originals = []
-    for profile, version in zip(("dante", "virgil"), versions):
-        plugin = tmp_path / "profiles" / profile / "plugins" / "directsdk"
-        plugin.mkdir(parents=True)
-        text = ('[project]\nname="hermes-plugin-claude-subscription-directsdk"\n'
-                f'version={json.dumps(version)}\nrequires-python=">=3.10"\ndependencies=[]\n')
-        (plugin / "pyproject.toml").write_text(text, encoding="utf-8")
-        originals.append(text)
-        plugins.append(plugin)
-    root = tmp_path / "generation"
-    _generate_pyproject(plugins, root, source=source)
-    document = tomllib.loads((root / "pyproject.toml").read_text())
-    members = document["tool"]["uv"]["workspace"]["members"]
-    assert len(members) == 2
-    projects = [tomllib.loads((root / member / "pyproject.toml").read_text())["project"]
-                for member in members]
-    assert len({project["name"] for project in projects}) == 2
-    assert sorted(project["version"] for project in projects) == sorted(versions)
-    assert all(project["dependencies"] == [] for project in projects)
-    assert [(plugin / "pyproject.toml").read_text() for plugin in plugins] == originals
-    uv = shutil.which("uv")
-    assert uv, "regression requires the installed uv runner"
-    result = subprocess.run(
-        [uv, "lock", "--offline", "--python", sys.executable], cwd=root,
-        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path),
-             "UV_CACHE_DIR": str(tmp_path / "uv-cache"), "UV_NO_CONFIG": "1"},
-        capture_output=True, text=True, timeout=30)
-    assert result.returncode == 0, result.stderr
-
-
 def test_scoped_members_respect_disabled_and_keep_other_profiles(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -59,7 +12,7 @@ def test_scoped_members_respect_disabled_and_keep_other_profiles(tmp_path, monke
     other = other_home / "plugins" / "same"
     for member in (current, other):
         member.mkdir(parents=True)
-        (member / "pyproject.toml").write_text('[project]\nname="test"\nversion="1"\n')
+        (member / "pyproject.toml").write_text('[project]\nname="test"\nversion="1"\ndependencies=["requests>=2"]\n')
     (home / "config.yaml").write_text('plugins:\n  enabled: [group/plugin]\n  disabled: []\n')
     (other_home / "config.yaml").write_text('plugins:\n  enabled: [same]\n')
     assert set(enabled_member_dirs()) == {current, other}
@@ -136,3 +89,65 @@ def test_buildable_pyproject_member_keeps_its_declared_name(tmp_path):
     member = _workspace_member(plugin, root, identity=plugin)
     assert (member / "pyproject.toml").read_text(encoding="utf-8") == (
         plugin / "pyproject.toml").read_text(encoding="utf-8")
+
+
+def test_virtual_member_without_project_metadata_gets_a_version(tmp_path):
+    """A metadata-only member whose pyproject declares no [project] (lint config
+    only) is emitted as ``[project] name = …``; uv rejects a [project] table
+    without ``version`` (or ``dynamic``) at ``uv lock`` time, aborting the whole
+    update. Generated virtual members carry the same inert version plugin-deps
+    use."""
+    import tomllib
+    from pm.workspace import _workspace_member
+
+    plugin = tmp_path / "home" / "plugins" / "hermes-lcm"
+    plugin.mkdir(parents=True)
+    (plugin / "pyproject.toml").write_text('[tool.ruff]\ntarget-version = "py311"\n', encoding="utf-8")
+    root = tmp_path / "gen"
+    root.mkdir()
+    member = _workspace_member(plugin, root, identity=plugin)
+    project = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert project["version"] == "0.0.0"
+
+
+def test_virtual_member_declaring_dynamic_version_is_left_alone(tmp_path):
+    """PEP 621 forbids supplying ``project.version`` while it is listed under
+    ``project.dynamic`` ("You cannot provide a value for project.version and
+    list it under project.dynamic at the same time"). A metadata-only member
+    may legitimately declare ``dynamic = ["version"]``; the generated member
+    must not gain a static version in that case, or ``uv lock`` rejects the
+    conflicted manifest."""
+    import tomllib
+    from pm.workspace import _workspace_member
+
+    plugin = tmp_path / "home" / "plugins" / "dynver"
+    plugin.mkdir(parents=True)
+    (plugin / "pyproject.toml").write_text(
+        '[project]\nname = "dynver"\ndynamic = ["version"]\n', encoding="utf-8"
+    )
+    root = tmp_path / "gen"
+    root.mkdir()
+    member = _workspace_member(plugin, root, identity=plugin)
+    project = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert "version" not in project
+    assert project["dynamic"] == ["version"]
+
+
+def test_buildable_member_without_a_version_gets_one_and_keeps_its_name(tmp_path):
+    """uv rejects a [project] table with no version at parse time, buildable or not.
+    A buildable member still keeps its declared name (uv checks it against its backend)."""
+    import tomllib
+    from pm.workspace import _workspace_member
+
+    plugin = tmp_path / "home" / "plugins" / "noversion"
+    plugin.mkdir(parents=True)
+    (plugin / "pyproject.toml").write_text(
+        '[project]\nname = "noversion-plugin"\n'
+        '[build-system]\nrequires = []\nbuild-backend = "backend"\n',
+        encoding="utf-8",
+    )
+    root = tmp_path / "gen"
+    root.mkdir()
+    member = _workspace_member(plugin, root, identity=plugin)
+    project = tomllib.loads((member / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert project == {"name": "noversion-plugin", "version": "0.0.0"}
