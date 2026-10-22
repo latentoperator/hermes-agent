@@ -133,6 +133,17 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
         # Release age is checked when Hermes locks; users trust that lock (#135589).
         uv_policy.pop("exclude-newer", None)
         uv_policy.pop("exclude-newer-package", None)
+        # Plugin workspaces build one host's environment. Resolving every foreign
+        # platform can reject core's optional wheels and falsely blame the plugin.
+        from packaging.markers import default_environment
+
+        host = default_environment()
+        host_marker = (f"sys_platform == '{host['sys_platform']}' and "
+                       f"platform_machine == '{host['platform_machine']}'")
+        uv_policy["environments"] = [
+            f"({constraint}) and ({host_marker})" if constraint else host_marker
+            for constraint in (uv_policy.get("environments") or [""])
+        ]
         uv_policy["workspace"] = {"members": sorted(members)}
         text = tomli_w.dumps(document)
     else:
