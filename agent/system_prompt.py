@@ -566,6 +566,8 @@ def _guidance_parts(agent: Any) -> list[str]:
                 ("_parallel_tool_call_guidance", PARALLEL_TOOL_CALL_GUIDANCE),
             ) if getattr(agent, flag, True)
         ]
+        if "delegate_task" in agent.valid_tool_names and getattr(agent, "_delegation_concurrency_guidance", True):
+            parts.append(_pb.DELEGATION_CONCURRENCY_GUIDANCE)
     parts.append(_tool_guidance_block(agent))  # None/empty entries are dropped by _join_tier
     if not agent.valid_tool_names:
         return parts

@@ -421,6 +421,23 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "read a file before you can patch it). When in doubt and the calls are independent, batch them."
 )
 
+# Hopewell local: agent-level concurrency, the delegate_task analogue of the batching steer above.
+# Measured on the fleet (Oct 2026): Claude parents delegated in ~2% of substantive sessions vs ~10-70%
+# for GPT parents on the same profiles, and an identity-file rule alone did not move it; a task that
+# named its split axis did. So this names concrete split axes. Only injected when delegate_task is
+# callable; gate: config.yaml ``agent.delegation_concurrency_guidance`` (default true).
+DELEGATION_CONCURRENCY_GUIDANCE = (
+    "# Concurrency\n"
+    "Before working through a multi-part job one piece at a time, ask whether the pieces depend on each other. "
+    "If they don't, and the job is more than a few minutes of work, split it across parallel `delegate_task` "
+    "workers (or background processes for mechanical work) — the test is speed and efficiency. Natural split axes: "
+    "per client, tenant, endpoint group or alert; per skill family, subsystem, repo area or file set; per source, "
+    "vendor or option being compared; per independent check (tests, build, live-state probe) running while you "
+    "keep working. Give each worker a self-contained goal and output shape, keep integration and judgment "
+    "yourself, and verify claims that matter. Stay serial only when steps depend on each other or the job is "
+    "too small to be worth splitting."
+)
+
 # Execution-discipline guidance for models that abandon partial results, skip prerequisite lookups, answer
 # from memory, or declare "done" unverified. Body is family-agnostic (OPENAI_ prefix reflects origin).
 # Injection gate: system_prompt.py via config.yaml ``agent.execution_guidance`` (auto/true/false/list).
