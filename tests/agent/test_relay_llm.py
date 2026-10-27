@@ -316,8 +316,12 @@ def test_provider_request_process_transport_keeps_caller_headers():
     assert provider_request["extra_headers"]["x-caller"] == "kept"
 
 
-def test_is_process_transport_follows_provider_auth_type():
-    assert relay_llm._is_process_transport("copilot-acp") is True
+def test_is_process_transport_follows_provider_auth_type(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import runtime_provider_backends
+    registry = {"test-process": SimpleNamespace(auth_type="external_process")}
+    monkeypatch.setattr(runtime_provider_backends, "_rp", lambda: SimpleNamespace(PROVIDER_REGISTRY=registry))
+    assert relay_llm._is_process_transport("test-process") is True
     assert relay_llm._is_process_transport("openrouter") is False
     assert relay_llm._is_process_transport("") is False
 

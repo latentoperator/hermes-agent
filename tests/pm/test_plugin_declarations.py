@@ -43,7 +43,7 @@ def test_profile_copies_keep_unique_dependency_only_workspace_members(tmp_path):
         )
         projects.append(plugin)
     workspace = tmp_path / "workspace"
-    _generate_pyproject(projects, workspace, source=core)
+    _generate_pyproject(projects, workspace, source=core, python=Path(sys.executable))
     document = tomllib.loads((workspace / "pyproject.toml").read_text())
     members = document["tool"]["uv"]["workspace"]["members"]
     assert len(members) == 2
@@ -75,7 +75,7 @@ def test_virtual_profile_dependency_constraints_are_resolved_together(tmp_path, 
             f'dependencies={json.dumps([spec])}\n[tool.uv]\npackage=false\n', encoding="utf-8")
         projects.append(plugin)
     workspace = tmp_path / "workspace"
-    _generate_pyproject(projects, workspace, source=core)
+    _generate_pyproject(projects, workspace, source=core, python=Path(sys.executable))
     uv = shutil.which("uv")
     assert uv, "real offline resolver is required"
     result = subprocess.run(
