@@ -192,6 +192,20 @@ class TestShouldExclude:
         assert not _should_exclude(Path("scratch/node/index.js"))
         assert not _should_exclude(Path("profiles/clean/skills/x/models/a.txt"))
 
+    def test_excludes_operator_backup_and_worktree_trees_at_home_roots_only(self):
+        """``maintenance-backups/`` (operator archives) and ``worktrees/`` (whole git checkouts)
+        at HERMES_HOME or a ``profiles/<name>/`` root are not full-backup content; a skill's
+        same-named directory is user data and stays."""
+        from hermes_cli.backup import _should_exclude
+        for name in ("maintenance-backups", "worktrees"):
+            assert _should_exclude(Path(name) / "x" / "a")
+            assert _should_exclude(Path("profiles/coder") / name / "x" / "state.db")
+            assert not _should_exclude(Path("skills/example") / name / "notes.md")
+            assert not _should_exclude(Path("profiles/coder/skills/example") / name / "notes.md")
+        # Near-miss names are unaffected.
+        assert not _should_exclude(Path("worktree/notes.md"))
+        assert not _should_exclude(Path("maintenance/backups.md"))
+
     def test_excludes_desktop_emergency_state_db_baks(self):
         """The desktop updater's pre-flight drops timestamped
         state.db.pre-update-emergency-*.bak files at the HERMES_HOME root —
@@ -265,6 +279,53 @@ class TestIterBackupFiles:
             f.write_text("x")
         selected = {str(rel) for _, rel in _iter_backup_files(root, tmp_path / "out.zip")}
         assert {rel for rel in files if str(Path(rel)) in selected} == {rel for rel, keep in files.items() if keep}
+
+    def test_prunes_maintenance_backups_and_worktrees_at_home_roots_only(self, tmp_path):
+        """The walk itself must prune root ``maintenance-backups/`` and ``worktrees/`` (often
+        large bind mounts) before descending, at HERMES_HOME and each ``profiles/<name>/``;
+        same-named directories deeper in a skill are kept."""
+        from hermes_cli.backup import _iter_backup_files
+
+        root = tmp_path / ".hermes"
+        root.mkdir()
+        files = {
+            "maintenance-backups/x/a": False,
+            "worktrees/wt1/b": False,
+            "worktrees/wt1/.git": False,
+            "profiles/coder/maintenance-backups/x/a": False,
+            "profiles/coder/worktrees/wt1/b": False,
+            "skills/example/worktrees/notes.md": True,
+            "skills/example/maintenance-backups/notes.md": True,
+            "profiles/coder/skills/example/worktrees/notes.md": True,
+            "profiles/coder/config.yaml": True,
+            "config.yaml": True,
+        }
+        for rel in files:
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text("x")
+
+        walked: list[str] = []
+        real_walk = os.walk
+
+        def _spy_walk(top, *a, **kw):
+            for entry in real_walk(top, *a, **kw):
+                walked.append(entry[0])
+                yield entry
+
+        skipped: set = set()
+        with patch("hermes_cli.backup.os.walk", _spy_walk):
+            selected = {str(rel).replace(os.sep, "/")
+                        for _, rel in _iter_backup_files(root, tmp_path / "out.zip", skipped)}
+
+        assert selected == {rel for rel, keep in files.items() if keep}
+        pruned = {str(Path(p)) for p in ("maintenance-backups", "worktrees",
+                                         "profiles/coder/maintenance-backups", "profiles/coder/worktrees")}
+        assert pruned <= skipped
+        # Pruned, not merely filtered: os.walk never entered them.
+        assert not any(Path(p).relative_to(root).parts[:1] in (("maintenance-backups",), ("worktrees",))
+                       for p in walked)
+        assert not any(Path(p).relative_to(root).parts[2:3] in (("maintenance-backups",), ("worktrees",))
+                       and Path(p).relative_to(root).parts[:1] == ("profiles",) for p in walked)
 
     def test_prunes_regenerable_caches_but_keeps_durable_and_nested(self, tmp_path):
         from hermes_cli.backup import _iter_backup_files
@@ -391,6 +452,66 @@ class TestBackup:
         assert result is not None
         assert staged_dirs, "no SQLite snapshot was staged"
         assert all(d == str(out_zip.parent) for d in staged_dirs), staged_dirs
+
+    def test_full_and_pre_update_archives_omit_root_worktrees_and_maintenance_backups(
+            self, tmp_path, monkeypatch):
+        """Both real archive writers (``hermes backup`` and the pre-update full zip) ship the same
+        member set: root/profile-root ``worktrees/`` and ``maintenance-backups/`` are absent —
+        including SQLite DBs inside them, which are never opened for a snapshot — while a skill's
+        same-named directory and the live state.db are archived."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        for rel in ("worktrees/wt1/kanban.db", "maintenance-backups/2026-10-01/state.db",
+                    "profiles/coder/worktrees/wt1/notes.md",
+                    "profiles/coder/maintenance-backups/x/state.db"):
+            path = hermes_home / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.suffix == ".db":
+                with sqlite3.connect(path) as conn:
+                    conn.execute("CREATE TABLE t (v TEXT)")
+            else:
+                path.write_text("x")
+        (hermes_home / "skills/my-skill/worktrees").mkdir(parents=True)
+        (hermes_home / "skills/my-skill/worktrees/README.md").write_text("skill data\n")
+        with sqlite3.connect(hermes_home / "state.db") as conn:
+            conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+        # run_backup's memory-provider lookup (load_config -> ensure_hermes_home) seeds a missing
+        # SOUL.md after its walk; pre-seed so both writers see one tree.
+        (hermes_home / "SOUL.md").write_text("# test soul\n")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        import hermes_cli.backup as backup_mod
+        snapshotted: list[str] = []
+        real_snapshot = backup_mod._zip_sqlite_snapshot
+
+        def _spy_snapshot(zf, abs_path, rel_path, *a, **kw):
+            snapshotted.append(Path(rel_path).as_posix())
+            return real_snapshot(zf, abs_path, rel_path, *a, **kw)
+
+        monkeypatch.setattr(backup_mod, "_zip_sqlite_snapshot", _spy_snapshot)
+
+        cli_zip = tmp_path / "cli.zip"
+        assert backup_mod.run_backup(Namespace(output=str(cli_zip))) is True
+        pre_zip = tmp_path / "pre-update.zip"
+        assert backup_mod._write_full_zip_backup(pre_zip, hermes_home) == pre_zip
+
+        def _members(zip_path: Path) -> set:
+            with zipfile.ZipFile(zip_path) as zf:
+                return set(zf.namelist())
+
+        cli_names, pre_names = _members(cli_zip), _members(pre_zip)
+        assert cli_names == pre_names
+        for names in (cli_names, pre_names):
+            assert not any(n.split("/")[0] in ("worktrees", "maintenance-backups") for n in names), names
+            assert not any(n.startswith(("profiles/coder/worktrees/", "profiles/coder/maintenance-backups/"))
+                           for n in names), names
+            assert "skills/my-skill/worktrees/README.md" in names
+            assert "state.db" in names
+        assert not any("worktrees/" in s or "maintenance-backups/" in s for s in snapshotted), snapshotted
+        assert "state.db" in snapshotted
 
 
 

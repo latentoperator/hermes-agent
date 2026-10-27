@@ -852,6 +852,7 @@ The full backup excludes:
 
 - The source checkout, dependency environments, and downloaded tools, models, and runtimes.
 - Build caches, checkpoints, previous backups, and quick snapshots.
+- Root-level `maintenance-backups/` and `worktrees/` (in `~/.hermes` and each profile root). Uncommitted work in those git worktrees is not in the archive — commit and push or `git bundle` it before migrating.
 - Browser profiles, including copies of real-browser credentials.
 - Bytecode, SQLite sidecars, `gateway.pid`, `cron.pid`, and `.backup.lock`.
 

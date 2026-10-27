@@ -640,7 +640,9 @@ source uninstaller. Data deletion is separate from package removal.
 :::tip Moving to a new machine rather than leaving?
 Run `hermes backup` before you remove the installation. The full archive includes
 credentials but excludes downloaded runtimes, dependency environments, caches,
-and browser profiles. Review its skipped-file report before you delete source data.
+browser profiles, and root-level `worktrees/` and `maintenance-backups/` — push or
+bundle any uncommitted worktree changes separately. Review its skipped-file report
+before you delete source data.
 `hermes profile export` packs one profile without credentials.
 See [`hermes backup` vs `hermes profile export`](../reference/faq.md#hermes-backup-vs-hermes-profile-export).
 :::
