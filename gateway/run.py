@@ -3978,6 +3978,8 @@ class GatewayRunner(
         in a ``finally`` block.
         """
         from gateway.session_context import build_action_approval_source, set_session_vars
+        from gateway.session_detached import session_env_source
+        source = session_env_source(self, context.source)
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
         # background=True) know whether this channel can wake a later turn.
@@ -3986,16 +3988,10 @@ class GatewayRunner(
         # bare runners built via object.__new__ (tests) without self.adapters
         # don't blow up — they simply default to supported.
         _adapters = getattr(self, "adapters", None) or {}
-        _adapter = _adapters.get(context.source.platform)
+        _adapter = _adapters.get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        effective_message_id = (
-            str(message_id)
-            if message_id is not None
-            else str(
-                context.message_id
-                or context.source.message_id
-                or ""
-            )
+        effective_message_id = "" if source is not context.source else str(
+            message_id if message_id is not None else (context.message_id or source.message_id or "")
         )
         effective_action_approval = (
             context.allow_action_approval
@@ -4004,15 +4000,15 @@ class GatewayRunner(
         )
         action_approval_source = (
             build_action_approval_source(
-                platform=context.source.platform.value,
-                user_id=str(context.source.user_id or ""),
-                scope_id=str(getattr(context.source, "scope_id", "") or ""),
-                chat_id=str(context.source.chat_id or ""),
-                thread_id=str(context.source.thread_id or ""),
+                platform=source.platform.value,
+                user_id=str(source.user_id or ""),
+                scope_id=str(getattr(source, "scope_id", "") or ""),
+                chat_id=str(source.chat_id or ""),
+                thread_id=str(source.thread_id or ""),
                 message_id=effective_message_id,
                 session_id=context.session_id,
             )
-            if effective_action_approval
+            if effective_action_approval and source is context.source
             else ""
         )
         # #98619: an admitted API turn carries its session-id provenance in the admission settings,
@@ -4020,23 +4016,23 @@ class GatewayRunner(
         from gateway.session_api_turn import api_session_vars
         _history_delivery = api_session_vars().get("session_history_delivery")
         return set_session_vars(
-            platform=context.source.platform.value,
-            chat_id=context.source.chat_id,
+            platform=source.platform.value,
+            chat_id=source.chat_id,
             chat_type=(
-                str(context.source.chat_type) if context.source.chat_type else ""
+                str(source.chat_type) if source.chat_type else ""
             ),
-            chat_name=context.source.chat_name or "",
-            thread_id=str(context.source.thread_id) if context.source.thread_id else "",
-            user_id=str(context.source.user_id) if context.source.user_id else "",
-            user_id_alt=str(context.source.user_id_alt) if context.source.user_id_alt else "",
-            user_name=str(context.source.user_name) if context.source.user_name else "",
-            scope_id=str(getattr(context.source, "scope_id", "") or ""),
-            parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
+            chat_name=source.chat_name or "",
+            thread_id=str(source.thread_id) if source.thread_id else "",
+            user_id=str(source.user_id) if source.user_id else "",
+            user_id_alt=str(source.user_id_alt) if source.user_id_alt else "",
+            user_name=str(source.user_name) if source.user_name else "",
+            scope_id=str(getattr(source, "scope_id", "") or ""),
+            parent_chat_id=str(getattr(source, "parent_chat_id", "") or ""),
             session_key=context.session_key,
             session_id=context.session_id or "",
             message_id=effective_message_id,
             action_approval_source=action_approval_source,
-            profile=getattr(context.source, "profile", "") or "",
+            profile=getattr(source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="", session_history_delivery=_history_delivery)
 
@@ -5200,9 +5196,8 @@ def main():
 
     config = None
     if args.config:
-        import hermes_yaml as yaml
-        with open(args.config, encoding="utf-8-sig") as f:
-            config = GatewayConfig.from_dict(yaml.safe_load(f) or {})
+        from gateway.config_loader import load_gateway_config_file
+        config = load_gateway_config_file(args.config)
         # Same boot-time verdict the loaded config gets when the file leaves the flag unset.
         from hermes_cli.gateway_multiplex_mode import log_multiplex_decision, resolve_multiplex_mode
         log_multiplex_decision(resolve_multiplex_mode(config))
