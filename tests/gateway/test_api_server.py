@@ -1000,6 +1000,16 @@ class TestSkillsEndpoint:
                     assert set(entry.keys()) >= {"name", "description", "category"}
 
 
+    @pytest.mark.asyncio
+    async def test_skills_call_matches_real_find_all_skills_signature(self, adapter):
+        # A mock with return_value accepts any kwargs; autospec binds the real signature so a
+        # stale keyword (e.g. include_editorial after a revert) fails here instead of in prod.
+        with patch("tools.skills_tool.find_all_skills", autospec=True, return_value=[]):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/skills")
+                assert resp.status == 200, await resp.text()
+
 class TestToolsetsEndpoint:
     @pytest.mark.asyncio
     async def test_toolsets_returns_resolved_tools(self, adapter):

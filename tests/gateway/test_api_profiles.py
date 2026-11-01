@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import json
 import pytest
 import pytest_asyncio
 from aiohttp import web
@@ -177,6 +178,21 @@ async def test_yaml_dates_in_ui_meta_do_not_break_the_roster(served, client):
     rows = {row["name"]: row for row in (await response.json())["profiles"]}
     assert rows["shared"]["ui_meta"] == {"anniversary": "2026-01-01"}
     assert "default" in rows
+
+
+@pytest.mark.asyncio
+async def test_yaml_infinity_in_ui_meta_never_emits_non_json(served, client):
+    # YAML 1.1 reads an unquoted ``20260815_082954_e43295`` as float inf; Infinity is not JSON,
+    # and a browser's response.json() rejects the whole roster over one field.
+    (served["shared"] / "profile.yaml").write_text(
+        "ui_meta:\n  hermes-bots:\n    chat: 20260815_082954_e43295\n", encoding="utf-8")
+    resp = await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))
+    assert resp.status == 200
+    body = await resp.text()
+    assert "Infinity" not in body and "NaN" not in body
+    json.loads(body, parse_constant=lambda c: pytest.fail(f"non-JSON constant {c}"))
+    rows = {row["name"]: row for row in json.loads(body)["profiles"]}
+    assert "shared" in rows and "ui_meta" not in rows["shared"]
 
 
 @pytest.mark.asyncio

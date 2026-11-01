@@ -218,7 +218,9 @@ def _json_safe(ui_meta: dict) -> dict | None:
     """``ui_meta`` normalized to exactly what will be sent (YAML dates etc. become strings), or
     None when it cannot be represented or exceeds the cap. One bad row never breaks the roster."""
     try:
-        encoded = json.dumps(ui_meta, default=str)
+        # allow_nan=False: YAML can yield inf/nan (e.g. an unquoted id like 2026_..._e43295), and
+        # Infinity/NaN are not JSON, so browsers would reject the whole roster.
+        encoded = json.dumps(ui_meta, default=str, allow_nan=False)
     except (TypeError, ValueError, RecursionError):
         return None
     if len(encoded) > _UI_META_MAX_BYTES:
