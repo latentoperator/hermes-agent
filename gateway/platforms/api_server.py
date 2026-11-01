@@ -1526,11 +1526,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     async def _handle_profile_ingress(self, request: web.Request) -> web.StreamResponse:
         """``/p/<profile>/<tail>`` → the served profile's shared-listener adapter (already scoped by the
-        prefix middleware); a profile with no adapter for the path is a 404, never the default's."""
+        prefix middleware); a profile with no adapter for the path is a 404, never the default's.
+        ``/api/plugins/...`` first tries the named profile's OWN plugin routes."""
+        from gateway.platforms.api_server_profile_plugins import dispatch_profile_plugin_route
         from gateway.platforms.shared_ingress import dispatch_profile_ingress
-        return await dispatch_profile_ingress(
-            self.gateway_runner, _api_request_profile.get(), request.match_info.get("tail", ""), request,
-            scoped=True)
+        profile, tail = _api_request_profile.get(), request.match_info.get("tail", "")
+        response = await dispatch_profile_plugin_route(self, profile, tail, request)
+        if response is not None:
+            return response
+        return await dispatch_profile_ingress(self.gateway_runner, profile, tail, request, scoped=True)
 
     def _make_profile_prefix_middleware(self):
         """Reject unknown /p/<profile>/ prefixes and scope the request home."""
@@ -4000,6 +4004,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
             # Plugin-registered native handlers, wired before AppRunner.setup() freezes the router.
             self._wire_plugin_handlers(self._app)
+            from gateway.platforms import api_server_profile_plugins as _profile_plugins
+            self._app.on_response_prepare.append(_profile_plugins.make_response_prepare_relay(self))
+            _profile_plugins.reopen_profile_plugin_apps(self)
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
 # Bind directly instead of probing 127.0.0.1 first — the old single-family pre-probe raced the
@@ -4069,6 +4076,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         files, #37011).
         """
         self._mark_disconnected()
+        from gateway.platforms import api_server_profile_plugins as _profile_plugins
+        _profile_plugins.begin_closing_profile_plugin_apps(self)
         # getattr: disconnect() tolerates bare __new__ fixtures (pinned in test_api_server_run_idempotency).
         routed = getattr(self, "_response_stores", {})
         stores = [s for s in (getattr(self, "_response_store", None), *list(routed.values())) if s is not None]
@@ -4088,6 +4097,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await self._runner.cleanup()
                 self._runner = None
         finally:
+            # After the listener drained: no request still runs on a per-profile plugin app.
+            await _profile_plugins.close_profile_plugin_apps(self)
             _api_runs._close_run_state(self)  # after site.stop(): no late request re-mints the executor
             self._close_cached_session_dbs()
             self._app = None
