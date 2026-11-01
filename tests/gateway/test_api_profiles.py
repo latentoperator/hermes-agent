@@ -8,6 +8,7 @@ Being served by the multiplexer is not authorization.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -109,10 +110,15 @@ async def test_listener_key_sees_only_profiles_that_accept_it(client):
 
 @pytest.mark.asyncio
 async def test_shared_key_reentering_root_or_default_gains_nothing(client):
-    for path in ("/v1/profiles", "/p/default/v1/profiles", "/p/shared/v1/profiles"):
+    expected = {
+        "/v1/profiles": {"default", "shared"},
+        "/p/default/v1/profiles": {"default", "shared"},
+        "/p/shared/v1/profiles": {"shared"},
+    }
+    for path, names in expected.items():
         response = await client.get(path, headers=_auth(DEFAULT_KEY))
         assert response.status == 200
-        assert {row["name"] for row in (await response.json())["profiles"]} <= {"default", "shared"}
+        assert {row["name"] for row in (await response.json())["profiles"]} == names
 
 
 @pytest.mark.asyncio
@@ -192,7 +198,7 @@ async def test_profile_key_cannot_fetch_another_profiles_avatar(client):
     ("/p/worker/v1/profiles", OTHER_KEY),
     ("/v1/profiles/worker/avatar", "x" * 32),
 ])
-async def test_wrong_key_is_refused_before_anything_is_read(client, path, key):
+async def test_wrong_key_is_refused(client, path, key):
     assert (await client.get(path, headers=_auth(key))).status == 401
 
 
@@ -220,3 +226,96 @@ def test_capabilities_advertise_the_roster():
     assert mod._STATIC_FEATURE_FLAGS["profile_roster"] is True
     names = {name for name, _ in mod._CAPABILITY_ENDPOINTS}
     assert {"profiles", "profile_avatar"} <= names
+
+
+def _swap_after_assets_open(monkeypatch, action):
+    """Run *action* right after ``assets`` is opened by descriptor, before the avatar is opened."""
+    import os
+
+    real_open = os.open
+
+    def spy(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if path == "assets" and kwargs.get("dir_fd") is not None:
+            action()
+        return fd
+
+    monkeypatch.setattr(os, "open", spy)
+
+
+@pytest.mark.asyncio
+async def test_assets_dir_swapped_after_open_cannot_redirect_the_read(served, client, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "avatar.png").write_bytes(b"OUTSIDE BYTES")
+    assets = served["shared"] / "assets"
+
+    def swap():
+        assets.rename(served["shared"] / "assets-old")
+        assets.symlink_to(outside, target_is_directory=True)
+
+    _swap_after_assets_open(monkeypatch, swap)
+    response = await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))
+    body = await response.read()
+    assert b"OUTSIDE BYTES" not in body
+    assert response.status == 200 and body == PNG
+
+
+@pytest.mark.asyncio
+async def test_avatar_swapped_for_fifo_does_not_block(served, client, monkeypatch):
+    import asyncio
+    import os
+
+    avatar = served["shared"] / "assets" / "avatar.png"
+
+    def swap():
+        avatar.unlink()
+        os.mkfifo(avatar)
+
+    _swap_after_assets_open(monkeypatch, swap)
+    response = await asyncio.wait_for(
+        client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY)), timeout=5)
+    assert response.status == 404
+
+
+@pytest.mark.asyncio
+async def test_roster_uses_the_routes_key_resolution_for_overriding_sources(served, client, monkeypatch):
+    """An external source that overrides a profile's .env key (or is cold) must be resolved
+    exactly as the /p/<profile>/ scope resolves it, so the roster and the route agree."""
+    from gateway import run
+
+    real = run._load_profile_secret_scope
+    external = "e" * 32
+
+    def loader(home):
+        scope = dict(real(home))
+        if home.name == "shared":
+            scope["API_SERVER_KEY"] = external  # source overrides the local listener-equal key
+        return scope
+
+    monkeypatch.setattr(run, "_load_profile_secret_scope", loader)
+    listed = {r["name"] for r in (await (await client.get(
+        "/v1/profiles", headers=_auth(DEFAULT_KEY))).json())["profiles"]}
+    assert listed == {"default"}
+    assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 404
+    assert (await client.get("/p/shared/v1/profiles", headers=_auth(DEFAULT_KEY))).status == 401
+    assert (await client.get("/p/shared/v1/profiles", headers=_auth(external))).status == 200
+
+
+@pytest.mark.asyncio
+async def test_roster_key_resolution_failure_fails_closed(served, client, monkeypatch):
+    from gateway import run
+
+    real = run._load_profile_secret_scope
+
+    named = {Path(h) for n, h in served.items() if n != "default"}
+
+    def broken(home):
+        if Path(home) in named:  # the request's own default scope still loads
+            raise RuntimeError("source unavailable")
+        return real(home)
+
+    monkeypatch.setattr(run, "_load_profile_secret_scope", broken)
+    response = await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))
+    assert response.status == 200
+    assert {r["name"] for r in (await response.json())["profiles"]} == {"default"}

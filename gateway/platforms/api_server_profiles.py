@@ -7,8 +7,9 @@ Hermes Browser Extension, Open WebUI, scripts) can reach ``/p/<profile>/`` for e
 but has no way to learn which profiles exist or how to draw them.
 
 This module serves that roster over the credential those clients already hold. It is
-read-only, lists only profiles this listener serves (the same set ``/p/<profile>/``
-accepts), and never exposes filesystem paths, secrets or sessions.
+read-only and lists a profile only when the presented key is the one that profile's own
+``/p/<profile>/`` route accepts. It does not select paths, credentials or sessions into the
+response; ``description`` and ``ui_meta`` are free-form user-authored text returned as written.
 """
 
 from __future__ import annotations
@@ -61,16 +62,21 @@ def _presented_token(request: web.Request) -> str:
 def _profile_key(self, name: str, home: Path) -> str:
     """The usable API_SERVER_KEY that ``/p/<name>/`` would accept, or "" (fail closed).
 
-    Built from the profile's own ``.env`` plus already-hydrated external sources, without
-    triggering a fresh external-source hydration and without touching ``os.environ``."""
+    Resolved through the same loader the ``/p/<name>/`` prefix scope uses
+    (``gateway.run._load_profile_secret_scope``: hydrate the profile's external secret
+    sources, then build its scope), so the roster and the route agree even when an external
+    source overrides the profile's ``.env`` or has not been hydrated yet. Hydration is cached
+    per home; this runs off the event loop and only after the caller authenticated."""
     from hermes_cli.auth import has_usable_secret
     if name == "default":
         key = getattr(self, "_api_key", "") or ""
     else:
         try:
-            from tui_gateway.launch_profile_policy import owner_secret_scope
-            key = owner_secret_scope(home).get("API_SERVER_KEY", "") or ""
-        except Exception as exc:
+            from gateway.run import _load_profile_secret_scope
+            key = _load_profile_secret_scope(Path(home)).get("API_SERVER_KEY", "") or ""
+        except BaseException as exc:  # ConfigBackendUnavailable is a SystemExit: fail closed, not crash
+            if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
+                raise
             logger.warning("Roster: cannot resolve API key for profile %r: %s", name, type(exc).__name__)
             return ""
     return key if has_usable_secret(key, min_length=16) else ""
@@ -119,44 +125,77 @@ def _ui_meta(home: Path) -> tuple[dict, dict]:
     return ui_meta, revisions
 
 
-def _avatar_file(home: Path) -> tuple[Path, str] | None:
-    """The profile's avatar: a regular, non-symlink file directly under a non-symlink ``assets/``."""
-    import stat as _stat
-    assets = home / "assets"
-    try:
-        if not _stat.S_ISDIR(assets.lstat().st_mode):
-            return None
-    except OSError:
-        return None
-    for ext, mime in _AVATAR_TYPES:
-        candidate = assets / f"avatar.{ext}"
-        try:
-            if _stat.S_ISREG(candidate.lstat().st_mode):
-                return candidate, mime
-        except OSError:
-            continue
-    return None
+def _open_avatar(home: Path) -> tuple[int, str] | None:
+    """Open the profile's avatar as ``(fd, mime)``; the caller closes ``fd``.
 
-
-def _read_avatar(path: Path) -> bytes | None:
-    """Read at most the cap without following a symlink swapped in after discovery."""
+    Traversal is descriptor-relative so nothing validated can be swapped afterwards:
+    ``assets`` is opened with ``O_DIRECTORY|O_NOFOLLOW`` relative to the profile directory,
+    and the avatar is opened relative to that descriptor with ``O_NOFOLLOW|O_NONBLOCK``
+    (a FIFO opens without blocking), then accepted only if ``fstat`` says regular file."""
     import os
     import stat as _stat
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
+        home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | cloexec)
     except OSError:
         return None
     try:
-        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+        try:
+            assets_fd = os.open("assets", os.O_RDONLY | os.O_DIRECTORY | nofollow | cloexec, dir_fd=home_fd)
+        except OSError:
             return None
-        with os.fdopen(fd, "rb") as handle:
-            fd = -1
-            data = handle.read(_AVATAR_MAX_BYTES + 1)
+        try:
+            for ext, mime in _AVATAR_TYPES:
+                try:
+                    fd = os.open(f"avatar.{ext}", os.O_RDONLY | nofollow | os.O_NONBLOCK | cloexec,
+                                 dir_fd=assets_fd)
+                except OSError:
+                    continue
+                try:
+                    if _stat.S_ISREG(os.fstat(fd).st_mode):
+                        result, fd = (fd, mime), -1
+                        return result
+                finally:
+                    if fd != -1:
+                        os.close(fd)
+            return None
+        finally:
+            os.close(assets_fd)
     finally:
-        if fd != -1:
-            os.close(fd)
-    return data if len(data) <= _AVATAR_MAX_BYTES else None
+        os.close(home_fd)
+
+
+def _has_avatar(home: Path) -> bool:
+    import os
+    opened = _open_avatar(home)
+    if opened is None:
+        return False
+    os.close(opened[0])
+    return True
+
+
+def _read_avatar(home: Path) -> tuple[bytes, str] | None:
+    """The avatar bytes and MIME type, reading at most the cap plus one byte."""
+    import os
+    opened = _open_avatar(home)
+    if opened is None:
+        return None
+    fd, mime = opened
+    try:
+        chunks, remaining = [], _AVATAR_MAX_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65_536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    data = b"".join(chunks)
+    return (data, mime) if len(data) <= _AVATAR_MAX_BYTES else None
 
 
 def _json_safe(ui_meta: dict) -> dict | None:
@@ -190,7 +229,7 @@ def _build_roster(self, token: str = "") -> list[dict[str, Any]]:
             "description": info.description or "",
             "display_name": info.display_name or "",
             "skill_count": int(info.skill_count or 0),
-            "has_avatar": _avatar_file(home) is not None,
+            "has_avatar": _has_avatar(home),
             "ui_meta_revisions": revisions}
         safe_meta = _json_safe(ui_meta) if ui_meta else None
         if safe_meta:
@@ -228,16 +267,8 @@ async def _handle_profile_avatar(self, request: web.Request) -> web.Response:
     if home is None:
         return _json_error("Unknown profile.", 404, "profile_not_found")
 
-    def read() -> tuple[bytes, str] | None:
-        found = _avatar_file(home)
-        if found is None:
-            return None
-        path, mime = found
-        body = _read_avatar(path)
-        return (body, mime) if body is not None else None
-
     try:
-        result = await asyncio.to_thread(read)
+        result = await asyncio.to_thread(_read_avatar, home)
     except OSError:
         result = None
     if result is None:
