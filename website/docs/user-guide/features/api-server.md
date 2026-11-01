@@ -775,9 +775,9 @@ curl http://localhost:8642/v1/profiles/default/avatar \
   -H "Authorization: Bearer $API_SERVER_KEY" --output avatar.png
 ```
 
-**Who sees what.** The listener's own `API_SERVER_KEY` sees every profile the listener serves. A request made through `/p/<profile>/` with that profile's own key sees only that profile, and `/p/<profile>/v1/profiles/<other>/avatar` is a 404. One profile's key never reveals that another profile exists.
+**Who sees what.** A key sees exactly the profiles whose own `/p/<profile>/` route would accept it. The listener's `API_SERVER_KEY` lists `default` plus any named profile configured with that same key; a profile with no key, or a different key, is never listed and its avatar is a 404. A request made through `/p/<profile>/` sees only that profile. Being served by the multiplexer is not authorization, so one key never reveals a profile it cannot already reach.
 
-**What is never returned.** Filesystem paths, credentials, sessions, skill names and environment values. The dashboard's `/api/profiles` is the richer, same-origin surface; this endpoint is the smaller one for clients that hold only the API-server credential. `ui_meta` is the free-form block Desktop and the browser extension store in `profile.yaml`; a row whose `ui_meta` is larger than 64 KB omits it, and a roster is capped at 1,000 profiles.
+**What is not selected into the response.** Filesystem paths, credentials, sessions, skill names and environment values. `description` and `ui_meta` are free-form, user-authored text and are returned as written, so keep secrets out of them. Avatars are served only from a regular, non-symlinked file under a non-symlinked `assets/` directory, up to 2 MB. The dashboard's `/api/profiles` is the richer, same-origin surface; this endpoint is the smaller one for clients that hold only the API-server credential. `ui_meta` is the free-form block Desktop and the browser extension store in `profile.yaml`; a row whose `ui_meta` is larger than 64 KB omits it, and a roster is capped at 1,000 profiles.
 
 Support is advertised as `features.profile_roster` and under `endpoints.profiles` / `endpoints.profile_avatar` in `/v1/capabilities`, so a client can detect it instead of probing for a 404.
 

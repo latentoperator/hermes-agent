@@ -2,7 +2,8 @@
 
 Exercises the real route table behind the real profile-prefix middleware with distinct
 default and named-profile keys, because the boundary that matters is *who may learn which
-profiles exist*: the listener's key sees the roster, a profile's own key sees only itself.
+profiles exist*: a key sees exactly the profiles whose own ``/p/<profile>/`` route accepts it.
+Being served by the multiplexer is not authorization.
 """
 
 from __future__ import annotations
@@ -55,11 +56,14 @@ def _reset_multiplex():
 
 @pytest.fixture
 def served(tmp_path, monkeypatch):
-    """Three served profiles; ``default`` and ``worker`` carry a bot title, ``worker`` and ``other`` an avatar."""
+    """Served profiles: ``shared`` reuses the listener key, ``worker``/``other`` have their own keys,
+    ``nokey`` has none. ``default``, ``worker`` carry a bot title; several carry an avatar."""
     homes = {
         "default": _profile(tmp_path, "default", ui_meta={"title": "Hermes"}),
+        "shared": _profile(tmp_path, "shared", key=DEFAULT_KEY, ui_meta={"title": "Shared"}, avatar=True),
         "worker": _profile(tmp_path, "worker", key=WORKER_KEY, ui_meta={"title": "Worker"}, avatar=True),
         "other": _profile(tmp_path, "other", key=OTHER_KEY, avatar=True),
+        "nokey": _profile(tmp_path, "nokey", avatar=True),
     }
     monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve", lambda multiplex=False: list(homes.items()))
     monkeypatch.setattr("hermes_cli.profiles.get_profile_dir", lambda name: homes[name])
@@ -90,17 +94,72 @@ def _auth(key):
 
 
 @pytest.mark.asyncio
-async def test_listener_key_sees_every_served_profile(client):
+async def test_listener_key_sees_only_profiles_that_accept_it(client):
     response = await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))
     assert response.status == 200
     payload = await response.json()
     assert payload["object"] == "list"
     rows = {row["name"]: row for row in payload["profiles"]}
-    assert set(rows) == {"default", "worker", "other"}
+    # No-key and different-key profiles stay invisible to the listener key.
+    assert set(rows) == {"default", "shared"}
     assert rows["default"]["is_default"] is True
-    assert rows["worker"]["has_avatar"] is True and rows["default"]["has_avatar"] is False
-    assert rows["worker"]["ui_meta"] == {"title": "Worker"}
-    assert "ui_meta" not in rows["other"]
+    assert rows["shared"]["has_avatar"] is True and rows["default"]["has_avatar"] is False
+    assert rows["shared"]["ui_meta"] == {"title": "Shared"}
+
+
+@pytest.mark.asyncio
+async def test_shared_key_reentering_root_or_default_gains_nothing(client):
+    for path in ("/v1/profiles", "/p/default/v1/profiles", "/p/shared/v1/profiles"):
+        response = await client.get(path, headers=_auth(DEFAULT_KEY))
+        assert response.status == 200
+        assert {row["name"] for row in (await response.json())["profiles"]} <= {"default", "shared"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["nokey", "worker", "other"])
+async def test_listener_key_cannot_read_unauthorized_avatars(client, name):
+    for path in (f"/v1/profiles/{name}/avatar", f"/p/default/v1/profiles/{name}/avatar"):
+        assert (await client.get(path, headers=_auth(DEFAULT_KEY))).status == 404
+
+
+@pytest.mark.asyncio
+async def test_avatar_symlink_is_not_followed(served, client, tmp_path):
+    secret = tmp_path / "outside.txt"
+    secret.write_text("not an avatar")
+    avatar = served["shared"] / "assets" / "avatar.png"
+    avatar.unlink()
+    avatar.symlink_to(secret)
+    response = await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))
+    assert response.status == 404
+    assert b"not an avatar" not in await response.read()
+    rows = {r["name"]: r for r in (await (await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))).json())["profiles"]}
+    assert rows["shared"]["has_avatar"] is False
+
+
+@pytest.mark.asyncio
+async def test_symlinked_assets_dir_is_not_followed(served, client, tmp_path):
+    import shutil
+
+    elsewhere = tmp_path / "elsewhere"
+    shutil.move(str(served["shared"] / "assets"), str(elsewhere))
+    (served["shared"] / "assets").symlink_to(elsewhere, target_is_directory=True)
+    assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 404
+
+
+@pytest.mark.asyncio
+async def test_oversized_avatar_is_refused(served, client):
+    (served["shared"] / "assets" / "avatar.png").write_bytes(b"x" * 2_000_001)
+    assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 404
+
+
+@pytest.mark.asyncio
+async def test_yaml_dates_in_ui_meta_do_not_break_the_roster(served, client):
+    (served["shared"] / "profile.yaml").write_text("ui_meta:\n  anniversary: 2026-01-01\n", encoding="utf-8")
+    response = await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))
+    assert response.status == 200
+    rows = {row["name"]: row for row in (await response.json())["profiles"]}
+    assert rows["shared"]["ui_meta"] == {"anniversary": "2026-01-01"}
+    assert "default" in rows
 
 
 @pytest.mark.asyncio
@@ -139,7 +198,7 @@ async def test_wrong_key_is_refused_before_anything_is_read(client, path, key):
 
 @pytest.mark.asyncio
 async def test_avatar_errors_are_404_not_500(client):
-    for name in ("default", "nope", "..%2f..%2fetc"):
+    for name in ("default", "nope", "nokey", "..%2f..%2fetc"):
         response = await client.get(f"/v1/profiles/{name}/avatar", headers=_auth(DEFAULT_KEY))
         assert response.status == 404
 
@@ -148,11 +207,11 @@ async def test_avatar_errors_are_404_not_500(client):
 async def test_oversized_ui_meta_is_dropped_not_served(served, client):
     import hermes_yaml as yaml
 
-    (served["worker"] / "profile.yaml").write_text(
+    (served["shared"] / "profile.yaml").write_text(
         yaml.safe_dump({"ui_meta": {"blob": "x" * 70_000}}), encoding="utf-8")
     response = await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))
     rows = {row["name"]: row for row in (await response.json())["profiles"]}
-    assert "ui_meta" not in rows["worker"]
+    assert "ui_meta" not in rows["shared"]
 
 
 def test_capabilities_advertise_the_roster():
