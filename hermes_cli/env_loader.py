@@ -174,22 +174,6 @@ def get_secret_source_values(hermes_home: str | os.PathLike) -> dict[str, str]:
     return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(str(Path(hermes_home).resolve()), {}))
 
 
-def secret_sources_settled(hermes_home: str | os.PathLike) -> bool:
-    """True when ``hermes_home``'s external secret sources need no further hydration: it has no
-    ``secrets:`` config, or a previous :func:`hydrate_profile_secret_sources` fully applied it.
-
-    Lock-free and never fetches, so request paths can ask "is this profile's credential final?"
-    without waiting on ``_SECRET_SOURCE_CACHE_LOCK`` (held across slow source fetches). A home
-    whose sources are cold or last failed (retryable) reports False."""
-    home = Path(hermes_home)
-    if str(home.resolve()) in _APPLIED_HOMES:
-        return True
-    try:
-        return not _load_secrets_config(home)
-    except Exception:
-        return False
-
-
 def hydrate_profile_secret_sources(hermes_home: str | os.PathLike) -> dict[str, str]:
     """Resolve one profile's configured sources without mutating ``os.environ``: multiplex gateways route
     turns to profiles that never ran the process-global dotenv path, so resolve against a private mapping

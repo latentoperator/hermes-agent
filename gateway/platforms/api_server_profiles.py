@@ -6,10 +6,16 @@ on an owner-only control socket. A client that holds just the API-server credent
 Hermes Browser Extension, Open WebUI, scripts) can reach ``/p/<profile>/`` for each profile
 but has no way to learn which profiles exist or how to draw them.
 
-This module serves that roster over the credential those clients already hold. It is
-read-only and lists a profile only when the presented key is the one that profile's own
-``/p/<profile>/`` route accepts. It does not select paths, credentials or sessions into the
-response; ``description`` and ``ui_meta`` are free-form user-authored text returned as written.
+This module serves that roster over the credential those clients already hold. Visibility is
+an explicit operator decision, never inferred from secret resolution:
+
+- the listener's own key (unprefixed or ``/p/default/``) sees ``default`` plus the served
+  profiles named in ``gateway.api_server.roster_profiles`` (default: none);
+- a named ``/p/<profile>/`` request, already authenticated with that profile's own key, sees
+  only that profile.
+
+It is read-only and does not select paths, credentials or sessions into the response;
+``description`` and ``ui_meta`` are free-form user-authored text returned as written.
 """
 
 from __future__ import annotations
@@ -54,67 +60,55 @@ def _json_error(message: str, status: int, code: str) -> web.Response:
         {"error": {"message": message, "type": "invalid_request_error", "code": code}}, status=status)
 
 
-def _presented_token(request: web.Request) -> str:
-    header = request.headers.get("Authorization", "")
-    return header[7:].strip() if header.startswith("Bearer ") else ""
+def _roster_allowlist() -> frozenset[str]:
+    """Named profiles the listener key may see: ``gateway.api_server.roster_profiles``.
 
-
-def _profile_key(self, name: str, home: Path) -> str:
-    """The usable API_SERVER_KEY that ``/p/<name>/`` would accept, or "" (fail closed).
-
-    Built by ``owner_secret_scope`` -- the same builder the ``/p/<name>/`` scope uses after
-    hydration -- but only once the profile's external secret sources are settled (no sources,
-    or fully hydrated; the gateway hydrates every served profile at startup). A cold or
-    last-failed profile is omitted rather than hydrated here: hydration holds a process-wide
-    lock across slow fetches that the synchronous prefix middleware also takes, so fanning it
-    out from a roster request could stall the event loop. Never fetches; never takes that lock.
-    Resolution exceptions omit the row; an outage that the route itself tolerates (a failed
-    source with a local fallback) is reflected as "not settled", i.e. omitted."""
-    from hermes_cli.auth import has_usable_secret
-    if name == "default":
-        key = getattr(self, "_api_key", "") or ""
-    else:
+    Read from the listener's (default) config. Anything other than a list of strings -- or an
+    unreadable config -- yields the empty set (fail closed: only ``default`` is listed)."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        raw = cfg_get(load_config(), "gateway", "api_server", "roster_profiles", default=None)
+    except BaseException as exc:  # ConfigBackendUnavailable is a SystemExit: fail closed, not crash
+        if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
+            raise
+        logger.warning("Roster: cannot read gateway.api_server.roster_profiles: %s", type(exc).__name__)
+        return frozenset()
+    if not isinstance(raw, list):
+        if raw is not None:
+            logger.warning("Roster: gateway.api_server.roster_profiles must be a list; listing default only")
+        return frozenset()
+    from hermes_cli.profiles import normalize_profile_name
+    names = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
         try:
-            from hermes_cli.env_loader import secret_sources_settled
-            if not secret_sources_settled(home):
-                return ""
-            from tui_gateway.launch_profile_policy import owner_secret_scope
-            key = owner_secret_scope(Path(home)).get("API_SERVER_KEY", "") or ""
-        except BaseException as exc:  # ConfigBackendUnavailable is a SystemExit: omit, not crash
-            if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
-                raise
-            logger.warning("Roster: cannot resolve API key for profile %r: %s", name, type(exc).__name__)
-            return ""
-    return key if has_usable_secret(key, min_length=16) else ""
+            names.add(normalize_profile_name(item))
+        except ValueError:
+            continue
+    names.discard("default")
+    return frozenset(names)
 
 
-def _served(self, token: str = "", only: str | None = None) -> dict[str, Path]:
-    """``{profile name: home}`` the presented credential is authorized for.
+def _served(self, only: str | None = None) -> dict[str, Path]:
+    """``{profile name: home}`` this already-authenticated request may see.
 
-    A profile is listed only when the caller's key is the key its own ``/p/<profile>/`` route
-    accepts, so the roster never reveals a profile the same key could not already reach.
-    Being served by the multiplexer is not authorization."""
-    import hmac
+    Named ``/p/<profile>/`` requests passed ``_check_auth`` against that profile's own key and
+    see only that profile. Unprefixed and ``/p/default/`` requests passed it against the
+    listener key and see ``default`` plus the operator's ``roster_profiles`` allowlist. Being
+    served by the multiplexer is never authorization on its own."""
     from hermes_cli.profiles import profiles_to_serve
     runner = getattr(self, "gateway_runner", None)
     multiplex = bool(getattr(getattr(runner, "config", None), "multiplex_profiles", False))
     served = {name: Path(home) for name, home in profiles_to_serve(multiplex=multiplex)}
-    if only is not None:  # avatar: resolve just the requested profile, never its siblings
+    if only is not None:  # avatar: consider just the requested profile
         served = {name: home for name, home in served.items() if name == only}
     from gateway.platforms.api_server import _api_request_profile
     scoped = _api_request_profile.get()
     if scoped and scoped != "default":
-        # Already authenticated by _check_auth against this profile's own key.
         return {name: home for name, home in served.items() if name == scoped}
-    if not token:
-        return {}
-    presented = token.encode()
-    allowed: dict[str, Path] = {}
-    for name, home in served.items():
-        key = _profile_key(self, name, home)
-        if key and hmac.compare_digest(presented, key.encode()):
-            allowed[name] = home
-    return allowed
+    visible = {"default"} | _roster_allowlist()
+    return {name: home for name, home in served.items() if name in visible}
 
 
 def _ui_meta(home: Path) -> tuple[dict, dict]:
@@ -218,9 +212,9 @@ def _json_safe(ui_meta: dict) -> dict | None:
     return json.loads(encoded)
 
 
-def _build_roster(self, token: str = "") -> list[dict[str, Any]]:
+def _build_roster(self) -> list[dict[str, Any]]:
     from hermes_cli.profiles import list_profiles
-    served = _served(self, token)
+    served = _served(self)
     if not served:
         return []
     rows: list[dict[str, Any]] = []
@@ -254,7 +248,7 @@ async def _handle_profiles(self, request: web.Request) -> web.Response:
     if auth_err:
         return auth_err
     try:
-        rows = await asyncio.to_thread(_build_roster, self, _presented_token(request))
+        rows = await asyncio.to_thread(_build_roster, self)
     except Exception:
         logger.exception("GET /v1/profiles failed")
         return _json_error("Failed to list profiles.", 500, "profiles_failed")
@@ -271,7 +265,7 @@ async def _handle_profile_avatar(self, request: web.Request) -> web.Response:
         name = normalize_profile_name(request.match_info.get("name", ""))
     except ValueError:
         return _json_error("Unknown profile.", 404, "profile_not_found")
-    home = (await asyncio.to_thread(_served, self, _presented_token(request), name)).get(name)
+    home = (await asyncio.to_thread(_served, self, name)).get(name)
     if home is None:
         return _json_error("Unknown profile.", 404, "profile_not_found")
 

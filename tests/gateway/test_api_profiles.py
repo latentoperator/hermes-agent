@@ -2,7 +2,8 @@
 
 Exercises the real route table behind the real profile-prefix middleware with distinct
 default and named-profile keys, because the boundary that matters is *who may learn which
-profiles exist*: a key sees exactly the profiles whose own ``/p/<profile>/`` route accepts it.
+profiles exist*: the listener key sees ``default`` plus the operator's explicit
+``gateway.api_server.roster_profiles`` allowlist; a profile's own key sees only itself.
 Being served by the multiplexer is not authorization.
 """
 
@@ -72,7 +73,14 @@ def served(tmp_path, monkeypatch):
         "hermes_cli.profiles.list_profiles",
         lambda lazy_skill_count=False: [_info(n, n == "default") for n in homes],
     )
+    _allow(monkeypatch, ["shared"])
     return homes
+
+
+def _allow(monkeypatch, value):
+    """Set gateway.api_server.roster_profiles as the listener config would."""
+    cfg = {"gateway": {"api_server": {"roster_profiles": value}}}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: cfg)
 
 
 @pytest_asyncio.fixture
@@ -95,13 +103,13 @@ def _auth(key):
 
 
 @pytest.mark.asyncio
-async def test_listener_key_sees_only_profiles_that_accept_it(client):
+async def test_listener_key_sees_default_plus_allowlist_only(client):
     response = await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))
     assert response.status == 200
     payload = await response.json()
     assert payload["object"] == "list"
     rows = {row["name"]: row for row in payload["profiles"]}
-    # No-key and different-key profiles stay invisible to the listener key.
+    # Profiles outside the allowlist stay invisible, whatever their keys.
     assert set(rows) == {"default", "shared"}
     assert rows["default"]["is_default"] is True
     assert rows["shared"]["has_avatar"] is True and rows["default"]["has_avatar"] is False
@@ -291,87 +299,61 @@ async def test_avatar_swapped_for_fifo_does_not_block(served, client, monkeypatc
     assert response.status == 404
 
 
-def _mark_hydrated(home, values):
-    from hermes_cli import env_loader
-
-    key = str(Path(home).resolve())
-    env_loader._APPLIED_HOMES.add(key)
-    env_loader._SECRET_SOURCE_VALUES_BY_HOME[key] = dict(values)
-
-
 @pytest.mark.asyncio
-async def test_roster_and_route_agree_when_a_source_overrides_the_key(served, client):
-    """A hydrated external source that overrides the profile's .env key decides both the
-    roster and the route."""
-    from hermes_cli import env_loader
-
-    external = "e" * 32
-    _mark_hydrated(served["shared"], {"API_SERVER_KEY": external})
-    try:
-        listed = {r["name"] for r in (await (await client.get(
-            "/v1/profiles", headers=_auth(DEFAULT_KEY))).json())["profiles"]}
-        assert listed == {"default"}
-        assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 404
-        assert (await client.get("/p/shared/v1/profiles", headers=_auth(DEFAULT_KEY))).status == 401
-        assert (await client.get("/p/shared/v1/profiles", headers=_auth(external))).status == 200
-    finally:
-        env_loader.reset_secret_source_cache(served["shared"])
-
-
-@pytest.mark.asyncio
-async def test_cold_profile_is_omitted_and_never_hydrated_by_the_roster(served, client, monkeypatch):
-    """A profile whose secret sources are configured but not yet hydrated (or last failed) is
-    omitted, and the roster/avatar path never starts a hydration for it."""
-    from hermes_cli import env_loader
-
-    (served["shared"] / "config.yaml").write_text("secrets:\n  bitwarden:\n    enabled: true\n", encoding="utf-8")
-    hydrated = []
-    real = env_loader._hydrate_profile_secret_sources
-
-    def spy(home):
-        hydrated.append(Path(home).resolve())
-        if Path(home).resolve() == Path(served["shared"]).resolve():
-            raise AssertionError("roster must not hydrate a sibling profile")
-        return real(home)
-
-    monkeypatch.setattr(env_loader, "_hydrate_profile_secret_sources", spy)
-    listed = {r["name"] for r in (await (await client.get(
-        "/v1/profiles", headers=_auth(DEFAULT_KEY))).json())["profiles"]}
-    assert listed == {"default"}
-    assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 404
-    assert Path(served["shared"]).resolve() not in hydrated
-
-
-@pytest.mark.asyncio
-async def test_avatar_resolves_only_the_requested_profile(served, client, monkeypatch):
-    from tui_gateway import launch_profile_policy
-
-    seen = []
-    real = launch_profile_policy.owner_secret_scope
-
-    def spy(home):
-        seen.append(Path(home).name)
-        return real(home)
-
-    monkeypatch.setattr(launch_profile_policy, "owner_secret_scope", spy)
-    assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 200
-    assert "shared" in seen
-    assert not {"worker", "other", "nokey"} & set(seen)  # siblings are never resolved
-
-
-@pytest.mark.asyncio
-async def test_roster_key_resolution_failure_fails_closed(served, client, monkeypatch):
-    from tui_gateway import launch_profile_policy
-
-    named = {Path(h).resolve() for n, h in served.items() if n != "default"}
-    real = launch_profile_policy.owner_secret_scope
-
-    def broken(home):
-        if Path(home).resolve() in named:
-            raise RuntimeError("source unavailable")
-        return real(home)
-
-    monkeypatch.setattr(launch_profile_policy, "owner_secret_scope", broken)
+@pytest.mark.parametrize("value", [None, [], "shared", {"shared": True}, [1, None], ["default"]])
+async def test_missing_or_malformed_allowlist_lists_default_only(served, client, monkeypatch, value):
+    _allow(monkeypatch, value)
     response = await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))
     assert response.status == 200
     assert {r["name"] for r in (await response.json())["profiles"]} == {"default"}
+    assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 404
+
+
+@pytest.mark.asyncio
+async def test_unreadable_config_fails_closed(served, client, monkeypatch):
+    def boom(*a, **k):
+        raise SystemExit("config backend unavailable")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", boom)
+    response = await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))
+    assert response.status == 200
+    assert {r["name"] for r in (await response.json())["profiles"]} == {"default"}
+
+
+@pytest.mark.asyncio
+async def test_allowlist_names_only_served_profiles(served, client, monkeypatch):
+    _allow(monkeypatch, ["shared", "ghost", "WORKER"])
+    rows = {r["name"] for r in (await (await client.get(
+        "/v1/profiles", headers=_auth(DEFAULT_KEY))).json())["profiles"]}
+    assert rows == {"default", "shared", "worker"}  # names are normalized; unknown names ignored
+    assert (await client.get("/v1/profiles/ghost/avatar", headers=_auth(DEFAULT_KEY))).status == 404
+
+
+@pytest.mark.asyncio
+async def test_roster_never_resolves_secrets(served, client, monkeypatch):
+    """Visibility is configuration, not secret resolution: no hydration, no scope building."""
+    from hermes_cli import env_loader
+    from tui_gateway import launch_profile_policy
+
+    calls = []
+    monkeypatch.setattr(env_loader, "_hydrate_profile_secret_sources",
+                        lambda home: calls.append(("hydrate", Path(home).name)) or {})
+    real_owner = launch_profile_policy.owner_secret_scope
+
+    def owner(home):
+        calls.append(("owner", Path(home).name))
+        return real_owner(home)
+
+    monkeypatch.setattr(launch_profile_policy, "owner_secret_scope", owner)
+    assert (await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))).status == 200
+    assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 200
+    named = {"shared", "worker", "other", "nokey"}
+    assert not [c for c in calls if c[1] in named]
+
+
+@pytest.mark.asyncio
+async def test_named_prefix_still_sees_only_itself_even_if_allowlisted(served, client, monkeypatch):
+    _allow(monkeypatch, ["shared", "worker", "other", "nokey"])
+    response = await client.get("/p/worker/v1/profiles", headers=_auth(WORKER_KEY))
+    assert [r["name"] for r in (await response.json())["profiles"]] == ["worker"]
+    assert (await client.get("/p/worker/v1/profiles/other/avatar", headers=_auth(WORKER_KEY))).status == 404

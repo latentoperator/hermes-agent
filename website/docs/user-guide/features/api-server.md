@@ -775,7 +775,15 @@ curl http://localhost:8642/v1/profiles/default/avatar \
   -H "Authorization: Bearer $API_SERVER_KEY" --output avatar.png
 ```
 
-**Who sees what.** A key sees exactly the profiles whose own `/p/<profile>/` route would accept it. The listener's `API_SERVER_KEY` lists `default` plus any named profile configured with that same key; a profile with no key, or a different key, is never listed and its avatar is a 404. A request made through a named `/p/<profile>/` prefix sees only that profile; `/p/default/` behaves like the unprefixed listener. Keys are resolved with the same builder each profile's own route uses, including external secret sources; a profile whose external sources are not yet hydrated (or last failed) is omitted until they settle, and resolution errors omit the row. Being served by the multiplexer is not authorization, so one key never reveals a profile it cannot already reach.
+**Who sees what.** Visibility is an explicit setting, never inferred from keys. The listener's `API_SERVER_KEY` (unprefixed or `/p/default/`) sees `default` plus the served profiles you name in `gateway.api_server.roster_profiles`; nothing else is listed and other avatars are a 404. A request through a named `/p/<profile>/` prefix, authenticated with that profile's own key, sees only that profile.
+
+```yaml
+gateway:
+  api_server:
+    roster_profiles: [wren, dante, virgil]   # default: [] (only "default" is listed)
+```
+
+Listing a profile here only reveals its roster row and avatar to holders of the listener key; it does not grant `/p/<profile>/` access, which still requires that profile's own key. A missing, malformed or unreadable setting lists `default` only.
 
 **What is not selected into the response.** Filesystem paths, credentials, sessions, skill names and environment values. `description` and `ui_meta` are free-form, user-authored text and are returned as written, so keep secrets out of them. Avatars are served only from a regular, non-symlinked file under a non-symlinked `assets/` directory (opened descriptor-relative, so neither can be swapped mid-request), up to 2 MB. The dashboard's `/api/profiles` is the richer, same-origin surface; this endpoint is the smaller one for clients that hold only the API-server credential. `ui_meta` is the free-form block Desktop and the browser extension store in `profile.yaml`; a row whose `ui_meta` is larger than 64 KB omits it, and a roster is capped at 1,000 profiles.
 
