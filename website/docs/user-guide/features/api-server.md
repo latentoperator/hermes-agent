@@ -783,7 +783,7 @@ gateway:
     roster_profiles: [wren, dante, virgil]   # default: [] (only "default" is listed)
 ```
 
-Listing a profile here only reveals its roster row and avatar to holders of the listener key; it does not grant `/p/<profile>/` access, which still requires that profile's own key. A missing, malformed or unreadable setting lists `default` only.
+Listing a profile here only reveals its roster row and avatar to holders of the listener key; it does not grant `/p/<profile>/` access, which still requires that profile's own key. A missing or malformed setting (including any non-string or empty entry, which rejects the whole list) or an unreadable `config.yaml` lists `default` only; a last-known-good copy is never used for this decision.
 
 **What is not selected into the response.** Filesystem paths, credentials, sessions, skill names and environment values. `description` and `ui_meta` are free-form, user-authored text and are returned as written, so keep secrets out of them. Avatars are served only from a regular, non-symlinked file under a non-symlinked `assets/` directory (opened descriptor-relative, so neither can be swapped mid-request), up to 2 MB. The dashboard's `/api/profiles` is the richer, same-origin surface; this endpoint is the smaller one for clients that hold only the API-server credential. `ui_meta` is the free-form block Desktop and the browser extension store in `profile.yaml`; a row whose `ui_meta` is larger than 64 KB omits it, and a roster is capped at 1,000 profiles.
 

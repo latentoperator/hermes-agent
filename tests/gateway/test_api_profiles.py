@@ -18,6 +18,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from agent import secret_scope as ss
+from hermes_cli import config as _config_mod
+
+_REAL_LOAD_CONFIG = _config_mod.load_config
 from gateway.config import GatewayConfig, PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 
@@ -300,7 +303,9 @@ async def test_avatar_swapped_for_fifo_does_not_block(served, client, monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("value", [None, [], "shared", {"shared": True}, [1, None], ["default"]])
+@pytest.mark.parametrize("value", [
+    None, [], "shared", {"shared": True}, [1, None], ["default"],
+    ["shared", 1], ["shared", None], ["shared", ""], ["shared", "  "]])
 async def test_missing_or_malformed_allowlist_lists_default_only(served, client, monkeypatch, value):
     _allow(monkeypatch, value)
     response = await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))
@@ -357,3 +362,48 @@ async def test_named_prefix_still_sees_only_itself_even_if_allowlisted(served, c
     response = await client.get("/p/worker/v1/profiles", headers=_auth(WORKER_KEY))
     assert [r["name"] for r in (await response.json())["profiles"]] == ["worker"]
     assert (await client.get("/p/worker/v1/profiles/other/avatar", headers=_auth(WORKER_KEY))).status == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["", "/p/default"])
+async def test_failed_config_read_fallback_never_authorizes(served, client, monkeypatch, prefix):
+    """load_config may return a FailedConfigRead carrying a stale/last-known-good allowlist."""
+    from hermes_cli.config_read_errors import FailedConfigRead
+
+    stale = FailedConfigRead({"gateway": {"api_server": {"roster_profiles": ["shared"]}}},
+                             error=OSError("EIO"))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: stale)
+    rows = {r["name"] for r in (await (await client.get(
+        f"{prefix}/v1/profiles", headers=_auth(DEFAULT_KEY))).json())["profiles"]}
+    assert rows == {"default"}
+    assert (await client.get(f"{prefix}/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix", ["", "/p/default"])
+async def test_real_loader_corrupted_config_revokes_visibility(served, client, monkeypatch, prefix):
+    """With the real loader: a good allowlist works, then corrupting config.yaml (warm cache,
+    last-known-good available) must list default only rather than the remembered allowlist."""
+    from hermes_constants import get_hermes_home
+
+    monkeypatch.setattr("hermes_cli.config.load_config", _REAL_LOAD_CONFIG)
+    homes = {Path(get_hermes_home()), Path(served["default"])}
+    for home in homes:
+        (home / "config.yaml").write_text(
+            "gateway:\n  api_server:\n    roster_profiles: [shared]\n", encoding="utf-8")
+    rows = {r["name"] for r in (await (await client.get(
+        f"{prefix}/v1/profiles", headers=_auth(DEFAULT_KEY))).json())["profiles"]}
+    assert rows == {"default", "shared"}
+
+    import os
+    import time
+
+    for home in homes:
+        path = home / "config.yaml"
+        path.write_text("gateway: [\n", encoding="utf-8")
+        later = time.time() + 5
+        os.utime(path, (later, later))
+    rows = {r["name"] for r in (await (await client.get(
+        f"{prefix}/v1/profiles", headers=_auth(DEFAULT_KEY))).json())["profiles"]}
+    assert rows == {"default"}
+    assert (await client.get(f"{prefix}/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 404

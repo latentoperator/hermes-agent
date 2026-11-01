@@ -10,7 +10,8 @@ This module serves that roster over the credential those clients already hold. V
 an explicit operator decision, never inferred from secret resolution:
 
 - the listener's own key (unprefixed or ``/p/default/``) sees ``default`` plus the served
-  profiles named in ``gateway.api_server.roster_profiles`` (default: none);
+  profiles named in ``gateway.api_server.roster_profiles`` (default: none; any unreadable
+  config or invalid entry lists ``default`` only);
 - a named ``/p/<profile>/`` request, already authenticated with that profile's own key, sees
   only that profile.
 
@@ -63,29 +64,42 @@ def _json_error(message: str, status: int, code: str) -> web.Response:
 def _roster_allowlist() -> frozenset[str]:
     """Named profiles the listener key may see: ``gateway.api_server.roster_profiles``.
 
-    Read from the listener's (default) config. Anything other than a list of strings -- or an
-    unreadable config -- yields the empty set (fail closed: only ``default`` is listed)."""
+    Read from the listener's (default) config. Fails closed to the empty set (only ``default``
+    is listed) when the config cannot be read authoritatively -- an exception, or the
+    ``FailedConfigRead`` fallback ``load_config`` serves for an unreadable/malformed file (which
+    may carry a stale or last-known-good allowlist) -- or when the setting is not a list whose
+    every item is a valid profile-name string. Partial lists are rejected whole."""
     try:
         from hermes_cli.config import cfg_get, load_config
-        raw = cfg_get(load_config(), "gateway", "api_server", "roster_profiles", default=None)
+        from hermes_cli.config_read_errors import FailedConfigRead
+        config = load_config()
+        if isinstance(config, FailedConfigRead):
+            logger.warning("Roster: config could not be read authoritatively; listing default only")
+            return frozenset()
+        raw = cfg_get(config, "gateway", "api_server", "roster_profiles", default=None)
     except BaseException as exc:  # ConfigBackendUnavailable is a SystemExit: fail closed, not crash
         if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
             raise
         logger.warning("Roster: cannot read gateway.api_server.roster_profiles: %s", type(exc).__name__)
         return frozenset()
+    if raw is None:
+        return frozenset()
     if not isinstance(raw, list):
-        if raw is not None:
-            logger.warning("Roster: gateway.api_server.roster_profiles must be a list; listing default only")
+        logger.warning("Roster: gateway.api_server.roster_profiles must be a list; listing default only")
         return frozenset()
     from hermes_cli.profiles import normalize_profile_name
     names = set()
     for item in raw:
-        if not isinstance(item, str):
-            continue
         try:
-            names.add(normalize_profile_name(item))
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(item)
+            name = normalize_profile_name(item)
+            if not name:
+                raise ValueError(item)
         except ValueError:
-            continue
+            logger.warning("Roster: gateway.api_server.roster_profiles has an invalid entry; listing default only")
+            return frozenset()
+        names.add(name)
     names.discard("default")
     return frozenset(names)
 
