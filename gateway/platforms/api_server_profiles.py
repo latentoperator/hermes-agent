@@ -62,19 +62,25 @@ def _presented_token(request: web.Request) -> str:
 def _profile_key(self, name: str, home: Path) -> str:
     """The usable API_SERVER_KEY that ``/p/<name>/`` would accept, or "" (fail closed).
 
-    Resolved through the same loader the ``/p/<name>/`` prefix scope uses
-    (``gateway.run._load_profile_secret_scope``: hydrate the profile's external secret
-    sources, then build its scope), so the roster and the route agree even when an external
-    source overrides the profile's ``.env`` or has not been hydrated yet. Hydration is cached
-    per home; this runs off the event loop and only after the caller authenticated."""
+    Built by ``owner_secret_scope`` -- the same builder the ``/p/<name>/`` scope uses after
+    hydration -- but only once the profile's external secret sources are settled (no sources,
+    or fully hydrated; the gateway hydrates every served profile at startup). A cold or
+    last-failed profile is omitted rather than hydrated here: hydration holds a process-wide
+    lock across slow fetches that the synchronous prefix middleware also takes, so fanning it
+    out from a roster request could stall the event loop. Never fetches; never takes that lock.
+    Resolution exceptions omit the row; an outage that the route itself tolerates (a failed
+    source with a local fallback) is reflected as "not settled", i.e. omitted."""
     from hermes_cli.auth import has_usable_secret
     if name == "default":
         key = getattr(self, "_api_key", "") or ""
     else:
         try:
-            from gateway.run import _load_profile_secret_scope
-            key = _load_profile_secret_scope(Path(home)).get("API_SERVER_KEY", "") or ""
-        except BaseException as exc:  # ConfigBackendUnavailable is a SystemExit: fail closed, not crash
+            from hermes_cli.env_loader import secret_sources_settled
+            if not secret_sources_settled(home):
+                return ""
+            from tui_gateway.launch_profile_policy import owner_secret_scope
+            key = owner_secret_scope(Path(home)).get("API_SERVER_KEY", "") or ""
+        except BaseException as exc:  # ConfigBackendUnavailable is a SystemExit: omit, not crash
             if isinstance(exc, (KeyboardInterrupt, GeneratorExit)):
                 raise
             logger.warning("Roster: cannot resolve API key for profile %r: %s", name, type(exc).__name__)
@@ -82,7 +88,7 @@ def _profile_key(self, name: str, home: Path) -> str:
     return key if has_usable_secret(key, min_length=16) else ""
 
 
-def _served(self, token: str = "") -> dict[str, Path]:
+def _served(self, token: str = "", only: str | None = None) -> dict[str, Path]:
     """``{profile name: home}`` the presented credential is authorized for.
 
     A profile is listed only when the caller's key is the key its own ``/p/<profile>/`` route
@@ -93,6 +99,8 @@ def _served(self, token: str = "") -> dict[str, Path]:
     runner = getattr(self, "gateway_runner", None)
     multiplex = bool(getattr(getattr(runner, "config", None), "multiplex_profiles", False))
     served = {name: Path(home) for name, home in profiles_to_serve(multiplex=multiplex)}
+    if only is not None:  # avatar: resolve just the requested profile, never its siblings
+        served = {name: home for name, home in served.items() if name == only}
     from gateway.platforms.api_server import _api_request_profile
     scoped = _api_request_profile.get()
     if scoped and scoped != "default":
@@ -263,7 +271,7 @@ async def _handle_profile_avatar(self, request: web.Request) -> web.Response:
         name = normalize_profile_name(request.match_info.get("name", ""))
     except ValueError:
         return _json_error("Unknown profile.", 404, "profile_not_found")
-    home = (await asyncio.to_thread(_served, self, _presented_token(request))).get(name)
+    home = (await asyncio.to_thread(_served, self, _presented_token(request), name)).get(name)
     if home is None:
         return _json_error("Unknown profile.", 404, "profile_not_found")
 

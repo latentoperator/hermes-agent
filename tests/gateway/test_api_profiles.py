@@ -228,23 +228,26 @@ def test_capabilities_advertise_the_roster():
     assert {"profiles", "profile_avatar"} <= names
 
 
-def _swap_after_assets_open(monkeypatch, action):
-    """Run *action* right after ``assets`` is opened by descriptor, before the avatar is opened."""
+def _swap_at_avatar_open(monkeypatch, action):
+    """Run *action* immediately before the avatar file itself is opened -- whether the code opens
+    it by full path or relative to a directory descriptor -- and report whether it fired."""
     import os
 
     real_open = os.open
+    fired = []
 
     def spy(path, flags, *args, **kwargs):
-        fd = real_open(path, flags, *args, **kwargs)
-        if path == "assets" and kwargs.get("dir_fd") is not None:
+        if os.path.basename(os.fspath(path)) == "avatar.png" and not fired:
+            fired.append(True)
             action()
-        return fd
+        return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", spy)
+    return fired
 
 
 @pytest.mark.asyncio
-async def test_assets_dir_swapped_after_open_cannot_redirect_the_read(served, client, tmp_path, monkeypatch):
+async def test_assets_dir_swapped_before_avatar_open_cannot_redirect_the_read(served, client, tmp_path, monkeypatch):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "avatar.png").write_bytes(b"OUTSIDE BYTES")
@@ -254,11 +257,12 @@ async def test_assets_dir_swapped_after_open_cannot_redirect_the_read(served, cl
         assets.rename(served["shared"] / "assets-old")
         assets.symlink_to(outside, target_is_directory=True)
 
-    _swap_after_assets_open(monkeypatch, swap)
+    fired = _swap_at_avatar_open(monkeypatch, swap)
     response = await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))
     body = await response.read()
+    assert fired, "the swap must actually run at the avatar open"
     assert b"OUTSIDE BYTES" not in body
-    assert response.status == 200 and body == PNG
+    assert response.status == 200 and body == PNG  # read through the already-anchored assets fd
 
 
 @pytest.mark.asyncio
@@ -272,50 +276,102 @@ async def test_avatar_swapped_for_fifo_does_not_block(served, client, monkeypatc
         avatar.unlink()
         os.mkfifo(avatar)
 
-    _swap_after_assets_open(monkeypatch, swap)
-    response = await asyncio.wait_for(
-        client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY)), timeout=5)
+    fired = _swap_at_avatar_open(monkeypatch, swap)
+    try:
+        response = await asyncio.wait_for(
+            client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY)), timeout=5)
+    finally:
+        # If a regression ever drops O_NONBLOCK, release the blocked reader so teardown can't hang.
+        try:
+            wfd = os.open(avatar, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(wfd)
+        except OSError:
+            pass
+    assert fired
     assert response.status == 404
 
 
+def _mark_hydrated(home, values):
+    from hermes_cli import env_loader
+
+    key = str(Path(home).resolve())
+    env_loader._APPLIED_HOMES.add(key)
+    env_loader._SECRET_SOURCE_VALUES_BY_HOME[key] = dict(values)
+
+
 @pytest.mark.asyncio
-async def test_roster_uses_the_routes_key_resolution_for_overriding_sources(served, client, monkeypatch):
-    """An external source that overrides a profile's .env key (or is cold) must be resolved
-    exactly as the /p/<profile>/ scope resolves it, so the roster and the route agree."""
-    from gateway import run
+async def test_roster_and_route_agree_when_a_source_overrides_the_key(served, client):
+    """A hydrated external source that overrides the profile's .env key decides both the
+    roster and the route."""
+    from hermes_cli import env_loader
 
-    real = run._load_profile_secret_scope
     external = "e" * 32
+    _mark_hydrated(served["shared"], {"API_SERVER_KEY": external})
+    try:
+        listed = {r["name"] for r in (await (await client.get(
+            "/v1/profiles", headers=_auth(DEFAULT_KEY))).json())["profiles"]}
+        assert listed == {"default"}
+        assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 404
+        assert (await client.get("/p/shared/v1/profiles", headers=_auth(DEFAULT_KEY))).status == 401
+        assert (await client.get("/p/shared/v1/profiles", headers=_auth(external))).status == 200
+    finally:
+        env_loader.reset_secret_source_cache(served["shared"])
 
-    def loader(home):
-        scope = dict(real(home))
-        if home.name == "shared":
-            scope["API_SERVER_KEY"] = external  # source overrides the local listener-equal key
-        return scope
 
-    monkeypatch.setattr(run, "_load_profile_secret_scope", loader)
+@pytest.mark.asyncio
+async def test_cold_profile_is_omitted_and_never_hydrated_by_the_roster(served, client, monkeypatch):
+    """A profile whose secret sources are configured but not yet hydrated (or last failed) is
+    omitted, and the roster/avatar path never starts a hydration for it."""
+    from hermes_cli import env_loader
+
+    (served["shared"] / "config.yaml").write_text("secrets:\n  bitwarden:\n    enabled: true\n", encoding="utf-8")
+    hydrated = []
+    real = env_loader._hydrate_profile_secret_sources
+
+    def spy(home):
+        hydrated.append(Path(home).resolve())
+        if Path(home).resolve() == Path(served["shared"]).resolve():
+            raise AssertionError("roster must not hydrate a sibling profile")
+        return real(home)
+
+    monkeypatch.setattr(env_loader, "_hydrate_profile_secret_sources", spy)
     listed = {r["name"] for r in (await (await client.get(
         "/v1/profiles", headers=_auth(DEFAULT_KEY))).json())["profiles"]}
     assert listed == {"default"}
     assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 404
-    assert (await client.get("/p/shared/v1/profiles", headers=_auth(DEFAULT_KEY))).status == 401
-    assert (await client.get("/p/shared/v1/profiles", headers=_auth(external))).status == 200
+    assert Path(served["shared"]).resolve() not in hydrated
+
+
+@pytest.mark.asyncio
+async def test_avatar_resolves_only_the_requested_profile(served, client, monkeypatch):
+    from tui_gateway import launch_profile_policy
+
+    seen = []
+    real = launch_profile_policy.owner_secret_scope
+
+    def spy(home):
+        seen.append(Path(home).name)
+        return real(home)
+
+    monkeypatch.setattr(launch_profile_policy, "owner_secret_scope", spy)
+    assert (await client.get("/v1/profiles/shared/avatar", headers=_auth(DEFAULT_KEY))).status == 200
+    assert "shared" in seen
+    assert not {"worker", "other", "nokey"} & set(seen)  # siblings are never resolved
 
 
 @pytest.mark.asyncio
 async def test_roster_key_resolution_failure_fails_closed(served, client, monkeypatch):
-    from gateway import run
+    from tui_gateway import launch_profile_policy
 
-    real = run._load_profile_secret_scope
-
-    named = {Path(h) for n, h in served.items() if n != "default"}
+    named = {Path(h).resolve() for n, h in served.items() if n != "default"}
+    real = launch_profile_policy.owner_secret_scope
 
     def broken(home):
-        if Path(home) in named:  # the request's own default scope still loads
+        if Path(home).resolve() in named:
             raise RuntimeError("source unavailable")
         return real(home)
 
-    monkeypatch.setattr(run, "_load_profile_secret_scope", broken)
+    monkeypatch.setattr(launch_profile_policy, "owner_secret_scope", broken)
     response = await client.get("/v1/profiles", headers=_auth(DEFAULT_KEY))
     assert response.status == 200
     assert {r["name"] for r in (await response.json())["profiles"]} == {"default"}
