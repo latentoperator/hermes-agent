@@ -370,8 +370,8 @@ def test_run_one_job_delivery_uses_profile_secret_scope(monkeypatch, tmp_path):
     scope, but that scope used to be reset before delivery, so a desktop
     backend could send a Syren job with the backend owner's Telegram token.
     """
-    import agent.secret_scope as secret_scope
-    import cron.scheduler as scheduler
+    from agent import secret_scope
+    from cron import scheduler
 
     profile_home = tmp_path / "syren"
     profile_home.mkdir()
@@ -380,6 +380,7 @@ def test_run_one_job_delivery_uses_profile_secret_scope(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     monkeypatch.setattr(scheduler, "_hermes_home", profile_home)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
     monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_args: {})
     monkeypatch.setattr(scheduler, "finish_execution", lambda *_args, **_kwargs: None)
@@ -400,7 +401,6 @@ def test_run_one_job_delivery_uses_profile_secret_scope(monkeypatch, tmp_path):
 
     def _capture_delivery(*_args, **_kwargs):
         seen["token"] = secret_scope.get_secret("TELEGRAM_BOT_TOKEN")
-        return None
 
     monkeypatch.setattr(scheduler, "_deliver_result", _capture_delivery)
 
@@ -409,6 +409,7 @@ def test_run_one_job_delivery_uses_profile_secret_scope(monkeypatch, tmp_path):
             "id": "job-profile-delivery",
             "execution_id": "exec-profile-delivery",
             "deliver": "telegram",
+            "no_agent": True,
         }
     ) is True
     assert seen["token"] == "syren-token"
@@ -567,3 +568,26 @@ def test_history_orders_by_instant_across_dst_fall_back(monkeypatch, tmp_path):
     ]
     page = executions.list_executions(job_id="dst-job", before_claimed_at=later["claimed_at"])
     assert [r["id"] for r in page] == [earlier["id"]]
+
+
+def test_existing_execution_ledger_widens_statuses_without_losing_rows():
+    from cron import executions
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE executions (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+        process_id TEXT NOT NULL, pid INTEGER NOT NULL, process_started_at INTEGER,
+        status TEXT NOT NULL CHECK(status IN ('claimed','running','completed','failed','unknown')),
+        claimed_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT)""")
+    conn.execute("INSERT INTO executions (id,job_id,source,process_id,pid,status,claimed_at) "
+                 "VALUES ('old','job','builtin','owner',1,'completed','2026-11-04T00:00:00Z')")
+    conn.commit()
+
+    executions._initialize_schema(conn)
+    assert conn.execute("SELECT id,status FROM executions").fetchall() == [("old", "completed")]
+    for status in ("cancelled", "missed"):
+        conn.execute("INSERT INTO executions (id,job_id,source,process_id,pid,status,claimed_at) "
+                     "VALUES (?,?,?,?,?,?,?)", (status, "job", "builtin", "owner", 1, status, "now"))
+    executions._initialize_schema(conn)
+    assert conn.execute("SELECT count(*) FROM executions").fetchone()[0] == 3
+    conn.close()
