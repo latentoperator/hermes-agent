@@ -215,6 +215,7 @@ common.no: "níl"
 common.unknown: "anaithnid"
 common.yes: "tá"
 
+composer.copySentToTerminal: "Cóip seolta chuig an teirminéal · greamaigh lena fíorú"
 composer.interruptHint: "Ctrl+C le briseadh isteach…"
 composer.placeholders.ask: "Cuir ceist ar bith orm…"
 composer.placeholders.config: "Bain triail as \"conas a oibríonn lódálaí na cumraíochta?\""

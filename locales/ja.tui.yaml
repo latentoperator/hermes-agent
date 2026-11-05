@@ -215,6 +215,7 @@ common.no: "いいえ"
 common.unknown: "不明"
 common.yes: "はい"
 
+composer.copySentToTerminal: "コピー要求をターミナルに送信しました · 貼り付けて確認"
 composer.interruptHint: "Ctrl+C で中断…"
 composer.placeholders.ask: "何でも聞いてください…"
 composer.placeholders.config: "例:「設定ローダーはどう動いていますか？」"

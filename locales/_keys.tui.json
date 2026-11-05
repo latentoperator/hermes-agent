@@ -209,6 +209,7 @@
   "common.no",
   "common.unknown",
   "common.yes",
+  "composer.copySentToTerminal",
   "composer.interruptHint",
   "composer.placeholders.ask",
   "composer.placeholders.config",

@@ -215,6 +215,7 @@ common.no: "não"
 common.unknown: "desconhecido"
 common.yes: "sim"
 
+composer.copySentToTerminal: "Cópia enviada ao terminal · cole para verificar"
 composer.interruptHint: "Ctrl+C para interromper…"
 composer.placeholders.ask: "Pergunte o que quiser…"
 composer.placeholders.config: "Tente \"como funciona o carregador de configuração?\""

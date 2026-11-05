@@ -215,6 +215,7 @@ common.no: "否"
 common.unknown: "未知"
 common.yes: "是"
 
+composer.copySentToTerminal: "已向终端发送复制请求 · 粘贴以确认"
 composer.interruptHint: "Ctrl+C 中断…"
 composer.placeholders.ask: "有什么想问的？"
 composer.placeholders.config: "试试“配置加载器是怎么工作的？”"

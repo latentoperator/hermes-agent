@@ -19,6 +19,7 @@ export const chromeEn = {
     fast: 'fast'
   },
   composer: {
+    copySentToTerminal: 'Copy sent to terminal · paste to verify',
     interruptHint: 'Ctrl+C to interrupt…',
     placeholders: {
       ask: 'Ask me anything…',

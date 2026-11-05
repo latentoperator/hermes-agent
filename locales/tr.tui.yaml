@@ -215,6 +215,7 @@ common.no: "hayır"
 common.unknown: "bilinmiyor"
 common.yes: "evet"
 
+composer.copySentToTerminal: "Kopyalama isteği terminale gönderildi · doğrulamak için yapıştırın"
 composer.interruptHint: "Durdurmak için Ctrl+C…"
 composer.placeholders.ask: "Bana bir şey sorun…"
 composer.placeholders.config: "\"yapılandırma yükleyici nasıl çalışıyor?\" deneyin"

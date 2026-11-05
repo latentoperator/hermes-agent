@@ -215,6 +215,7 @@ common.no: "nem"
 common.unknown: "ismeretlen"
 common.yes: "igen"
 
+composer.copySentToTerminal: "Másolási kérés elküldve a terminálnak · beillesztéssel ellenőrizhető"
 composer.interruptHint: "Ctrl+C a megszakításhoz…"
 composer.placeholders.ask: "Kérdezz bármit…"
 composer.placeholders.config: "Próbáld: \"hogyan működik a konfigbetöltő?\""

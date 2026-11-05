@@ -215,6 +215,7 @@ common.no: "nee"
 common.unknown: "onbekend"
 common.yes: "ja"
 
+composer.copySentToTerminal: "Kopie na terminaal gestuur · plak om te bevestig"
 composer.interruptHint: "Ctrl+C om te onderbreek…"
 composer.placeholders.ask: "Vra my enigiets…"
 composer.placeholders.config: "Probeer \"hoe werk die konfigurasielaaier?\""

@@ -215,6 +215,7 @@ common.no: "ні"
 common.unknown: "невідомо"
 common.yes: "так"
 
+composer.copySentToTerminal: "Запит копіювання надіслано терміналу · вставте для перевірки"
 composer.interruptHint: "Ctrl+C — перервати…"
 composer.placeholders.ask: "Запитайте будь-що…"
 composer.placeholders.config: "Спробуйте «як працює завантажувач конфігурації?»"

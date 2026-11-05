@@ -215,6 +215,7 @@ common.no: "لا"
 common.unknown: "غير معروف"
 common.yes: "نعم"
 
+composer.copySentToTerminal: "أُرسل النسخ إلى الطرفية · الصق للتحقق"
 composer.interruptHint: "Ctrl+C للمقاطعة…"
 composer.placeholders.ask: "اسألني أي شيء…"
 composer.placeholders.config: "جرّب \"كيف يعمل محمّل الإعدادات؟\""
