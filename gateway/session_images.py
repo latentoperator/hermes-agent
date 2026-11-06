@@ -1,8 +1,28 @@
-"""Staging-only image uploads on the authenticated session authority."""
+"""Image staging and terminal previews on the authenticated session authority."""
 import asyncio
 from pathlib import Path
 
 from hermes_state_runtime import RuntimeStoreError
+
+
+async def render(connection, ref, params):
+    if not isinstance(ref.session_id, str) or not ref.session_id:
+        raise RuntimeStoreError('invalid_params')
+    if ref.session_id not in connection.subscriptions:
+        raise RuntimeStoreError('permission_denied')
+    from gateway.session_busy_controls import authorize
+    # A preview reads a caller-selected host image, like an interactive file pick;
+    # a read-only transcript viewer must not acquire arbitrary host-file access.
+    authorize(connection, ref, params, 'session:control')
+
+    def paint():
+        from gateway.display_config import local_display_config
+        from hermes_cli.config import load_config
+        from tui_gateway.image_preview import render_preview
+        return render_preview(params, local_display_config(load_config().get('display') or {}))
+
+    # dispatch binds the owner scope; to_thread preserves it without blocking turns.
+    return await asyncio.to_thread(paint)
 
 
 async def attach_bytes(connection, ref, params):

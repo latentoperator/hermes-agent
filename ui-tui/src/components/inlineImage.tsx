@@ -4,7 +4,7 @@ import { useStore } from '@nanostores/react'
 import { memo, useEffect, useState } from 'react'
 
 import { useGateway } from '../app/gatewayContext.js'
-import { $uiInlineImages } from '../app/uiStore.js'
+import { $uiInlineImages, $uiSessionId } from '../app/uiStore.js'
 import { TERMUX_TUI_MODE } from '../config/env.js'
 import { INLINE_IMAGE_MAX_COLS, INLINE_IMAGE_MAX_ROWS } from '../config/limits.js'
 import { transcriptBodyWidth, transcriptGutterWidth } from '../lib/inputMetrics.js'
@@ -42,7 +42,8 @@ const placed = new Map<string, string>()
 
 const sizeOf = (res: ImageRenderResult) => `${res.cols}x${res.rows}`
 
-const renderKey = (path: string, revision: string | undefined, cols: number) => `${path}\0${revision ?? ''}\0${cols}`
+const renderKey = (path: string, revision: string | undefined, cols: number, sid?: null | string) =>
+  `${sid ?? ''}\0${path}\0${revision ?? ''}\0${cols}`
 
 /** A resolved render that paints correctly right now: for kitty, the terminal must hold its size. */
 const usableRender = (key: string): ImageRenderResult | null => {
@@ -73,9 +74,10 @@ const requestRender = (
   write: (data: string) => boolean,
   path: string,
   revision: string | undefined,
-  cols: number
+  cols: number,
+  sid?: null | string
 ) => {
-  const key = renderKey(path, revision, cols)
+  const key = renderKey(path, revision, cols, sid)
   const cached = renders.get(key)
 
   // In flight, or still paintable. A kitty entry another size displaced has
@@ -88,7 +90,14 @@ const requestRender = (
 
   const entry: RenderEntry = {
     pending: gw
-      .request('image.render', { cols, graphics: IS_TTY, path, rows: INLINE_IMAGE_MAX_ROWS, terminal: TERMINAL })
+      .request('image.render', {
+        cols,
+        graphics: IS_TTY,
+        path,
+        rows: INLINE_IMAGE_MAX_ROWS,
+        terminal: TERMINAL,
+        ...(sid && { session_id: sid })
+      })
       .then(res => asRpcResult<ImageRenderResult>(res))
       .catch(() => null)
       .then(res => {
@@ -141,24 +150,31 @@ interface InlineImageProps {
 export const InlineImage = memo(function InlineImage({ cols, path, revision }: InlineImageProps) {
   const { gw } = useGateway()
   const { write } = useStdout()
+  const sessionId = useStore($uiSessionId)
+  const sid = gw.isCanonical ? sessionId : undefined
   const budget = Math.max(1, Math.min(INLINE_IMAGE_MAX_COLS, cols))
-  const key = renderKey(path, revision, budget)
+  const key = renderKey(path, revision, budget, sid)
   // Seeded from a resolved render so a virtual-scroll remount has its real height on the first frame.
-  const [image, setImage] = useState<ImageRenderResult | null>(() => usableRender(key))
+  const [rendered, setRendered] = useState(() => ({ key, image: usableRender(key) }))
+  const image = rendered.key === key ? rendered.image : usableRender(key)
 
   useEffect(() => {
     let live = true
 
-    void requestRender(gw, write, path, revision, budget).then(res => {
+    if (gw.isCanonical && !sid) {
+      return
+    }
+
+    void requestRender(gw, write, path, revision, budget, sid).then(res => {
       if (live && res) {
-        setImage(res)
+        setRendered({ key, image: res })
       }
     })
 
     return () => {
       live = false
     }
-  }, [budget, gw, path, revision, write])
+  }, [budget, gw, key, path, revision, sid, write])
 
   if (image?.mode === 'kitty' && image.color && image.placeholder?.length) {
     return <KittyImage color={image.color} placeholder={image.placeholder} />

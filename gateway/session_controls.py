@@ -256,9 +256,10 @@ class AuthorityConnection:
         handlers.update(side_handlers(self))
         from gateway.session_llm_oneshot import handlers as oneshot_handlers
         handlers.update(oneshot_handlers(self))
-        from gateway.session_images import attach_bytes
+        from gateway.session_images import attach_bytes, render
         from functools import partial
         handlers['image.attach_bytes'] = partial(attach_bytes, self)
+        handlers['image.render'] = partial(render, self)
         from gateway.session_complete_path import complete_path
         handlers['complete.path'] = partial(complete_path, self)
         from gateway.session_prune import prune

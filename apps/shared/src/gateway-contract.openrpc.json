@@ -8968,6 +8968,61 @@
         "title": "CanonicalEventsResult",
         "type": "object"
       },
+      "CanonicalImageRenderParams": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "cols": {
+            "title": "Cols",
+            "type": "integer"
+          },
+          "rows": {
+            "title": "Rows",
+            "type": "integer"
+          },
+          "graphics": {
+            "default": false,
+            "title": "Graphics",
+            "type": "boolean"
+          },
+          "terminal": {
+            "default": "unicode",
+            "enum": [
+              "kitty",
+              "unicode"
+            ],
+            "title": "Terminal",
+            "type": "string"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          }
+        },
+        "required": [
+          "path",
+          "cols",
+          "rows",
+          "session_id"
+        ],
+        "title": "CanonicalImageRenderParams",
+        "type": "object"
+      },
       "CanonicalListParams": {
         "additionalProperties": false,
         "properties": {
@@ -49017,6 +49072,24 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/CanonicalAttachedImageResult"
+        }
+      }
+    },
+    {
+      "name": "image.render",
+      "summary": "",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/CanonicalImageRenderParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ImageRenderResult"
         }
       }
     },

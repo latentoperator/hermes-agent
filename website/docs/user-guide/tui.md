@@ -256,6 +256,10 @@ display:
   inline_images: auto        # auto | kitty | iterm | unicode | off — see the CLI guide's "Inline Images"
 ```
 
+Image previews appear beneath sent messages and successful image-producing tools, including in
+`--native` mode. The shared gateway renders them using the session owner's display settings and
+the viewing terminal's capabilities. The composer shows an attachment label before sending.
+
 Set `display.copy_on_select: true` to copy transcript and composer text when you
 release a mouse selection, including over SSH to a Linux server. The highlight
 stays visible. `false` disables automatic copying; manual copy shortcuts remain

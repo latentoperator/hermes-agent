@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { GatewayProvider } from '../app/gatewayContext.js'
 import type { GatewayServices } from '../app/interfaces.js'
+import { patchUiState, resetUiState } from '../app/uiStore.js'
 import { MessageLine } from '../components/messageLine.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import { DEFAULT_THEME } from '../theme.js'
@@ -17,6 +18,7 @@ const unmounts: Array<() => void> = []
 
 afterEach(() => {
   unmounts.splice(0).forEach(fn => fn())
+  resetUiState()
   vi.restoreAllMocks()
 })
 
@@ -28,12 +30,21 @@ const settle = async () => {
 
 type RenderParams = { cols?: number; path: string }
 
-const mount = (msgs: Msg[], render: ImageRenderResult | ((params: RenderParams) => ImageRenderResult), cols = 100) => {
+const mount = (
+  msgs: Msg[],
+  render: ImageRenderResult | ((params: RenderParams) => ImageRenderResult),
+  cols = 100,
+  canonical = false
+) => {
   const request = vi.fn(async (_method: string, params: RenderParams) =>
     typeof render === 'function' ? render(params) : render
   )
 
-  const gateway = { gw: { request } as unknown as GatewayClient, rpc: vi.fn() } as unknown as GatewayServices
+  const gateway = {
+    gw: { isCanonical: canonical, request } as unknown as GatewayClient,
+    rpc: vi.fn()
+  } as unknown as GatewayServices
+
   const stdout = new PassThrough()
   const stdin = new PassThrough()
   const stderr = new PassThrough()
@@ -69,6 +80,31 @@ const mount = (msgs: Msg[], render: ImageRenderResult | ((params: RenderParams) 
 }
 
 describe('inline transcript images', () => {
+  it('waits for a canonical session and scopes preview requests and cached renders to it', async () => {
+    const { output, request } = mount(
+      [{ images: ['/tmp/session-preview.png'], role: 'user', text: 'describe it' }],
+      {
+        mode: 'unicode',
+        cols: 1,
+        rows: 1,
+        cells: [[[10, 190, 30, 255, 10, 190, 30, 255]]]
+      },
+      100,
+      true
+    )
+
+    await settle()
+    expect(request).not.toHaveBeenCalled()
+    patchUiState({ sid: 'preview-owner-a' })
+    await settle()
+    expect(request).toHaveBeenCalledWith('image.render', expect.objectContaining({ session_id: 'preview-owner-a' }))
+    expect(output()).toContain('▀')
+    patchUiState({ sid: 'preview-owner-b' })
+    await settle()
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(request).toHaveBeenLastCalledWith('image.render', expect.objectContaining({ session_id: 'preview-owner-b' }))
+  })
+
   it('paints kitty placeholders and sends each image to the terminal once', async () => {
     const terminal = vi.spyOn(process.stdout, 'write').mockImplementation(() => true)
     const transmit = '\x1b_Ga=T,U=1,i=14698097,c=3,r=2,f=100,q=2,m=0;AAAA\x1b\\'
