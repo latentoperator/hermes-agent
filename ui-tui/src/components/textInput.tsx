@@ -3,7 +3,7 @@ import * as Ink from '@hermes/ink'
 import { type MutableRefObject, useEffect, useMemo, useRef, useState } from 'react'
 
 import { runCopyWithFeedback } from '../app/copyFeedbackStore.js'
-import { setInputSelection } from '../app/inputSelectionStore.js'
+import { setInputSelection, takeInputCursor } from '../app/inputSelectionStore.js'
 import { getUiState } from '../app/uiStore.js'
 import { highlightMask, highlightsStable } from '../domain/composerHighlights.js'
 import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
@@ -965,9 +965,10 @@ export function TextInput({
     }
 
     pendingParentValue.current = null
-    setCur(value.length)
+    const at = takeInputCursor(value) ?? value.length
+    setCur(at)
     setSel(null)
-    curRef.current = value.length
+    curRef.current = at
     selRef.current = null
     vRef.current = value
     lineWidthRef.current = stringWidth(value.includes('\n') ? value.slice(value.lastIndexOf('\n') + 1) : value)
@@ -1047,6 +1048,7 @@ export function TextInput({
           commit(vRef.current.slice(0, current.start) + vRef.current.slice(current.end), current.start)
         })
       },
+      cursor: curRef.current,
       end: selected?.end ?? curRef.current,
       start: selected?.start ?? curRef.current,
       value: vRef.current
@@ -1917,7 +1919,7 @@ export const shouldPassThroughToGlobalHandler = (
   (key.ctrl && input === 'c') ||
   (key.ctrl && input === 'x') ||
   (key.ctrl && input === 'o') ||
-  (key.ctrl && (input === 'r' || input === 't')) ||
+  (key.ctrl && (input === 'p' || input === 'r' || input === 't')) ||
   key.tab ||
   (key.shift && key.tab) ||
   key.pageUp ||
