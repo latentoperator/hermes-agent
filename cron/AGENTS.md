@@ -104,7 +104,9 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   payload, and only then drops the marker: a source-update relaunch (`-I`, no `PYTHONPATH`) or a
   post-restore re-exec must replay the whole worker, never land after the ack with the payload
   gone and no dependency boot.
-- Cron sessions pass `skip_memory=True`; memory providers intentionally do not run during cron.
+- Cron agents run with `skip_memory=False` (pinned by `tests/cron/test_cron_memory_contract.py`), but a
+  fire mirrors only a provenance header + its final response into external memory, never the
+  assembled prompt; `[SILENT]`/empty fires write nothing (`agent/cron_memory_sync.py`).
 - Cron execution has its own session. Eligible continuable deliveries may mirror or seed the
   reply-facing conversation: origin, origin-less home fallback, user-written bare-platform home,
   or opted-in explicit targets. `all` expansions do not gain home mirror eligibility. Mirrored
