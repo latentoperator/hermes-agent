@@ -2601,9 +2601,11 @@ def run_job(
 
         # Open state.db only after every early-return gate has passed.
         _session_db = _open_cron_session_db(job)
-        agent = _construct_cron_agent(
-            AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
-            session_db=_session_db)
+        agent = _construct_cron_agent(AIAgent, job, _cfg, setup, workdir=scope.workdir,
+                                      session_id=_cron_session_id, session_db=_session_db)
+        # Provenance header for cron memory sync, never the prompt (agent/cron_memory_sync.py).
+        agent._cron_job_meta = {"id": job_id, "name": job.get("name") or job_id,
+                                "scheduled_at": _hermes_now().isoformat(timespec="seconds")}
         _audit = _FireAudit(job, job_id, model)
 
         result = _run_agent_with_watchdog(

@@ -898,7 +898,14 @@ class AIAgent(
         is almost certainly a retry of the same intent, and a prefetch keyed on the interrupted turn would
         fire against stale context. See #15218.
         """
-        if interrupted or not (self._memory_manager and final_response and original_user_message):
+        if interrupted or not self._memory_manager:
+            return
+        if getattr(self, "platform", None) == "cron":
+            # Header + response only; never the assembled prompt (agent/cron_memory_sync.py).
+            from agent.cron_memory_sync import sync_cron_turn
+            _quietly(sync_cron_turn, self, _summarize_user_message_for_log(final_response, sep="\n") if final_response else "")
+            return
+        if not (final_response and original_user_message):
             return
         # Flatten multimodal parts to text (newline-joined for memory).
         user_text = _summarize_user_message_for_log(original_user_message, sep="\n")
