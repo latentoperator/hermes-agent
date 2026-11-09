@@ -84,11 +84,37 @@ def _host_local_lock(lock) -> bool:
     return bool(lock) and str(lock).startswith(kb._host_prefix())
 
 
+def _lost_interpreter_pid(conn, task_id):
+    """The interpreter pid the owner's ``worker_lost`` names for the current run, or None.
+
+    An interpreter that dies in ``worker.adopt`` never writes ``worker_bound``, but its owner
+    records the loss (pid and ``bound`` scope) before settling the admission ``unknown``. That
+    note speaks for the run only under the run's own host-local claim.
+    """
+    lost = _latest_run_event(conn, task_id, 'worker_lost')
+    if not lost.get('bound'):
+        return None
+    row = conn.execute("SELECT claim_lock FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row is None or not _host_local_lock(row['claim_lock']) or lost.get('claim_lock') != row['claim_lock']:
+        return None
+    try:
+        return int(lost['pid']) or None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def bound_interpreter_gone(conn, task_id):
-    """True when the owner bound an interpreter to the task's current run and it is dead."""
+    """True when the owner bound an interpreter to the task's current run and it is dead.
+
+    Without a ``worker_bound`` event, the owner's own loss note naming a dead interpreter is
+    the same evidence. It carries no fingerprint, so only an absent pid is proof: a live one,
+    even a recycled number, keeps the pause.
+    """
     bound = _latest_run_event(conn, task_id, 'worker_bound')
     if not bound:
-        return False
+        pid = _lost_interpreter_pid(conn, task_id)
+        from hermes_cli import kanban_db as kb
+        return pid is not None and not kb._pid_alive(pid)
     from hermes_cli.kanban_db_dispatch import _worker_alive
     return not _worker_alive(bound.get('pid'), bound.get('started_at'))
 

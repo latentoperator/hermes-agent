@@ -310,3 +310,74 @@ def test_a_loss_recorded_against_a_superseded_run_is_dropped(board):
     board.conn.commit()
     record_worker_loss(policy, "managed_worker_failed", pid=1234, bound=False)
     assert count() == 1
+
+
+# --- D2: a worker lost BEFORE it bound, behind a live owner and an 'unknown' admission ----
+# Run 2376 of t_e122ba97: claimed, spawned, owner_admitted, then the managed interpreter
+# died in startup (ENOSPC) and the owner wrote ``worker_lost`` (its interpreter pid,
+# ``bound: true``) and settled the admission ``unknown``. No ``worker_bound`` was ever
+# written. ``owner_reclaim_paused`` held for ``unknown``, ``bound_interpreter_gone`` had no
+# ``worker_bound`` to read, and ``owner_attempt_provably_over`` needed a terminal admission
+# or a dead owner (the long-lived gateway was alive), so every path skipped the card and it
+# sat ``running`` until it was closed by hand. The owner's own same-run, same-claim loss note
+# naming a provably dead interpreter is the evidence ``worker_bound`` would have given.
+
+def _run_2376(board, tid, *, claim_expires_in=900, lost_pid=None, lost_lock=None, bound=True):
+    import os
+    run_id = board.running(tid, claim_expires_in=claim_expires_in, heartbeat_age=None,
+                           owner_pid=os.getpid(), admission=("unknown", None))
+    lock = board.state(tid)["claim_lock"]
+    board.event(tid, run_id, "worker_lost",
+                {"reason": "managed_worker_failed", "claim_lock": lost_lock or lock, "run_id": run_id,
+                 "pid": _absent_pid(base=3_990_000) if lost_pid is None else lost_pid, "bound": bound},
+                NOW - 116)
+    board.conn.commit()
+    return run_id
+
+
+@pytest.mark.parametrize("claim_expires_in", [900, CLAIM_LAPSED], ids=["live-claim", "lapsed-claim"])
+def test_a_worker_lost_before_binding_behind_an_unknown_admission_is_crashed_once(board, claim_expires_in):
+    run_id = _run_2376(board, "t_2376", claim_expires_in=claim_expires_in)
+    kinds = [r[0] for r in board.conn.execute(
+        "SELECT kind FROM task_events WHERE task_id='t_2376' AND run_id=? ORDER BY id", (run_id,))]
+    assert kinds == ["claimed", "spawned", "owner_admitted", "worker_lost"]   # no worker_bound
+    assert kanban_owner_recovery.owner_reclaim_paused(board.conn, "t_2376") is True
+    assert kanban_owner_recovery.owner_attempt_provably_over(board.conn, "t_2376") is False
+    assert kanban_owner_recovery.bound_interpreter_gone(board.conn, "t_2376") is True
+
+    board.tick(failure_limit=2)
+    row, run = board.state("t_2376"), board.run(run_id)
+    assert row["status"] == "ready"
+    assert (row["claim_lock"], row["worker_pid"], row["current_run_id"]) == (None, None, None)
+    assert run["outcome"] == "crashed"                     # booked by the crash sweep, once
+    assert "managed worker lost: managed_worker_failed" in run["error"]
+    assert row["consecutive_failures"] == 1
+    kinds = [r[0] for r in board.conn.execute(
+        "SELECT kind FROM task_events WHERE task_id='t_2376' AND run_id=?", (run_id,))]
+    assert kinds.count("crashed") == 1 and "reclaimed" not in kinds
+
+
+def test_a_worker_lost_before_binding_blocks_the_card_at_the_failure_limit(board):
+    _run_2376(board, "t_2376")
+    board.conn.execute("UPDATE tasks SET consecutive_failures = ? WHERE id = 't_2376'",
+                       (kbd.DEFAULT_FAILURE_LIMIT - 1,))
+    board.conn.commit()
+    board.tick()
+    assert board.state("t_2376")["status"] == "blocked"
+
+
+@pytest.mark.parametrize("shape", [
+    dict(lost_pid="live"),                       # the named interpreter is still running
+    dict(lost_lock="other-host:1"),              # a note written under another claim
+    dict(bound=False),                           # the owner never had an interpreter scope
+    dict(lost_pid=0),                            # no interpreter pid to judge
+], ids=["live-interpreter", "other-claim", "unbound-scope", "no-pid"])
+def test_a_loss_note_that_is_not_proof_keeps_the_pause(board, shape):
+    import os
+    if shape.get("lost_pid") == "live":
+        shape = dict(shape, lost_pid=os.getpid())
+    run_id = _run_2376(board, "t_held", **shape)
+    assert kanban_owner_recovery.bound_interpreter_gone(board.conn, "t_held") is False
+    board.tick(failure_limit=2)
+    assert board.state("t_held")["status"] == "running"
+    assert board.run(run_id)["outcome"] is None
