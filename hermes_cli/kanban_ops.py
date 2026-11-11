@@ -302,46 +302,44 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
+def _gc_workspaces() -> int:
+    """Backstop for scratch/worktree workspaces the completion/archive hooks missed.
+
+    Covers ``archived`` and ``done`` tasks through the same guarded removal the
+    hooks use (managed-root containment #28818, live sharers on any board,
+    clean-and-pushed worktrees). A ``done`` task keeps its workspace while a
+    child still needs its handoff files. Returns how many were removed.
+    """
+    scratch_root = kb.workspaces_root()
+    removed = 0
+    with kbc.connect_closing() as conn:
+        rows = conn.execute(
+            "SELECT id, status, workspace_kind, workspace_path, branch_name FROM tasks "
+            "WHERE status IN ('archived', 'done') AND workspace_kind IN ('scratch', 'worktree')"
+        ).fetchall()
+        for row in rows:
+            kind = row["workspace_kind"]
+            raw = row["workspace_path"] or (str(scratch_root / row["id"]) if kind == "scratch" else "")
+            path = Path(raw) if raw else None
+            # Cheap first: most rows were cleaned at completion. rmtree refuses a
+            # symlink, so a symlinked scratch dir is never removed or counted.
+            if path is None or not path.is_dir() or (kind == "scratch" and path.is_symlink()):
+                continue
+            if row["status"] == "done" and kbw._has_active_children(conn, row["id"]):
+                continue
+            kbw._remove_terminal_workspace(conn, row["id"], kind, path, row["branch_name"])
+            if not path.is_dir():
+                removed += 1
+    return removed
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
-    import shutil
+    """Remove finished tasks' leftover workspaces, old events, and old worker logs."""
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
     if event_days < 0 or log_days < 0:
         return _err("kanban gc: retention days must be >= 0 (0 disables that sweep)", 2)
-    scratch_root = kb.workspaces_root()
-    removed_ws = 0
-    with kbc.connect_closing() as conn:
-        rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
-            "WHERE status = 'archived'"
-        ).fetchall()
-        for row in rows:
-            if row["workspace_kind"] == "worktree":
-                # Backstop for worktrees that escaped the completion/archive hook.
-                # Same safety predicate: only clean, fully-pushed worktrees go.
-                wt_path = row["workspace_path"]
-                if wt_path and Path(wt_path).is_dir():
-                    if kbw._defer_shared_worktree_cleanup(conn, row["id"], wt_path):
-                        continue
-                    kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
-                    if not Path(wt_path).is_dir():
-                        removed_ws += 1
-                continue
-            if row["workspace_kind"] != "scratch":
-                continue
-            path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-            # Same containment predicate as completion cleanup (#28818): strictly below a
-            # managed root, never the root itself (which holds every task's scratch dir).
-            # Cheap existence/symlink check first: most rows were already cleaned at
-            # completion, and rmtree refuses a symlink (so it must not be counted).
-            if not path.is_dir() or path.is_symlink() or not kbw._is_managed_scratch_path(path):
-                continue
-            if kbw._defer_shared_workspace_cleanup(conn, row["id"], path):
-                continue
-            shutil.rmtree(path, ignore_errors=True)
-            if not path.exists():
-                removed_ws += 1
+    removed_ws = _gc_workspaces()
 
     removed_events = 0
     if event_days:
