@@ -1753,6 +1753,52 @@ def test_slash_exec_routes_a_secondary_only_bundle_to_dispatch(server, tmp_path,
     assert resp["result"]["type"] == "send" and "b-pack" in resp["result"]["notice"]
 
 
+def test_slash_exec_runs_a_plugin_command_under_the_session_profile(server, tmp_path, monkeypatch):
+    """A plugin slash command typed in a secondary-profile session must be looked up and run with
+    that profile's home bound, so the plugin reads the session profile's settings and state, not
+    the launch profile's (same class as #110695)."""
+    import hermes_cli.plugins as plugins_mod
+    from hermes_constants import get_hermes_home
+
+    profile_b = tmp_path / "profile_b"
+    profile_b.mkdir()
+    launch_home = str(get_hermes_home())
+    assert launch_home != str(profile_b)
+    seen = {}
+
+    def handler(arg, **_kwargs):
+        seen["run"] = str(get_hermes_home())
+        return f"ran {arg}"
+
+    def lookup(name):
+        if name != "probe-plugin-cmd":
+            return None
+        seen["lookup"] = str(get_hermes_home())
+        return handler
+
+    monkeypatch.setattr(plugins_mod, "get_plugin_command_handler", lookup)
+    sid = "test-session-profile-b-plugin"
+    server._sessions[sid] = {"session_key": sid, "agent": None, "profile_home": str(profile_b)}
+
+    resp = server.handle_request({
+        "id": "r1", "method": "slash.exec",
+        "params": {"command": "/probe-plugin-cmd status", "session_id": sid}})
+
+    assert "error" not in resp, resp
+    assert resp["result"]["output"] == "ran status"
+    assert seen == {"lookup": str(profile_b), "run": str(profile_b)}
+    assert str(get_hermes_home()) == launch_home  # the binding does not leak past the request
+
+    # A launch-profile session (no profile_home) keeps resolving against the launch home.
+    seen.clear()
+    server._sessions["test-session-launch-plugin"] = {"session_key": "test-session-launch-plugin", "agent": None}
+    resp = server.handle_request({
+        "id": "r2", "method": "slash.exec",
+        "params": {"command": "/probe-plugin-cmd again", "session_id": "test-session-launch-plugin"}})
+    assert resp["result"]["output"] == "ran again"
+    assert seen == {"lookup": launch_home, "run": launch_home}
+
+
 def test_command_dispatch_queue_sends_message(server):
     """command.dispatch /queue returns {type: 'send', message: ...} for the TUI."""
     sid = "test-session"
