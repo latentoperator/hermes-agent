@@ -773,7 +773,17 @@ function useFwdDelete(active: boolean) {
 
 type InputHandler = (inp: string, k: Key, event: InputEvent) => void
 
-type PasteResult = { cursor: number; value: string } | null
+interface PasteInsert {
+  cursor: number
+  /**
+   * Re-place the insertion on the owner's live value, which can be ahead of
+   * this input's; null when it no longer belongs there. Commit the result at once.
+   */
+  land?: (view: { caret: number; value: string }) => PasteInsert | null
+  value: string
+}
+
+type PasteResult = PasteInsert | null
 
 const isPasteResultPromise = (
   value: PasteResult | Promise<PasteResult> | null | undefined
@@ -826,6 +836,8 @@ export function TextInput({
   const emittedValueRef = useRef<string | null>(null)
   const keyBurstTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const editVersionRef = useRef(0)
+  // Commits of async paste results, so one paste landing does not read as an edit to another.
+  const pasteLandingsRef = useRef(0)
   const parentChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingParentValue = useRef<string | null>(null)
   const localRenderTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -1222,7 +1234,10 @@ export function TextInput({
   }
 
   const emitPaste = (e: PasteEvent) => {
+    // Typed keys still waiting on their frame flush belong before the paste.
+    flushKeyBurst()
     const startVersion = editVersionRef.current
+    const startLandings = pasteLandingsRef.current
     const h = cbPaste.current?.(e)
 
     if (isPasteResultPromise(h)) {
@@ -1230,9 +1245,19 @@ export function TextInput({
 
       void h
         .then(result => {
-          if (result && editVersionRef.current === startVersion) {
-            commit(result.value, result.cursor)
-          } else if (result && fallbackText && PRINTABLE.test(fallbackText)) {
+          if (!result) {
+            return
+          }
+
+          // Only other pastes landing since: this one still belongs in the draft.
+          if (editVersionRef.current - startVersion === pasteLandingsRef.current - startLandings) {
+            const landed = result.land ? result.land({ caret: curRef.current, value: vRef.current }) : result
+
+            if (landed) {
+              pasteLandingsRef.current += 1
+              commit(landed.value, landed.cursor)
+            }
+          } else if (fallbackText && PRINTABLE.test(fallbackText)) {
             // User typed while async paste was in-flight — fall back to raw text insert
             // so the pasted content is not silently lost.
             const cur = curRef.current
@@ -1872,9 +1897,7 @@ interface TextInputProps {
   mask?: string
   mouseApiRef?: MutableRefObject<null | TextInputMouseApi>
   onChange: (v: string) => void
-  onPaste?: (
-    e: PasteEvent
-  ) => { cursor: number; value: string } | Promise<{ cursor: number; value: string } | null> | null
+  onPaste?: (e: PasteEvent) => PasteInsert | Promise<PasteResult> | null
   onSubmit?: (v: string) => void
   placeholder?: string
   /** Hex color for placeholder text (theme muted); SGR dim when omitted. */

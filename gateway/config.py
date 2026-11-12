@@ -238,7 +238,6 @@ class Platform(Enum):
     WEIXIN = "weixin"
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
-    YUANBAO = "yuanbao"
     RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
 
     @classmethod
@@ -281,7 +280,8 @@ class Platform(Enum):
         manifest ``name:`` keys that differ from their directory (alias -> directory name). Aliases
         never shadow a directory name, so the directory stays the canonical platform value."""
         try:
-            platforms_dir = Path(__file__).parent.parent / "plugins" / "platforms"
+            from hermes_cli.plugins import get_bundled_plugins_dir
+            platforms_dir = get_bundled_plugins_dir() / "platforms"
             dirs = [
                 child for child in (platforms_dir.iterdir() if platforms_dir.is_dir() else ())
                 if child.is_dir() and (child / "__init__.py").exists()
@@ -313,6 +313,9 @@ PORT_BINDING_CONDITIONAL_MODES: dict[str, str] = {"feishu": "webhook"}
 # Port-binders whose /p/<profile>/ surface is a MIRROR served by the default's own adapter; a secondary
 # never gets an instance of these (api_server: /p/<profile>/v1/..., webhook: profile-bound routes).
 SHARED_LISTENER_MIRROR_PLATFORMS = frozenset({"api_server", "webhook"})
+# Everything a served profile reads from the default's own entry: the listener mirrors plus Relay,
+# process-level shared ingress whose one adapter serves every profile (no per-profile URL).
+SERVED_PROFILE_MIRROR_PLATFORMS = SHARED_LISTENER_MIRROR_PLATFORMS | frozenset({"relay"})
 # Path a client appends to ``<default listener>/p/<profile>`` to reach each mirror.
 SHARED_LISTENER_MIRROR_PATHS: dict[str, str] = {"api_server": "/v1", "webhook": "/webhooks/<route>"}
 
