@@ -98,7 +98,7 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
     source = Path(__file__).resolve().parents[2]
     repo = tmp_path / "source"
     repo.mkdir()
-    for name in ("pm", "hermes_cli", "hermes_agent", "utils"):
+    for name in ("pm", "hermes_cli", "hermes_agent", "utils", "agent", "hermes_platform"):
         shutil.copytree(source / name, repo / name,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     for name in ("hermes_constants.py", "hermes_yaml.py",
@@ -111,7 +111,7 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
     (repo / "pyproject.toml").write_text(
         '[project]\nname="cold-pm-app"\nversion="0.0.0"\n'
         'requires-python=">=3.14,<3.15"\n'
-        f'dependencies=[{json.dumps(yaml_requirement)}]\n'
+        f'dependencies=[{json.dumps(yaml_requirement)}, "python-dotenv==1.2.2"]\n'
         '[project.optional-dependencies]\nall=[]\n'
         '[tool.uv]\npackage=false\n', encoding="utf-8",
     )

@@ -3886,22 +3886,65 @@ class GatewayRunner(
         Platform.FEISHU, Platform.WECOM, Platform.WECOM_CALLBACK, Platform.WEIXIN, Platform.BLUEBUBBLES, Platform.QQBOT, Platform.LOCAL,
     })
 
-    def _set_session_env(self, context: SessionContext) -> list:
-        """Set session context variables (contextvars, not os.environ, so concurrent messages can't
-        overwrite each other). Returns reset tokens for ``_clear_session_env`` in a ``finally``."""
-        from gateway.session_context import set_session_vars
+    def _set_session_env(
+        self,
+        context: SessionContext,
+        *,
+        message_id: str | None = None,
+        allow_action_approval: bool | None = None,
+    ) -> list:
+        """Set session context variables for the current async task.
+
+        Uses ``contextvars`` instead of ``os.environ`` so that concurrent
+        gateway messages cannot overwrite each other's session state.
+
+        Returns a list of reset tokens; pass them to ``_clear_session_env``
+        in a ``finally`` block.
+        """
+        from gateway.session_context import build_action_approval_source, set_session_vars
         from gateway.session_detached import session_env_source
         source = session_env_source(self, context.source)
-        # Can async tools wake a later turn here? Default True (CLI/unknown); api_server declares False.
-        _adapter = (getattr(self, "adapters", None) or {}).get(source.platform)
+        # Propagate the adapter's async-delivery capability so async tools
+        # (terminal notify_on_complete / watch_patterns, delegate_task
+        # background=True) know whether this channel can wake a later turn.
+        # Default True keeps CLI / unknown paths working; stateless adapters
+        # (api_server) declare supports_async_delivery=False. Use getattr so
+        # bare runners built via object.__new__ (tests) without self.adapters
+        # don't blow up — they simply default to supported.
+        _adapters = getattr(self, "adapters", None) or {}
+        _adapter = _adapters.get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        # #98619: an admitted API turn carries its session-id provenance; other platforms leave it unset.
+        effective_message_id = "" if source is not context.source else str(
+            message_id if message_id is not None else (context.message_id or source.message_id or "")
+        )
+        effective_action_approval = (
+            context.allow_action_approval
+            if allow_action_approval is None
+            else allow_action_approval
+        )
+        action_approval_source = (
+            build_action_approval_source(
+                platform=source.platform.value,
+                user_id=str(source.user_id or ""),
+                scope_id=str(getattr(source, "scope_id", "") or ""),
+                chat_id=str(source.chat_id or ""),
+                thread_id=str(source.thread_id or ""),
+                message_id=effective_message_id,
+                session_id=context.session_id,
+            )
+            if effective_action_approval and source is context.source
+            else ""
+        )
+        # #98619: an admitted API turn carries its session-id provenance in the admission settings,
+        # and its rebound browser-controller identity; every other platform leaves both undeclared.
         from gateway.session_api_turn import api_session_vars
         _history_delivery = api_session_vars().get("session_history_delivery")
         return set_session_vars(
             platform=source.platform.value,
             chat_id=source.chat_id,
-            chat_type=str(source.chat_type) if source.chat_type else "",
+            chat_type=(
+                str(source.chat_type) if source.chat_type else ""
+            ),
             chat_name=source.chat_name or "",
             thread_id=str(source.thread_id) if source.thread_id else "",
             user_id=str(source.user_id) if source.user_id else "",
@@ -3911,10 +3954,9 @@ class GatewayRunner(
             scope_id=str(getattr(source, "scope_id", "") or ""),
             parent_chat_id=str(getattr(source, "parent_chat_id", "") or ""),
             session_key=context.session_key,
-            # A cached agent binds HERMES_SESSION_ID only on the turn that built it; every later turn
-            # (and a command it yields to the background) must still see its own session.
             session_id=context.session_id or "",
-            message_id=str(source.message_id) if source.message_id else "",
+            message_id=effective_message_id,
+            action_approval_source=action_approval_source,
             profile=getattr(source, "profile", "") or "",
             async_delivery=_async_delivery, cron_session="", session_history_delivery=_history_delivery)
 

@@ -681,3 +681,54 @@ def _get_console_executor() -> concurrent.futures.ThreadPoolExecutor:
                     lambda: _console_executor
                     and _console_executor.shutdown(wait=False, cancel_futures=True))
     return _console_executor
+
+
+def _dashboard_allowed_origins() -> frozenset[str]:
+    """Return explicit reverse-proxy origins trusted for WebSocket upgrades.
+
+    Hopebox exposes a token-authenticated loopback dashboard through a local
+    reverse proxy.  That proxy preserves the browser/Desktop ``Origin`` while
+    rewriting ``Host`` to the loopback upstream, so the normal same-bind WS
+    guard needs this narrow, exact-origin seam.  Keep it separate from
+    ``dashboard.public_url``: the latter intentionally engages the OAuth/basic
+    auth gate, while this legacy deployment remains protected by its session
+    token and loopback peer restriction.
+    """
+    raw = os.environ.get("HERMES_DASHBOARD_ALLOWED_ORIGINS", "")
+    origins = {
+        normalized
+        for item in raw.split(",")
+        if (normalized := _normalize_web_origin(item)) is not None
+    }
+    return frozenset(origins)
+
+
+
+
+def _normalize_web_origin(value: str) -> Optional[str]:
+    """Return a canonical HTTP(S) origin, or ``None`` when malformed."""
+    try:
+        parsed = urllib.parse.urlparse((value or "").strip())
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+
+    scheme = parsed.scheme.lower()
+    hostname = hostname.lower()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    default_port = 443 if scheme == "https" else 80
+    authority = hostname if port in {None, default_port} else f"{hostname}:{port}"
+    return f"{scheme}://{authority}"

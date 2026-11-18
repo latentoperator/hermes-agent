@@ -2,6 +2,7 @@
 
 import os
 import struct
+import tempfile
 import time
 import wave
 from pathlib import Path
@@ -37,6 +38,13 @@ def temp_voice_dir(tmp_path, monkeypatch):
     voice_dir.mkdir()
     monkeypatch.setattr("tools.voice_mode._TEMP_DIR", str(voice_dir))
     return voice_dir
+
+
+@pytest.fixture
+def short_socket_dir():
+    """Keep AF_UNIX paths below Linux's 108-byte sockaddr limit."""
+    with tempfile.TemporaryDirectory(prefix="hermes-sock-") as path:
+        yield Path(path)
 
 
 @pytest.fixture
@@ -110,10 +118,10 @@ def fake_clock(monkeypatch):
 
 @pytest.mark.platforms("linux")
 class TestPulseSocketReachable:
-    def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path):
+    def test_stale_socket_file_not_reachable(self, monkeypatch, short_socket_dir):
         """A socket file with no listener should not count as reachable."""
         import socket as _socket
-        runtime_dir = tmp_path.parent / "pulse-stale"
+        runtime_dir = short_socket_dir / "pulse-stale"
         sock_path = runtime_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
@@ -126,10 +134,12 @@ class TestPulseSocketReachable:
         from tools.voice_mode import _pulse_socket_reachable
         assert _pulse_socket_reachable() is False
 
-    def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, tmp_path):
+    def test_listening_socket_reachable_via_xdg_runtime(
+        self, monkeypatch, short_socket_dir
+    ):
         """A live PulseAudio-style socket under XDG_RUNTIME_DIR is reachable (#35622)."""
         import socket as _socket
-        runtime_dir = tmp_path.parent / "pulse-live"
+        runtime_dir = short_socket_dir / "pulse-live"
         sock_path = runtime_dir / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)

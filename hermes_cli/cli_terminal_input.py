@@ -367,7 +367,8 @@ def _terminal_supports_extended_enter_keys(env: Optional[Mapping[str, str]] = No
     term_program = (env.get("TERM_PROGRAM") or "").strip()
     term = (env.get("TERM") or "").strip().lower()
     return bool(
-        env.get("WT_SESSION")
+        env.get("HERDR_ENV") == "1"
+        or env.get("WT_SESSION")
         or term_program in {"iTerm.app", "WezTerm", "ghostty", "vscode"}
         or env.get("KITTY_WINDOW_ID") or "kitty" in term
         or term == "xterm-ghostty"
@@ -398,7 +399,13 @@ def _enable_extended_enter_keys(output=None, env: Optional[Mapping[str, str]] = 
     from cli import _EXTENDED_ENTER_KEYS_SEQ, _MODIFY_OTHER_KEYS_SEQ, _is_ghostty_terminal, _terminal_supports_extended_enter_keys
     if not _terminal_supports_extended_enter_keys(env):
         return False
-    seq = _MODIFY_OTHER_KEYS_SEQ if _is_ghostty_terminal(env) else _EXTENDED_ENTER_KEYS_SEQ
+    # Herdr provides a nested terminal; outer-terminal markers can be inherited.
+    # Use its modifyOtherKeys support without enabling Kitty mode, which can
+    # misencode shifted punctuation in Herdr panes.
+    current_env = os.environ if env is None else env
+    seq = (_MODIFY_OTHER_KEYS_SEQ
+           if current_env.get("HERDR_ENV") == "1" or _is_ghostty_terminal(current_env)
+           else _EXTENDED_ENTER_KEYS_SEQ)
     try:
         if output is not None and hasattr(output, "write_raw"):
             output.write_raw(seq)

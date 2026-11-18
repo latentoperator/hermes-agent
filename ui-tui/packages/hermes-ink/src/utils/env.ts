@@ -13,6 +13,12 @@ function detectTerminal(): TerminalName {
     return 'kitty'
   }
 
+  // Herdr panes report TERM=xterm-256color and may inherit the outer
+  // terminal's TERM_PROGRAM, so detect the multiplexer itself first.
+  if (process.env.HERDR_ENV) {
+    return 'herdr'
+  }
+
   if (process.env.TERM_PROGRAM) {
     return process.env.TERM_PROGRAM
   }

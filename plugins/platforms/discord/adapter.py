@@ -308,7 +308,7 @@ from gateway.platforms.helpers import (
 from gateway.platforms.helpers import cancel_task, inline_document_text
 from utils import atomic_json_write, env_float
 from gateway.platforms.base import (
-    BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
+    BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
     cache_image_from_url, cache_image_from_bytes_async, cache_audio_from_url, cache_audio_from_bytes_async,
     cache_document_from_bytes_async, SUPPORTED_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit, utf16_len, validate_inbound_media_size,
@@ -3154,12 +3154,14 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordAuthorizationMixin, DiscordMe
             )
             result = SendResult(success=False, error="Refusing to send empty message")
             # Backfill replays from this table: record the dropped final reply as failed or it is lost.
-            return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
+            return await self._record_response_async(
+                reply_to, result, content, bool(metadata and metadata.get("notify")), metadata
+            )
+        nonconversational = _metadata_marks_nonconversational(metadata)
         try:
             thread_id = None
             if metadata and metadata.get("thread_id"):
                 thread_id = metadata["thread_id"]
-            nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
             if thread_id:
                 channel = await self._resolve_channel(thread_id)
@@ -3212,13 +3214,20 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordAuthorizationMixin, DiscordMe
             )
             return await self._record_response_async(reply_to, result, content, final_delivery, metadata)
         except Exception as e:  # pragma: no cover - defensive logging
-            logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
+            unavailable_target_kind = self._discord_unavailable_target_kind(e)
+            error_kind = unavailable_target_kind or classify_send_error(e)
+            if nonconversational and unavailable_target_kind is not None:
+                logger.debug("[%s] Skipping non-conversational Discord send to unavailable target: %s", self.name, e)
+            else:
+                logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             if _is_discord_transport_error(e):
                 # Connection-shaped failure: runtime-retryable marker so the reconnect sweep can replay it.
-                result = SendResult(success=False, error="send_path_degraded", retryable=True)
+                result = SendResult(success=False, error="send_path_degraded", error_kind=error_kind, retryable=True)
             else:
-                result = SendResult(success=False, error=str(e))
-            return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")), metadata)
+                result = SendResult(success=False, error=str(e), error_kind=error_kind)
+            return await self._record_response_async(
+                reply_to, result, content, bool(metadata and metadata.get("notify")), metadata
+            )
 
     @staticmethod
     def _forum_thread_parts(thread: Any) -> tuple:
@@ -6219,6 +6228,26 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordAuthorizationMixin, DiscordMe
             await self.handle_message(event)
         return True
 
+    @staticmethod
+    def _discord_unavailable_target_kind(exc: BaseException) -> Optional[str]:
+        """Classify errors proving a captured Discord route is gone."""
+        code = getattr(exc, "code", None)
+        if code is None:
+            data = getattr(exc, "data", None)
+            if isinstance(data, dict):
+                code = data.get("code")
+        try:
+            code = int(code) if code is not None else None
+        except (TypeError, ValueError):
+            code = None
+
+        text = str(exc).lower()
+        if code == 50001 or "error code: 50001" in text or "missing access" in text:
+            return "forbidden"
+        if code == 10003 or "error code: 10003" in text or "unknown channel" in text:
+            return "not_found"
+        return None
+
     def _text_batch_delay_for(self, pending: Optional[MessageEvent]) -> float:
         """A bot handoff's continuation chunks arrive at Discord's send rate (~1/s), so a
         batch opened by a bot tag waits the split delay regardless of chunk length."""
@@ -6669,6 +6698,7 @@ def _define_discord_view_classes() -> None:
                 except Exception:
                     pass
 
+
     class ClarifyChoiceView(_HermesView):
         """One button per clarify choice (max 24) plus ``✏️ Other``. A numeric click resolves the
         gateway clarify entry immediately; ``Other`` flips to text-capture (next message answers).
@@ -7070,6 +7100,7 @@ async def _standalone_send(
         shown = describe_proxy_error(e, _proxy)
         logger.error("Discord standalone send failed%s", f": {shown}" if shown else "", exc_info=not shown)
         return send_error(f"Discord send failed: {shown or f'{type(e).__name__}: {e}'}", nothing_sent=last_data is None and request_never_left(e))
+
 
 
 # ── Plugin entry point ────────────────────────────────────────────────────────

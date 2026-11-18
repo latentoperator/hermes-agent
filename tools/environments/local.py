@@ -748,6 +748,8 @@ def _managed_runtime_path_entries() -> list[str]:
     - ``$HERMES_HOME/bin`` — the managed ``uv``. ``install.sh`` writes it there
       and nothing has ever put that directory on PATH, so an install whose only
       uv is the managed one looks uv-less to both the agent and the model.
+    - the default Hermes root's ``bin`` — shared fleet tools remain available
+      to terminal commands running under a named profile.
 
     Resolved per call rather than cached in a module constant because
     ``get_hermes_home()`` is profile-scoped and a managed runtime can appear
@@ -755,12 +757,12 @@ def _managed_runtime_path_entries() -> list[str]:
     """
     try:
         import pm
-        from hermes_constants import get_hermes_home
+        from hermes_constants import get_default_hermes_root, get_hermes_home
 
         env = pm.env_for("npm", base_env={"PATH": ""})
         managed = [Path(d) for d in env.get("PATH", "").split(os.pathsep) if d]
-        candidates = [*managed, get_hermes_home() / "bin"]
-        return [str(d) for d in candidates if d.is_dir()]
+        candidates = [*managed, get_hermes_home() / "bin", get_default_hermes_root() / "bin"]
+        return list(dict.fromkeys(str(d) for d in candidates if d.is_dir()))
     except Exception:
         return []
 

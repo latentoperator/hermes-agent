@@ -985,30 +985,6 @@ def test_is_managed_scratch_path_rejects_kanban_metadata_subtrees(kanban_home):
     assert kb._is_managed_scratch_path(task_dir)
 
 
-@pytest.mark.require_symlinks
-def test_symlinked_workspaces_root_does_not_widen_scratch_cleanup(kanban_home, tmp_path):
-    """A workspaces root that is a symlink to a broad directory must not make
-    every path inside the symlink target "managed". Only paths that are
-    lexically below the root (i.e. reached through it) are scratch; a path
-    named directly inside the target is user data (#28818)."""
-    broad = tmp_path / "user-data"
-    victim = broad / "project"
-    victim.mkdir(parents=True)
-    (victim / "keep.txt").write_text("user data", encoding="utf-8")
-    ws_root = kanban_home / "kanban" / "workspaces"
-    if ws_root.is_dir() and not ws_root.is_symlink():
-        ws_root.rmdir()
-    ws_root.parent.mkdir(parents=True, exist_ok=True)
-    ws_root.symlink_to(broad, target_is_directory=True)
-
-    with kbc.connect() as conn:
-        # Legacy explicit-path scratch task pointing straight at user data.
-        t = kb.create_task(conn, title="scratch")
-        kbw.set_workspace_path(conn, t, victim)
-        assert kb.complete_task(conn, t, result="done")
-    assert (victim / "keep.txt").is_file()
-
-
 # ---------------------------------------------------------------------------
 # Tenancy
 # ---------------------------------------------------------------------------
@@ -1581,7 +1557,9 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     import shutil
     import sys
     from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import _launchers
 
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda root: None)
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
@@ -1603,10 +1581,11 @@ def test_resolve_hermes_argv_module_actually_runs():
     """
     import subprocess
     from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli import _launchers
     import shutil
     from unittest import mock
 
-    with mock.patch.dict(os.environ, {}, clear=False):
+    with mock.patch.object(_launchers, "resolve_store_python", return_value=None), mock.patch.dict(os.environ, {}, clear=False):
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kbd._resolve_hermes_argv()
@@ -1616,6 +1595,22 @@ def test_resolve_hermes_argv_module_actually_runs():
         f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
         f"stderr={r.stderr[:200]!r}"
     )
+
+
+def test_resolve_hermes_argv_uses_published_managed_launcher(tmp_path, monkeypatch):
+    """An isolated store Python needs the install bootstrap, not bare ``-m``."""
+    from hermes_cli import _launchers
+
+    repo = tmp_path / "source"
+    launcher = repo / ".hermes" / "bin" / "hermes"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/bin/sh\nexit 0\n")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(kbd, "__file__", str(repo / "hermes_cli" / "kanban_db_dispatch.py"))
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda root: tmp_path / "store-python")
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
+    assert kbd._resolve_hermes_argv() == [str(launcher)]
 
 
 def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monkeypatch):

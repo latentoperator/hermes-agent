@@ -1733,6 +1733,12 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
         return data if want_deepcopy else cached_copy
 
 
+def invalidate_raw_config_cache(config_path: Path | None = None) -> None:
+    """Force the next raw read to observe edits even when mtime and size are unchanged."""
+    with _CONFIG_LOCK:
+        _RAW_CONFIG_CACHE.pop(str(config_path if config_path is not None else get_config_path()), None)
+
+
 def read_raw_config() -> dict[str, Any]:
     """Read config.yaml as-is (no defaults merged, no migration); ``{}`` if missing/unparseable.
     Cached on the file signature (mtime_ns, size, ino, ctime_ns); returns a deepcopy since callers mutate before ``save_config()``."""

@@ -142,6 +142,8 @@ export interface ConfigDisplayConfig {
   bell_on_complete?: boolean
   bell_on_prompt?: boolean
   busy_input_mode?: string
+  /** true/false overrides the platform default; auto enables copy-on-select on macOS only. */
+  copy_on_select?: 'auto' | boolean
   details_mode?: string
   /** Focus view (/focus) — display-only reduced-output mode. */
   focus_view?: boolean

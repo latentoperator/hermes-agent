@@ -52,7 +52,7 @@ _STATIC_FEATURE_FLAGS = {
     "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
     "reasoning_streaming": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
-    "skills_api": True, "audio_api": False, "realtime_voice": False,
+    "skills_api": True, "profile_roster": True, "audio_api": False, "realtime_voice": False,
     "session_continuity_header": "X-Hermes-Session-Id",
     "session_key_header": "X-Hermes-Session-Key"}
 # /v1/capabilities "endpoints" table: name -> (method, path[, feature]). An entry naming a
@@ -69,8 +69,8 @@ _CAPABILITY_ENDPOINTS = (
     ("run_unknown_resolution", ("POST", "/v1/runs/{run_id}/resolve-unknown", "run_unknown_resolution")),
     ("run_stop", ("POST", "/v1/runs/{run_id}/stop")), ("skills", ("GET", "/v1/skills")),
     ("toolsets", ("GET", "/v1/toolsets")), ("sessions", ("GET", "/api/sessions")),
-    ("session_create", ("POST", "/api/sessions")),
-    ("session", ("GET", "/api/sessions/{session_id}")),
+    ("profiles", ("GET", "/v1/profiles", "profile_roster")), ("session_create", ("POST", "/api/sessions")),
+    ("profile_avatar", ("GET", "/v1/profiles/{name}/avatar", "profile_roster")), ("session", ("GET", "/api/sessions/{session_id}")),
     ("session_update", ("PATCH", "/api/sessions/{session_id}")),
     ("session_delete", ("DELETE", "/api/sessions/{session_id}")),
     ("session_messages", ("GET", "/api/sessions/{session_id}/messages")),
@@ -111,7 +111,7 @@ except ImportError:
 from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
-from gateway.platforms import api_server_room_grants as _room_grants
+from gateway.platforms import api_server_profiles as _api_profiles, api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
@@ -1539,11 +1539,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     async def _handle_profile_ingress(self, request: web.Request) -> web.StreamResponse:
         """``/p/<profile>/<tail>`` → the served profile's shared-listener adapter (already scoped by the
-        prefix middleware); a profile with no adapter for the path is a 404, never the default's."""
+        prefix middleware); a profile with no adapter for the path is a 404, never the default's.
+        ``/api/plugins/...`` first tries the named profile's OWN plugin routes."""
+        from gateway.platforms.api_server_profile_plugins import dispatch_profile_plugin_route
         from gateway.platforms.shared_ingress import dispatch_profile_ingress
-        return await dispatch_profile_ingress(
-            self.gateway_runner, _api_request_profile.get(), request.match_info.get("tail", ""), request,
-            scoped=True)
+        profile, tail = _api_request_profile.get(), request.match_info.get("tail", "")
+        response = await dispatch_profile_plugin_route(self, profile, tail, request)
+        if response is not None:
+            return response
+        return await dispatch_profile_ingress(self.gateway_runner, profile, tail, request, scoped=True)
 
     def _make_profile_prefix_middleware(self):
         """Reject unknown /p/<profile>/ prefixes and scope the request home."""
@@ -1600,7 +1604,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
-        routes.extend(_api_runs._http_routes(self))
+        routes.extend(_api_runs._http_routes(self) + _api_profiles._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
@@ -2388,9 +2392,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         try:
             from tools.skills_tool import find_all_skills, sort_skills
             skills = sort_skills(
-                find_all_skills(
-                    skip_disabled=False, include_editorial=True
-                )
+                find_all_skills(skip_disabled=False)
             )
         except Exception:
             logger.exception("GET /v1/skills failed")
@@ -3969,6 +3971,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
             # Plugin-registered native handlers, wired before AppRunner.setup() freezes the router.
             self._wire_plugin_handlers(self._app)
+            from gateway.platforms import api_server_profile_plugins as _profile_plugins
+            self._app.on_response_prepare.append(_profile_plugins.make_response_prepare_relay(self))
+            _profile_plugins.reopen_profile_plugin_apps(self)
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
 # Bind directly instead of probing 127.0.0.1 first — the old single-family pre-probe raced the
@@ -4038,6 +4043,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         files, #37011).
         """
         self._mark_disconnected()
+        from gateway.platforms import api_server_profile_plugins as _profile_plugins
+        _profile_plugins.begin_closing_profile_plugin_apps(self)
         # getattr: disconnect() tolerates bare __new__ fixtures (pinned in test_api_server_run_idempotency).
         routed = getattr(self, "_response_stores", {})
         stores = [s for s in (getattr(self, "_response_store", None), *list(routed.values())) if s is not None]
@@ -4057,6 +4064,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await self._runner.cleanup()
                 self._runner = None
         finally:
+            # After the listener drained: no request still runs on a per-profile plugin app.
+            await _profile_plugins.close_profile_plugin_apps(self)
             _api_runs._close_run_state(self)  # after site.stop(): no late request re-mints the executor
             self._close_cached_session_dbs()
             self._app = None

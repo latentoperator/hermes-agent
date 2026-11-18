@@ -1,4 +1,6 @@
 """The workspace and admission paths agree on scoped keys and disabled plugins."""
+import pytest
+
 from pm.workspace import enabled_member_dirs
 
 

@@ -266,6 +266,10 @@ def ws_host_origin_reason(ws, state) -> Optional[str]:
     origin = ws.headers.get("origin", "")
     if not origin:
         return None
+    from hermes_cli.web_server_chat import _normalize_web_origin
+    normalized_origin = _normalize_web_origin(origin)
+    if normalized_origin and normalized_origin in getattr(state, "trusted_proxy_origins", frozenset()):
+        return None
     try:
         parsed = urllib.parse.urlparse(origin)
     except ValueError:  # malformed authority, e.g. "http://[::1" — fail closed

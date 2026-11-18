@@ -317,8 +317,18 @@ export function parseOscColor(data: string): string | undefined {
 // and emit codepoints our input parser doesn't handle (notably over SSH and
 // in xterm.js-based terminals like VS Code). tmux is allowlisted because it
 // accepts modifyOtherKeys and doesn't forward the kitty sequence to the outer
-// terminal.
-const EXTENDED_KEYS_TERMINALS = ['iTerm.app', 'kitty', 'WezTerm', 'ghostty', 'tmux', 'windows-terminal', 'vscode']
+// terminal. Herdr only encodes modified Enter (CSI 13;2u) after a pane
+// requests enhanced keys, so it must opt in here for Shift+Enter to work.
+const EXTENDED_KEYS_TERMINALS = [
+  'iTerm.app',
+  'kitty',
+  'WezTerm',
+  'ghostty',
+  'tmux',
+  'windows-terminal',
+  'vscode',
+  'herdr'
+]
 
 /** True if this terminal correctly handles extended key reporting
  *  (Kitty keyboard protocol + xterm modifyOtherKeys). */

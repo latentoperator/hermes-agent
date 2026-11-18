@@ -994,6 +994,8 @@ def _configure_auth_gate(
     own_url = getattr(app.state, "listener_public_url", None)
     app.state.trusted_public_hosts = (
         _dashboard_public_hosts() if own_url is None else public_url_hosts(own_url))
+    from hermes_cli.web_server_chat import _dashboard_allowed_origins
+    app.state.trusted_proxy_origins = _dashboard_allowed_origins()
     app.state.trusted_public_origins = (  # its exact loopback origin: a proxy on another local port
         _dashboard_public_origins() if own_url is None else public_url_origins(own_url))
     # auth_required drives middleware, SPA-token injection, WS auth, the

@@ -136,6 +136,17 @@ def test_unknown_terminal_does_not_enable_extended_enter_keys():
     assert cli_mod._terminal_supports_extended_enter_keys({"TERM_PROGRAM": "unknown"}) is False
 
 
+def test_herdr_requests_modify_other_keys_without_kitty_mode():
+    """Herdr panes need enhanced Enter reports, but Kitty mode can corrupt punctuation."""
+    import cli as cli_mod
+
+    env = {"HERDR_ENV": "1", "TERM": "xterm-256color"}
+    assert cli_mod._terminal_supports_extended_enter_keys(env) is True
+    out = _FakeOutput()
+    assert cli_mod._enable_extended_enter_keys(output=out, env=env) is True
+    assert out.written == b"\x1b[>4;2m"
+
+
 # ---------------------------------------------------------------------------
 # Ghostty: must push ONLY modifyOtherKeys, not the Kitty keyboard protocol —
 # see cli._is_ghostty_terminal for the full rationale (#87630).

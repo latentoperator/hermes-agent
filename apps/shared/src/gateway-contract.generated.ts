@@ -5537,6 +5537,15 @@ export interface CanonicalAttachedImageResult {
   message?: string | null
   mime: string
 }
+export interface CanonicalImageRenderParams {
+  path: string
+  cols: number
+  rows: number
+  graphics?: boolean
+  terminal?: 'kitty' | 'unicode'
+  session_id: string
+  profile?: string | null
+}
 export interface CanonicalRoomAttemptParams {
   profile?: string | null
   room_id: string
@@ -7180,6 +7189,7 @@ export interface CanonicalRpcMethods {
   'groups.peer.revoke': { params: CanonicalGroupsPeerRevokeParams; result: GroupsPeerRevokeResult }
   'groups.retry': { params: CanonicalRoomAttemptParams; result: GroupsRetryResult }
   'image.attach_bytes': { params: ImageAttachBytesParams; result: CanonicalAttachedImageResult }
+  'image.render': { params: CanonicalImageRenderParams; result: ImageRenderResult }
   /** Native-owner only: admit the dispatcher's current claim on a kanban task. */
   'kanban.run': { params: KanbanRunParams; result: KanbanRunResult }
   'profiles.list': { params: CanonicalProfilesParams; result: CanonicalProfilesResult }
@@ -7258,6 +7268,7 @@ export const CANONICAL_RPC_METHODS = [
   'groups.peer.revoke',
   'groups.retry',
   'image.attach_bytes',
+  'image.render',
   'kanban.run',
   'profiles.list',
   'prompt.cancel',

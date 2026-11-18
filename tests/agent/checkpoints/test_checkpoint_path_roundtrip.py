@@ -21,6 +21,7 @@ def _assert_safe_restore(tmp_path, monkeypatch, names):
     work = tmp_path / "project"
     work.mkdir()
     (work / "AGENTS.md").write_text("Project instructions\n", encoding="utf-8")
+    (work / "pyproject.toml").write_text("[project]\nname = 'checkpoint-test'\n", encoding="utf-8")
 
     for name in names:
         (work / name).write_text("original\n", encoding="utf-8")

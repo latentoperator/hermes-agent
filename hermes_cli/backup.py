@@ -101,10 +101,8 @@ _EXCLUDED_DIRS = {
 # a deeper directory of the same name (such as a skill's models/) is user data.
 _EXCLUDED_ROOT_DIRS = LOCAL_RUNTIME_ROOT_DIRS | (PM_RUNTIME_ROOT_DIRS - {"cache"})
 
-# Browser Use CLI profile dir (browser.backend: browser-use): Chromium user-data with Login Data / Cookies;
-# the secret caches and Photon sidecar token. Root-scoped like models/ — a skill's own browser_profiles/ is
-# user data. Backup-only: do not fold into LOCAL_RUNTIME_ROOT_DIRS (clone-all identity contract).
-_EXCLUDED_BACKUP_ROOT_DIRS = frozenset({"browser_profiles", *SECRET_CACHE_FILES})
+# Exclude operator archives and checkouts as well as browser and secret caches at profile roots.
+_EXCLUDED_BACKUP_ROOT_DIRS = frozenset({"browser_profiles", "maintenance-backups", "worktrees", *SECRET_CACHE_FILES})
 
 # ``cache/`` at those same roots mixes regenerable state (model/plugin catalogs, stamps, browser
 # profiles with locked SQLite, tool-output spill) with durable artifacts nothing can rebuild: media

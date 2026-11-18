@@ -1620,3 +1620,20 @@ class TestSanePathIncludesHomebrew:
             result = _make_run_env({})
         assert result["Path"] == windows_env["Path"]
         assert "PATH" not in result
+
+
+def test_profile_terminal_path_includes_shared_bin(tmp_path, monkeypatch):
+    import pm
+    from tools.environments.local import _managed_runtime_path_entries
+
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "dante"
+    (root / "bin").mkdir(parents=True)
+    (profile / "bin").mkdir(parents=True)
+    monkeypatch.setattr(pm, "env_for", lambda *args, **kwargs: {"PATH": ""})
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: profile)
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
+
+    entries = _managed_runtime_path_entries()
+    assert str(profile / "bin") in entries
+    assert str(root / "bin") in entries

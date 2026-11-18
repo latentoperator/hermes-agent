@@ -786,6 +786,8 @@ class GatewayTurnPrepareMixin:
         _was_auto_reset, _is_new_session = await self._hmwa_open_session(session_entry, session_key, source)
         restore_gateway_yolo(session_key, session_entry.yolo)  # None: TurnRunner seeds the launch policy
         context = build_session_context(source, self.config, session_entry, event)
+        context.message_id = str(event.message_id) if event.message_id else ""
+        context.allow_action_approval = not bool(getattr(event, "internal", False))
         # Session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
         # Self-injected turns (internal=True) persist with a DB-only display_kind: timeline notices, not user bubbles.

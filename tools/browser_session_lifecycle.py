@@ -232,6 +232,9 @@ def cleanup_all_browsers() -> None:
     _best_effort("Lightpanda stop", _stop_lightpanda)
     from tools.browser_session_cloud import reset_caches
     reset_caches()
+    # Reload config after browser cleanup, including preserved-mtime edits.
+    from hermes_cli.config import invalidate_raw_config_cache
+    invalidate_raw_config_cache()
 
 
 def emergency_cleanup_all_sessions() -> None:
