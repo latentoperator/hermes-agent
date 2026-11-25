@@ -144,6 +144,8 @@ export interface ConfigDisplayConfig {
   /** OSC 7501 Program Status reports (default on). */
   program_status?: boolean
   busy_input_mode?: string
+  /** true/false overrides the platform default; auto enables copy-on-select on macOS only. */
+  copy_on_select?: 'auto' | boolean
   details_mode?: string
   /** Focus view (/focus) — display-only reduced-output mode. */
   focus_view?: boolean

@@ -11,6 +11,7 @@ whole-file overwrite of content this task never saw or that changed since.
 """
 
 import fnmatch
+import logging
 import os
 import unicodedata
 from pathlib import Path
@@ -28,6 +29,8 @@ from tools.file_tools_paths import (
     _expand_tilde, _resolve_path_for_task, _ssh_path_escapes_home, _terminal_env_type_for_task)
 from tools.file_tools_read_tracking import _has_full_write_baseline, _is_own_blind_patch, _read_mtime_drifted
 import itertools
+
+logger = logging.getLogger("tools.file_tools")
 
 # Prefixes matched after realpath. macOS: /private/var mirrors /var — block the
 # sensitive subtrees only; a blanket "/private/var/" refuses every temp-file
@@ -357,6 +360,8 @@ def _check_protected_instruction_write(paths: list[str], task_id: str = "default
                            for p in paths) if r]
     if not reasons:
         return None
+    if _claim_kanban_protected_write_grant(paths, task_id):
+        return None
     return _request_protected_instruction_approval(reasons, task_id)
 
 
@@ -664,3 +669,42 @@ def _looks_like_read_file_line_numbered_content(content: str) -> bool:
 def _is_internal_file_tool_content(content: str) -> bool:
     """Return True when content is file-tool display text, not intended file bytes."""
     return _is_internal_file_status_text(content) or _looks_like_read_file_line_numbered_content(content)
+
+
+def _claim_kanban_protected_write_grant(
+        paths: list[str], task_id: str = "default") -> bool:
+    """Consume an exact Decision Card grant for a headless Kanban write.
+
+    Interactive sessions keep the existing one-operation prompt. This bridge
+    runs only for dispatcher workers, where ``chat -q`` has no callback/stdin
+    and a durable Decision Card is the human approval transport.
+    """
+    kanban_task = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
+    if not kanban_task or not profile:
+        return False
+
+    resolved: list[str] = []
+    for path in paths:
+        try:
+            target = _resolve_path_for_task(path, task_id)
+        except (OSError, ValueError, RuntimeError):
+            target = Path(_expand_tilde(path))
+        resolved.append(os.path.realpath(str(target)))
+
+    try:
+        from gateway.decision_cards import claim_protected_instruction_write
+
+        return claim_protected_instruction_write(
+            task_id=kanban_task,
+            profile=profile,
+            paths=resolved,
+        ) is not None
+    except Exception as exc:
+        # The Decision Card bridge is an optional authorization source, never a
+        # reason to fail open. The normal prompt/fail-closed path runs below.
+        logger.warning(
+            "protected instruction Decision Card lookup failed closed: %s",
+            exc,
+        )
+        return False

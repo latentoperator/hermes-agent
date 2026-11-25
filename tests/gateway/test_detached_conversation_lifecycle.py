@@ -68,6 +68,10 @@ async def test_what_the_old_conversation_schedules_for_here_names_the_app_not_th
     with runner._session_env_scope(build_session_context(live.source, runner.config, entry)):
         env = {name: get_session_env(f'HERMES_SESSION_{name}') for name in ('PLATFORM', 'CHAT_ID', 'KEY')}
         origin = _origin_from_env()
+        approval_source = get_session_env('HERMES_ACTION_APPROVAL_SOURCE')
+        message_id = get_session_env('HERMES_SESSION_MESSAGE_ID')
+    assert approval_source == ''
+    assert message_id == ''
     assert env == {'PLATFORM': 'local', 'CHAT_ID': ref_a.session_id, 'KEY': live.route}
     assert origin is None or origin['platform'] == 'local', origin
 

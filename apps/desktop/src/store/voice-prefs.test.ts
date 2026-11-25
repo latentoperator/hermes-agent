@@ -20,13 +20,16 @@ import {
   applyVoiceStopPhraseFromConfig
 } from './voice-prefs'
 
+// jsdom methods live on the prototype; the Node 26 test fallback owns them directly.
+const storageMethodOwner = () => localStorage instanceof Storage ? Storage.prototype : localStorage
+
 it('keeps the desktop toggle local across config refreshes', async () => {
   for (const fails of [false, true]) {
     for (const enabled of [false, true]) {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const write = vi.spyOn(storageMethodOwner(), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {
@@ -55,7 +58,7 @@ it('migrates the legacy preference once, not on every refresh', async () => {
       localStorage.clear()
       vi.resetModules()
       const prefs = await import('./voice-prefs')
-      const write = vi.spyOn(localStorage, 'setItem')
+      const write = vi.spyOn(storageMethodOwner(), 'setItem')
 
       if (fails) {
         write.mockImplementation(() => {

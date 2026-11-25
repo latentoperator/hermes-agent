@@ -769,7 +769,7 @@ class _KanbanNotification:
         try:
             self.plat = self.platform_cls(self.platform_str)
         except ValueError:
-            await self.advance()
+            # The claim already advanced this cursor.
             return
         # Recheck the exact route after claiming: config/adapters can change between ticks. The
         # recheck reads the served profile's session store for a stateless destination, so it runs
@@ -847,8 +847,7 @@ class _KanbanNotification:
                 )
                 return
 
-        # Delivery complete: advance the cursor (the dedup mechanism).
-        await self.advance()
+        # Claim already advanced the cursor; a late completion must not regress it.
         if not is_push:
             self.clear_failures()
         # Unsubscribe only on archive; ``done`` is reversible.

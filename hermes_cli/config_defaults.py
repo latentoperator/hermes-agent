@@ -833,7 +833,7 @@ DEFAULT_CONFIG = {
         "resume_last_session": True,
         # One-time TUI hint ("subagents working · /agents to watch live") on first delegation.
         "tui_agents_nudge": True,
-        "bell_on_complete": False,
+        "bell_on_complete": False, "copy_on_select": "auto",  # Ink TUI: auto = macOS only; bool overrides.
         "bell_on_prompt": False,   # bell when a blocking prompt opens (clarify/approval/sudo)
         "program_status": True,    # OSC 7501 idle/working/blocked/done/error for terminals that track it
         # Stream reasoning live before the response; otherwise thinking models show a bare spinner.

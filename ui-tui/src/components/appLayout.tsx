@@ -35,6 +35,7 @@ import { GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } 
 import { FloatingOverlays, PromptZone } from './appOverlays.js'
 import { Banner, Panel, SessionPanel } from './branding.js'
 import { HalfBlockImage, KittyImage } from './cellImage.js'
+import { CopyFeedback } from './copyFeedback.js'
 import { FpsOverlay } from './fpsOverlay.js'
 import { GoalBar } from './goalBar.js'
 import { HelpHint } from './helpHint.js'
@@ -334,22 +335,23 @@ function ComposerHintRow({
   const ui = useStore($uiState)
   const backtrackHint = useBacktrackHint()
 
-  if (backtrackHint) {
-    return (
-      <Text color={ui.theme.color.muted} wrap="truncate-end">
-        {backtrackHint}
-      </Text>
-    )
-  }
+  return (
+    <Box height={1} onMouseDown={onMouseDown} onMouseDrag={onMouseDrag} onMouseUp={onMouseUp}>
+      <Box flexGrow={1} flexShrink={1} minWidth={0}>
+        {backtrackHint ? (
+          <Text color={ui.theme.color.muted} wrap="truncate-end">
+            {backtrackHint}
+          </Text>
+        ) : status.showStickyPrompt ? (
+          <Text color={ui.theme.color.muted} wrap="truncate-end">
+            <Text color={ui.theme.color.label}>↳ </Text>
 
-  return status.showStickyPrompt ? (
-    <Text color={ui.theme.color.muted} wrap="truncate-end">
-      <Text color={ui.theme.color.label}>↳ </Text>
-
-      {status.stickyPrompt}
-    </Text>
-  ) : (
-    <Box height={1} onMouseDown={onMouseDown} onMouseDrag={onMouseDrag} onMouseUp={onMouseUp} />
+            {status.stickyPrompt}
+          </Text>
+        ) : null}
+      </Box>
+      <CopyFeedback />
+    </Box>
   )
 }
 

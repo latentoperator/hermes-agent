@@ -2362,6 +2362,7 @@ all = [
     { name = "mcp" },
     { name = "pyasn1" },
     { name = "python-multipart" },
+    { name = "pyyaml" },
     { name = "starlette" },
     { name = "uvicorn" },
     { name = "uvloop", marker = "platform_python_implementation != 'PyPy' and sys_platform != 'android' and sys_platform != 'cygwin' and sys_platform != 'win32'" },
@@ -2443,6 +2444,9 @@ google-chat = [
 google-meet = [
     { name = "playwright", marker = "sys_platform != 'android'" },
     { name = "websockets", marker = "sys_platform != 'android'" },
+]
+hindsight = [
+    { name = "hindsight-client" },
 ]
 keychain = [
     { name = "keyring" },
@@ -2532,6 +2536,7 @@ termux-all = [
     { name = "pyasn1" },
     { name = "python-multipart" },
     { name = "python-telegram-bot", extra = ["webhooks"] },
+    { name = "pyyaml" },
     { name = "starlette" },
     { name = "uvicorn" },
 ]
@@ -2581,6 +2586,7 @@ wake-sherpa = [
 web = [
     { name = "fastapi" },
     { name = "python-multipart" },
+    { name = "pyyaml" },
     { name = "starlette" },
     { name = "uvicorn" },
 ]
@@ -2672,6 +2678,7 @@ requires-dist = [
     { name = "hermes-agent", extras = ["web"], marker = "extra == 'all'" },
     { name = "hermes-agent", extras = ["web"], marker = "extra == 'termux-all'" },
     { name = "hermes-agent", extras = ["youtube"], marker = "extra == 'all'" },
+    { name = "hindsight-client", marker = "extra == 'hindsight'", specifier = "==0.10.1" },
     { name = "httplib2", marker = "extra == 'google'", specifier = "==0.32.0" },
     { name = "httptools", marker = "python_full_version >= '3.14'", specifier = ">=0.6.3,<0.9" },
     { name = "httpx", extras = ["socks"], marker = "python_full_version >= '3.14'", specifier = "==0.28.1" },
@@ -2733,6 +2740,7 @@ requires-dist = [
     { name = "python-telegram-bot", extras = ["webhooks"], marker = "extra == 'termux'", specifier = "==22.8" },
     { name = "pywin32", marker = "python_full_version >= '3.14' and sys_platform == 'win32'", specifier = ">=306,<312" },
     { name = "pywinpty", marker = "python_full_version >= '3.14' and sys_platform == 'win32'", specifier = ">=3.0.5,<4" },
+    { name = "pyyaml", marker = "extra == 'web'", specifier = "==6.0.3" },
     { name = "qrcode", marker = "extra == 'dingtalk'", specifier = "==7.4.2" },
     { name = "qrcode", marker = "extra == 'feishu'", specifier = "==7.4.2" },
     { name = "qrcode", marker = "extra == 'messaging'", specifier = "==7.4.2" },
@@ -2777,7 +2785,7 @@ requires-dist = [
     { name = "winrt-windows-services-store", marker = "python_full_version >= '3.14' and sys_platform == 'win32'", specifier = ">=3.2.1,<4" },
     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = "==1.2.4" },
 ]
-provides-extras = ["uvloop", "anthropic", "exa", "firecrawl", "parallel-web", "ddgs", "fal", "edge-tts", "neutts", "kittentts", "piper", "modal", "daytona", "vercel", "google-meet", "messaging", "cron", "slack", "matrix", "wecom", "keychain", "tts-premium", "voice", "wake", "telegram", "discord", "stt-whisper", "audio-io", "silk", "wake-openwakeword", "wake-sherpa", "wake-porcupine", "google-chat", "doc-extract", "documents", "documents-pdf", "trace-upload", "vision", "pty", "mcp", "nemo-relay", "sms", "teams", "computer-use", "acp", "mistral", "otlp", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
+provides-extras = ["uvloop", "anthropic", "exa", "firecrawl", "parallel-web", "ddgs", "fal", "edge-tts", "neutts", "kittentts", "piper", "hindsight", "modal", "daytona", "vercel", "google-meet", "messaging", "cron", "slack", "matrix", "wecom", "keychain", "tts-premium", "voice", "wake", "telegram", "discord", "stt-whisper", "audio-io", "silk", "wake-openwakeword", "wake-sherpa", "wake-porcupine", "google-chat", "doc-extract", "documents", "documents-pdf", "trace-upload", "vision", "pty", "mcp", "nemo-relay", "sms", "teams", "computer-use", "acp", "mistral", "otlp", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -2818,6 +2826,23 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/6c/dc/03a21b89f118664a0926ff25b0f8e44a519bf22724a6a8fc7a9abbc188b6/hf_xet-1.7.0-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:0a9e802f33bf50c851abe45fc5380e61f959e2d369647d6742b79ad9d6c27cab", size = 4418814, upload-time = "2026-10-06T20:18:37.888Z" },
     { url = "https://files.pythonhosted.org/packages/4d/59/b35106dfa71b6eef605dc88bd038fe99c7f86fb132a15b60d0bf2f235b2c/hf_xet-1.7.0-cp38-abi3-win_amd64.whl", hash = "sha256:2b7bb5727889b0f2436dbaaad8fc4c3e66b8240d992716989e0c086b4278b1bc", size = 3822644, upload-time = "2026-10-06T20:18:40.052Z" },
     { url = "https://files.pythonhosted.org/packages/48/cd/072313585f74fe9d441e2eb5e0a4703c30586cd709810ea369675f61b74e/hf_xet-1.7.0-cp38-abi3-win_arm64.whl", hash = "sha256:acc3851cf2576a8fb2ae926da863f4efabe21303cf292e9a44332802ab0dcc6a", size = 3662436, upload-time = "2026-10-06T20:18:42.205Z" },
+]
+
+[[package]]
+name = "hindsight-client"
+version = "0.10.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "aiohttp-retry" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+    { name = "typing-extensions" },
+    { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ac/81/03d22890aa5fa8b09fa1c290814cf0ff716bd5c6b537305458467092e5a1/hindsight_client-0.10.1.tar.gz", hash = "sha256:764c4326c14123c5c9222f21ae5ebe62ef2323c60c8907b35667f5f82924c81d", size = 192363, upload-time = "2026-09-21T15:00:52.758Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5b/9b/aef41711ea4ea419386a10d7b5b52cebd9aac380127897629508ddff12b9/hindsight_client-0.10.1-py3-none-any.whl", hash = "sha256:04e03353a0f9dcfa7b1b1000cccc8f077a93a788b27af62cc5e014b2dd3b960c", size = 422723, upload-time = "2026-09-21T15:00:51.121Z" },
 ]
 
 [[package]]

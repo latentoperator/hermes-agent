@@ -284,6 +284,39 @@ def test_nested_dist_travels_but_root_dist_stays_out(tmp_path):
     assert not (destination / "dist").exists(), "root build output never enters the snapshot"
 
 
+def test_plugin_workspace_ignores_unavailable_foreign_platform_dependencies(tmp_path):
+    """A per-host plugin generation must not evict plugins over another OS's optional wheels."""
+    from packaging.markers import default_environment
+
+    native_platform = default_environment()["sys_platform"]
+    source = tmp_path / "core"
+    source.mkdir()
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    _fixtures._wheel(wheels, "fixturedep", "1.0")
+    foreign = f"missing-foreign==99; sys_platform != '{native_platform}'"
+    (source / "pyproject.toml").write_text(
+        '[project]\nname="core"\nversion="1"\nrequires-python=">=3.11"\n'
+        f'dependencies={json.dumps([foreign])}\n'
+        '[tool.uv]\npackage=false\nno-index=true\n'
+        f'find-links=[{json.dumps(wheels.as_posix())}]\n', encoding="utf-8")
+    plugin = tmp_path / "plugin"
+    plugin.mkdir()
+    (plugin / "pyproject.toml").write_text(
+        '[project]\nname="member"\nversion="1"\ndependencies=["fixturedep==1.0"]\n'
+        '[tool.uv]\npackage=false\n', encoding="utf-8")
+    root = tmp_path / "workspace"
+    workspace._generate_pyproject([plugin], root, source=source, python=Path(sys.executable))
+    uv = shutil.which("uv")
+    assert uv, "the regression requires the native offline resolver"
+    result = subprocess.run(
+        [uv, "lock", "--offline", "--no-index", "--find-links", str(wheels),
+         "--python", sys.executable], cwd=root,
+        env={"PATH": str(Path(uv).parent), "HOME": str(tmp_path),
+             "UV_CACHE_DIR": str(tmp_path / "cache"), "UV_NO_CONFIG": "1"},
+        capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
+
 def test_tool_store_inside_a_package_stays_out_of_the_snapshot(tmp_path):
     """The container image keeps PM's tool store in the ``tools`` package directory; each dependency
     generation copied its interpreters, browser and media binaries (~1.5 GB) into its workspace."""

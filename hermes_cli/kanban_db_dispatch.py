@@ -1571,9 +1571,9 @@ def check_respawn_guard(
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
+    handoff or authorized ready-resume followed the comment: the profile must
+    work on that PR). The review lane skips the last two: they are the *inputs*
+    to a review handoff. Stale / dead claim locks are NOT a guard reason — the reclaim
     passes own those.
     """
     row = conn.execute(
@@ -1640,23 +1640,78 @@ def check_respawn_guard(
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
-    pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
-                                          cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
-    if pr_times:
-        # Strictly after: a same-second tie stays guarded (fail closed).
-        if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
-                conn, "task_events", task_id, max(pr_times),
-                "AND kind IN ('assigned', 'changes_requested', 'review_reopened')", cols=", kind, payload", strict=True)):
+    #    Exception: a handoff or authorized resume AFTER the newest PR comment
+    #    means work on THAT PR, not a duplicate implementation (#111910).
+    #    Automatic crash/TTL recovery is not authorization; explicit operator
+    #    requeues and promotions following a dependency completion are.
+    pr_rows = list(_rows_since(
+        conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
+        cols=", body", unreadable=now,
+    ))
+    for comment_at, c in sorted(pr_rows, key=lambda row: row[0], reverse=True):
+        body = _kb._lossy_text(c["body"])
+        if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+            continue
+        last_claim_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_events "
+            "WHERE task_id = ? AND kind = 'claimed'", (task_id,),
+        ).fetchone()[0]
+        events = [event for _, event in _rows_since(
+            conn, "task_events", task_id, comment_at,
+            "AND kind IN ('assigned', 'changes_requested', 'review_reopened', "
+            "'promoted', 'promoted_manual', 'unblocked', 'status', 'reclaimed')",
+            cols=", id, kind, payload", strict=True,
+        )]
+        if any(
+            _is_pr_continuation_event(
+                conn, task_id, e, comment_at, last_claim_id,
+            )
+            for e in events
+        ):
             return None
         return "active_pr"
 
     return None
+
+
+def _is_pr_continuation_event(
+    conn: sqlite3.Connection, task_id: str, event: sqlite3.Row, comment_at: int,
+    last_claim_id: int,
+) -> bool:
+    """Distinguish outside authorization from the dispatcher's recovery loop.
+
+    Legacy ready ``unblocked``/``promoted`` events have null payloads. A
+    promotion alone is insufficient: an untyped failed run can auto-promote
+    too, so require a linked parent's terminal event after the PR comment and
+    before this promotion. A ready claim consumes the resume authorization;
+    a newly posted PR URL starts the guard afresh as well.
+    """
+    kind, payload = event["kind"], event["payload"]
+    if kind in ("assigned", "changes_requested", "review_reopened"):
+        return _is_handoff_event(kind, payload)
+    if event["id"] <= last_claim_id:
+        return False
+    data = {} if payload is None else _kb._json_or(payload, None)
+    if not isinstance(data, dict):
+        return False
+    if kind == "reclaimed":
+        return data.get("manual") is True and data.get("retry_status") == "ready"
+    if kind == "status":
+        return data.get("status") == "ready"
+    if kind == "promoted_manual":
+        return True
+    if data.get("status", "ready") != "ready":
+        return False
+    if kind == "unblocked":
+        return True
+    if kind == "promoted":
+        return conn.execute(
+            "SELECT 1 FROM task_links l JOIN task_events e ON e.task_id = l.parent_id "
+            "WHERE l.child_id = ? AND e.kind IN ('completed', 'archived') "
+            "AND e.created_at > ? AND e.id > ? AND e.id < ? LIMIT 1",
+            (task_id, comment_at, last_claim_id, event["id"]),
+        ).fetchone() is not None
+    return False
 
 
 _GUARD_TIME_COLS = {"task_runs": "ended_at", "task_events": "created_at", "task_comments": "created_at"}
@@ -2430,8 +2485,19 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
 
 
 def _module_hermes_argv() -> list[str]:
-    """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
+    """Invoke this install, including bootstrap for an isolated managed Python."""
+    from pathlib import Path
+    from hermes_cli._launchers import resolve_store_python, runtime_command
+
+    root = Path(__file__).resolve().parents[1]
+    if resolve_store_python(root) is not None:
+        # The daemon's launcher inserted the source tree into sys.path. Its
+        # child does not inherit that insertion, so `sys.executable -m` fails
+        # even though find_spec("hermes_cli") succeeds in the parent.
+        launcher = root / ".hermes" / "bin" / "hermes"
+        if launcher.is_file() and os.access(launcher, os.X_OK):
+            return [str(launcher)]
+        return runtime_command(root)
     return [sys.executable, "-m", "hermes_cli.main"]
 
 
@@ -2496,14 +2562,14 @@ def _hermes_path_argv(path: str) -> list[str]:
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv for ``Popen``: ``$HERMES_BIN``
     (path-like -> absolute; bare names keep PATH semantics, never a
-    same-directory file), then the running interpreter's ``sys.executable -m
-    hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
-    is not importable. The module argv must win over PATH: a PATH-first lookup
+    same-directory file), then this install's bootstrap launcher for managed
+    source installs (or the running interpreter's module form otherwise),
+    then ``which("hermes")`` (Windows: safe PATH search, batch shims fall back
+    to the module form) only when ``hermes_cli`` is not importable. The
+    install-bound argv must win over PATH: a PATH-first lookup
     lets an attacker-planted ``hermes`` shadow the running install (#111569).
-    Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``
-    sits below ``gateway`` in the dependency order.
+    Unlike ``gateway.run._resolve_hermes_bin``, this resolver must preserve
+    the managed source install's bootstrap when a dispatcher spawns a child.
     """
     import importlib.util
     import shutil

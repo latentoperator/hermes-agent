@@ -288,9 +288,10 @@ class AuthorityConnection:
         handlers.update(oneshot_handlers(self))
         from gateway.session_teammate_waits import handlers as teammate_wait_handlers
         handlers.update(teammate_wait_handlers(self))
-        from gateway.session_images import attach_bytes
+        from gateway.session_images import attach_bytes, render
         from functools import partial
         handlers['image.attach_bytes'] = partial(attach_bytes, self)
+        handlers['image.render'] = partial(render, self)
         from gateway.session_complete_path import complete_path
         handlers['complete.path'] = partial(complete_path, self)
         from gateway.session_prune import prune

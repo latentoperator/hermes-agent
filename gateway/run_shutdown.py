@@ -1103,6 +1103,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
             except Exception as e:
                 logger.debug("Failed to send shutdown notification to %s:%s: %s", platform_str, chat_id, e)
                 continue
+            from gateway.run import _non_conversational_metadata
+            metadata = _non_conversational_metadata(metadata, platform=platform)
             # Automatic interrupt diagnostic, resolved under the session's own profile scope (same
             # shape as the stall watcher). The requester's own chat on an in-chat /restart is the
             # requested outcome of that command and is never suppressed.

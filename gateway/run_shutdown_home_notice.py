@@ -104,7 +104,7 @@ class GatewayHomeShutdownNoticeMixin:
         silent (#118233). ``list(...)`` snapshots the adapter maps: adapter.send() can hit a fatal path
         (_handle_fatal) that pops the adapter -> "dictionary changed size during iteration".
         """
-        from gateway.run import _async_profile_runtime_scope
+        from gateway.run import _async_profile_runtime_scope, _non_conversational_metadata
         from gateway.run_shutdown import _delivery_target_key
         from gateway.warning_notifications import present_notification
 
@@ -131,6 +131,8 @@ class GatewayHomeShutdownNoticeMixin:
                     "Failed to send shutdown notification to home channel %s:%s: %s", platform.value, home.chat_id, e,
                 )
                 continue
+
+            metadata = _non_conversational_metadata(metadata, platform=platform)
 
             async def _send_home(adapter=adapter, home=home, platform=platform, metadata=metadata,
                                  dedup_key=dedup_key):

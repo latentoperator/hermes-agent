@@ -684,7 +684,7 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     from tools.approval_context import set_current_session_key
     scopes = st.scopes
     scopes.approval = set_current_session_key(session["session_key"])
-    scopes.session_tokens = _set_session_context(session["session_key"], ui_session_id=sid)
+    scopes.session_tokens = _set_session_context(session["session_key"], ui_session_id=sid, allow_action_approval=True)
     # Profile turn: that profile's home + secrets + terminal policy. Launch-profile turn: unscoped in a
     # single-profile process; once multiplexing is active (#68559 / #107422 residual) its OWN scope,
     # built from the env frozen at activation — get_secret() fails closed then, so an unscoped default

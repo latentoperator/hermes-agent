@@ -362,6 +362,60 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[-1][2]["success"] is True
 
 
+def test_run_one_job_delivery_uses_profile_secret_scope(monkeypatch, tmp_path):
+    """Standalone delivery must resolve the scheduled profile's credentials.
+
+    Desktop's built-in ticker multiplexes every local profile without live
+    adapters.  The job body already ran under the target profile's secret
+    scope, but that scope used to be reset before delivery, so a desktop
+    backend could send a Syren job with the backend owner's Telegram token.
+    """
+    from agent import secret_scope
+    from cron import scheduler
+
+    profile_home = tmp_path / "syren"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "TELEGRAM_BOT_TOKEN=syren-token\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(scheduler, "_hermes_home", profile_home)
+    monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "mark_execution_running", lambda *_args: {})
+    monkeypatch.setattr(scheduler, "finish_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda job, *, defer_agent_teardown=None, **_kw: (
+            True,
+            "output",
+            "profile-scoped response",
+            None,
+        ),
+    )
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: True)
+
+    seen = {}
+
+    def _capture_delivery(*_args, **_kwargs):
+        seen["token"] = secret_scope.get_secret("TELEGRAM_BOT_TOKEN")
+
+    monkeypatch.setattr(scheduler, "_deliver_result", _capture_delivery)
+
+    assert scheduler.run_one_job(
+        {
+            "id": "job-profile-delivery",
+            "execution_id": "exec-profile-delivery",
+            "deliver": "telegram",
+            "no_agent": True,
+        }
+    ) is True
+    assert seen["token"] == "syren-token"
+    assert secret_scope.current_secret_scope() is None
+
+
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
     import cron.scheduler_provider as provider
 
@@ -514,3 +568,26 @@ def test_history_orders_by_instant_across_dst_fall_back(monkeypatch, tmp_path):
     ]
     page = executions.list_executions(job_id="dst-job", before_claimed_at=later["claimed_at"])
     assert [r["id"] for r in page] == [earlier["id"]]
+
+
+def test_existing_execution_ledger_widens_statuses_without_losing_rows():
+    from cron import executions
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""CREATE TABLE executions (
+        id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+        process_id TEXT NOT NULL, pid INTEGER NOT NULL, process_started_at INTEGER,
+        status TEXT NOT NULL CHECK(status IN ('claimed','running','completed','failed','unknown')),
+        claimed_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT)""")
+    conn.execute("INSERT INTO executions (id,job_id,source,process_id,pid,status,claimed_at) "
+                 "VALUES ('old','job','builtin','owner',1,'completed','2026-11-04T00:00:00Z')")
+    conn.commit()
+
+    executions._initialize_schema(conn)
+    assert conn.execute("SELECT id,status FROM executions").fetchall() == [("old", "completed")]
+    for status in ("cancelled", "missed"):
+        conn.execute("INSERT INTO executions (id,job_id,source,process_id,pid,status,claimed_at) "
+                     "VALUES (?,?,?,?,?,?,?)", (status, "job", "builtin", "owner", 1, status, "now"))
+    executions._initialize_schema(conn)
+    assert conn.execute("SELECT count(*) FROM executions").fetchone()[0] == 3
+    conn.close()

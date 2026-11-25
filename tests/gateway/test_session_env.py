@@ -77,6 +77,91 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     runner._clear_session_env(tokens)
 
 
+def test_set_session_env_binds_real_telegram_message_as_action_source(monkeypatch):
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="7593705216",
+        chat_type="dm",
+        user_id="7593705216",
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:main:telegram:dm:7593705216",
+        session_id="20260823_211711_458dbe03",
+    )
+
+    tokens = runner._set_session_env(context, message_id="174813")
+    try:
+        assert get_session_env("HERMES_SESSION_MESSAGE_ID") == "174813"
+        assert get_session_env("HERMES_SESSION_ID") == "20260823_211711_458dbe03"
+        assert get_session_env("HERMES_ACTION_APPROVAL_SOURCE") == (
+            "in_session:telegram:7593705216:174813"
+        )
+    finally:
+        runner._clear_session_env(tokens)
+
+
+def test_internal_turn_does_not_bind_action_approval_source():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="7593705216",
+        chat_type="dm",
+        user_id="7593705216",
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:main:telegram:dm:7593705216",
+        session_id="20260823_211711_458dbe03",
+    )
+
+    tokens = runner._set_session_env(
+        context,
+        message_id="174813",
+        allow_action_approval=False,
+    )
+    try:
+        assert get_session_env("HERMES_ACTION_APPROVAL_SOURCE") == ""
+    finally:
+        runner._clear_session_env(tokens)
+
+
+def test_set_session_env_binds_discord_scope_channel_and_message_source():
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="1509308354521207045",
+        chat_type="thread",
+        user_id="394627202232352769",
+        scope_id="1509308349152493699",
+        thread_id="1509308354521207045",
+    )
+    context = SessionContext(
+        source=source,
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:main:discord:thread",
+        session_id="20260823_211711_458dbe03",
+    )
+
+    tokens = runner._set_session_env(
+        context,
+        message_id="1509309000000000001",
+    )
+    try:
+        assert get_session_env("HERMES_ACTION_APPROVAL_SOURCE") == (
+            "in_session:discord:394627202232352769:1509308349152493699:"
+            "1509308354521207045:1509309000000000001"
+        )
+    finally:
+        runner._clear_session_env(tokens)
+
+
 def test_shared_source_uses_current_event_author_for_live_actor_context():
     """Regression for #140059: shared routing does not erase this turn's actor."""
     shared_source = SessionSource(
@@ -391,3 +476,42 @@ async def test_plugin_slash_command_receives_calling_session(monkeypatch):
 
     assert (handled, result) == (True, "ok")
     assert seen == [("details", source, "20261018_live", key, "telegram", "20261018_live")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("internal", [False, True])
+async def test_prepare_turn_binds_only_human_approval_provenance(monkeypatch, internal):
+    """The extracted prepare phase carries the event identity and excludes injected turns."""
+    from datetime import datetime
+    from unittest.mock import AsyncMock
+
+    from gateway.config import GatewayConfig
+    from gateway.platforms.event import MessageEvent
+    from gateway.session import SessionEntry
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner._hmwa_open_session = AsyncMock(return_value=(False, False))
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", user_id="123", chat_type="dm")
+    event = MessageEvent(text="approve", source=source, message_id="456", internal=internal)
+    entry = SessionEntry(session_key="agent:main:telegram:dm:123", session_id="session-test",
+                         created_at=datetime.now(), updated_at=datetime.now())
+    bound = {}
+    real_bind = runner._set_session_env
+
+    class Bound(Exception):
+        pass
+
+    def capture(context):
+        tokens = real_bind(context)
+        try:
+            bound["message"] = get_session_env("HERMES_SESSION_MESSAGE_ID")
+            bound["approval"] = get_session_env("HERMES_ACTION_APPROVAL_SOURCE")
+        finally:
+            runner._clear_session_env(tokens)
+        raise Bound
+
+    monkeypatch.setattr(runner, "_set_session_env", capture)
+    with pytest.raises(Bound):
+        await runner._hmwa_prepare_turn(event, source, entry, entry.session_key, "turn", 1)
+    assert bound == {"message": "456", "approval": "" if internal else "in_session:telegram:123:456"}

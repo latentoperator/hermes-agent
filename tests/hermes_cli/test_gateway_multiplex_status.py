@@ -23,6 +23,9 @@ def _fake_multiplexer(monkeypatch, tmp_path, *, multiplex: bool, pid_file: bool 
 
     import hermes_constants
     from gateway import status
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "_get_wrapper_dir", lambda: tmp_path / "wrappers")
 
     (tmp_path / "profiles" / "beta").mkdir(parents=True)
     # A profile dir needs an identity marker to be listed/served (bare dirs are side-effect shells).

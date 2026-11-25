@@ -11,6 +11,7 @@ short-circuit) → fallback provider → terminal ``(empty)`` sentinel. Nothing 
 from __future__ import annotations
 
 import logging
+import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -60,6 +61,31 @@ def _notification_turn_without_tool_round(messages: list[dict[str, Any]]) -> boo
             return False
         if msg.get("role") == "user":
             return msg.get("display_kind") in _MACHINERY_DISPLAY_KINDS
+    return False
+
+
+def _successful_reaction_only_turn(messages: list[dict[str, Any]]) -> bool:
+    """A successful tapback can itself answer the latest user message."""
+    if len(messages) < 3 or messages[-1].get("role") != "tool":
+        return False
+    call = messages[-2]
+    calls = call.get("tool_calls") if call.get("role") == "assistant" else None
+    if not isinstance(calls, list) or len(calls) != 1:
+        return False
+    if calls[0].get("function", {}).get("name") != "react_to_message":
+        return False
+    try:
+        success = json.loads(messages[-1].get("content") or "").get("success") is True
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if not success:
+        return False
+    # A reaction after substantive work is not proof the task was finished.
+    for message in reversed(messages[:-2]):
+        if message.get("role") == "user":
+            return True
+        if message.get("role") == "tool":
+            return False
     return False
 
 
@@ -300,6 +326,18 @@ def recover_empty_response(
     if _machinery_quiet_exit(agent, assistant_message, finish_reason, messages):
         _turn_exit_reason = NOTIFICATION_NO_REPLY_EXIT
         final_response = ""
+        return _verdict("break")
+
+    if (
+        finish_reason == "stop"
+        and not agent._extract_reasoning(assistant_message)
+        and _successful_reaction_only_turn(messages)
+    ):
+        # Keep role alternation for the next turn; the GUI hides blank assistant rows.
+        append_message(messages, agent._build_assistant_message(assistant_message, finish_reason))
+        _turn_exit_reason = "reaction_only"
+        final_response = ""
+        logger.info("Successful reaction-only turn — no text reply required")
         return _verdict("break")
 
     # Prior turn had real content + ONLY housekeeping tools: model is done, reuse it.

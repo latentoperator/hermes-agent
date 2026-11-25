@@ -78,6 +78,7 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     """Stat-based change signature over every directory the catalog walks; platform is read via
     ``agent.skill_utils.sys`` so test patches are honored."""
     from agent import skill_utils as _skill_utils
+
     platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
     sig: list = []
     for d in dirs_to_scan:

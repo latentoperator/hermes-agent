@@ -6,6 +6,7 @@ other's routing ids.  ``get_session_env`` is a drop-in for ``os.getenv``.
 """
 
 import os
+import re
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any, Iterator
@@ -35,14 +36,15 @@ _SESSION_VARS = (
     _SESSION_PLATFORM, _SESSION_SOURCE, _SESSION_CHAT_ID, _SESSION_CHAT_TYPE,
     _SESSION_CHAT_NAME, _SESSION_THREAD_ID, _SESSION_USER_ID, _SESSION_USER_ID_ALT,
     _SESSION_USER_NAME, _SESSION_SCOPE_ID, _SESSION_KEY, _SESSION_ID,
-    _SESSION_UI_SESSION_ID, _SESSION_MESSAGE_ID, _SESSION_PROFILE, _CRON_SESSION, _SESSION_PARENT_CHAT_ID,
+    _SESSION_UI_SESSION_ID, _SESSION_MESSAGE_ID, _ACTION_APPROVAL_SOURCE, _SESSION_PROFILE,
+    _CRON_SESSION, _SESSION_PARENT_CHAT_ID,
     _SESSION_ACTOR_ID, _SESSION_ACTOR_NAME,
 ) = tuple(ContextVar(name, default=_UNSET) for name in (
     "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
     "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID",
     "HERMES_SESSION_USER_ID", "HERMES_SESSION_USER_ID_ALT", "HERMES_SESSION_USER_NAME",
     "HERMES_SESSION_SCOPE_ID", "HERMES_SESSION_KEY", "HERMES_SESSION_ID",
-    "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_SESSION_PROFILE",
+    "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_ACTION_APPROVAL_SOURCE", "HERMES_SESSION_PROFILE",
     "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID",
     # The trusted sender of THIS turn. USER_ID is the session ROUTE (kanban/cron/send_message rebuild
     # routes from it) and is empty in a shared chat (Telegram observe mode); ACTOR is who asked.
@@ -162,8 +164,8 @@ def set_session_vars(
     user_name: str = "", scope_id: str = "", session_key: str = "", session_id: str = "",
     message_id: str = "", profile: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
-    session_history_delivery: str | None = None, actor_id: str | None = None, actor_name: str | None = None,
-    turn_event: Any = None,
+    session_history_delivery: str | None = None, action_approval_source: str = "",
+    actor_id: str | None = None, actor_name: str | None = None, turn_event: Any = None,
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -178,7 +180,7 @@ def set_session_vars(
     _session_context_engaged = True
     values = (
         platform, source, chat_id, chat_type, chat_name, thread_id, user_id, user_id_alt,
-        user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
+        user_name, scope_id, session_key, session_id, ui_session_id, message_id, action_approval_source, profile,
         cron_session, parent_chat_id, user_id if actor_id is None else actor_id, user_name if actor_name is None else actor_name,
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
@@ -288,3 +290,51 @@ def session_history_delivery_supported() -> bool:
 
     Fail closed on omitted bindings; never borrow authority from the environment."""
     return _SESSION_HISTORY_DELIVERY.get() == "1"
+
+
+_ACTION_SOURCE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+
+
+def build_action_approval_source(
+    *,
+    platform: str = "",
+    source: str = "",
+    user_id: str = "",
+    scope_id: str = "",
+    chat_id: str = "",
+    thread_id: str = "",
+    message_id: str = "",
+    session_id: str = "",
+    desktop_principal: str = "",
+) -> str:
+    """Build canonical approval provenance from trusted live-turn metadata.
+
+    Empty is fail-closed: callers must not fall back to model-authored
+    ``in_session:`` values when the current surface lacks required identity.
+    """
+    import os
+
+    surface = str(platform or source or "").strip().lower()
+    uid = str(user_id or "").strip()
+    message = str(message_id or "").strip()
+    if surface == "telegram":
+        if uid.isdigit() and uid != "0" and message.isdigit() and message != "0":
+            return f"in_session:telegram:{uid}:{message}"
+        return ""
+    if surface == "discord":
+        scope = str(scope_id or "").strip()
+        channel = str(thread_id or chat_id or "").strip()
+        if all(value.isdigit() and value != "0" for value in (uid, scope, channel, message)):
+            return f"in_session:discord:{uid}:{scope}:{channel}:{message}"
+        return ""
+    if surface == "desktop":
+        principal = str(
+            desktop_principal
+            or os.environ.get("HERMES_ACTION_APPROVAL_DESKTOP_PRINCIPAL")
+            or os.environ.get("USER")
+            or ""
+        ).strip()
+        sid = str(session_id or "").strip()
+        if _ACTION_SOURCE_TOKEN.fullmatch(principal) and _ACTION_SOURCE_TOKEN.fullmatch(sid):
+            return f"in_session:desktop:{principal}:{sid}"
+    return ""
